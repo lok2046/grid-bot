@@ -988,6 +988,69 @@ class OMS:
                 logger.info(f"[OMS] Cancelling dangling order {order.exchange_id}")
                 self._rest_cancel_order(order.exchange_id)
 
+    def reconcile_on_startup(self) -> float:
+        """
+        Called once at startup (after OMS.start()) to detect leftover state
+        from a previous run (crash, hard-kill, or clean stop that did not liquidate).
+
+        Live mode:
+          1. Cancel all open orders for the instrument on the exchange.
+             Prevents the new grid from conflicting with orphaned orders.
+          2. Fetch the real position from private/get-positions.
+             Returns the net long qty so the caller can decide to close it.
+
+        Paper mode:
+          Nothing to do — paper state is in-memory only, so a restart is always
+          a clean slate.  Returns 0.0.
+        """
+        if not self.live_trading:
+            return 0.0
+
+        # Step 1: cancel all open orders for this instrument
+        logger.info("[OMS] Startup reconcile: cancelling all open orders on exchange...")
+        try:
+            resp = self._signed_post("private/cancel-all-orders",
+                                     {"instrument_name": self.instrument})
+            if resp is not None and resp.get("code", -1) == 0:
+                logger.info("[OMS] Startup reconcile: all open orders cancelled")
+            else:
+                code = resp.get("code") if resp else "N/A"
+                logger.warning(f"[OMS] Startup reconcile: cancel-all-orders returned code={code}")
+        except Exception as e:
+            logger.error(f"[OMS] Startup reconcile: cancel-all-orders error: {e}")
+
+        # Step 2: fetch current position
+        long_qty = 0.0
+        try:
+            resp = self._signed_post("private/get-positions",
+                                     {"instrument_name": self.instrument})
+            if resp is not None and resp.get("code", -1) == 0:
+                positions = resp.get("result", {}).get("data", [])
+                for pos in positions:
+                    if pos.get("instrument_name") == self.instrument:
+                        qty  = float(pos.get("quantity", 0))
+                        side = pos.get("side", "")   # "BUY" = long, "SELL" = short
+                        if side == "BUY" and qty > 0:
+                            long_qty = qty
+                            logger.warning(
+                                f"[OMS] Startup reconcile: found existing long "
+                                f"{long_qty:.4f} {self.instrument} from previous run"
+                            )
+                        elif side == "SELL" and qty > 0:
+                            logger.warning(
+                                f"[OMS] Startup reconcile: found existing short "
+                                f"{qty:.4f} {self.instrument} — unexpected for grid bot"
+                            )
+                        else:
+                            logger.info("[OMS] Startup reconcile: no open position found")
+            else:
+                code = resp.get("code") if resp else "N/A"
+                logger.warning(f"[OMS] Startup reconcile: get-positions returned code={code}")
+        except Exception as e:
+            logger.error(f"[OMS] Startup reconcile: get-positions error: {e}")
+
+        return long_qty
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WebSocket market feed  (copied from funding_arb/ws_manager.py _ReconnectingWS)
@@ -2018,6 +2081,19 @@ class GridBot:
     def start(self):
         logger.info("[GridBot] Starting")
         self._oms.start()
+
+        # ── Startup reconciliation ────────────────────────────────────────────
+        # Detect and close any position left over from a previous run (crash,
+        # hard-kill, or clean stop).  Also cancels all orphaned open orders so
+        # the new grid starts from a clean slate.  No-op in paper mode.
+        stale_qty = self._oms.reconcile_on_startup()
+        if stale_qty > 0:
+            self._alerter.send(
+                f"⚠️ Startup: found stale long {stale_qty:.4f} BTC from previous run\n"
+                f"Closing before building new grid..."
+            )
+            self._liquidate_position(stale_qty, reason="startup reconcile")
+
         self._market_ws.start()
 
         warmup_s = self._cfg.get("min_warmup_seconds", 60)
@@ -2040,8 +2116,19 @@ class GridBot:
         self._stop_event.set()
         self._ws_stop.set()
         self._market_ws.stop()
+
+        # Liquidate any accumulated long before tearing down the OMS.
+        # This mirrors what _emergency_halt does for stop-loss events so that
+        # a clean SIGINT/SIGTERM also closes the position rather than leaving
+        # it orphaned on the exchange.
+        long_qty = 0.0
         if self._engine:
+            long_qty = self._engine.get_stats().get("long_qty", 0.0)
             self._engine.stop()
+            self._engine = None
+        if long_qty > 0:
+            self._liquidate_position(long_qty, reason="GridBot stop")
+
         self._oms.stop()
         self._alerter.send_sync(f"🔴 GridBot stopped")
         self._alerter.stop()
@@ -2089,6 +2176,39 @@ class GridBot:
             time.sleep(0.1)
 
     # ── Grid management ───────────────────────────────────────────────────────
+
+    def _liquidate_position(self, qty: float, reason: str = ""):
+        """
+        Submit a market SELL for `qty` BTC and wait for the fill (up to 15s).
+        Used by stop(), start() reconcile, and _emergency_halt().
+        In paper mode the fill is instant at the live mid price.
+        Logs and alerts on both success and timeout.
+        """
+        tag = f"[{reason}]" if reason else ""
+        logger.warning(f"[GridBot]{tag} Liquidating {qty:.4f} BTC long via market SELL")
+        req  = OrderRequest.market(side="SELL", qty=qty,
+                                   instrument=INSTRUMENT, purpose="liquidate")
+        self._oms.submit(req)
+        fill = self._oms.wait_fill(req.client_oid, timeout=15.0)
+        if fill and fill.is_filled:
+            logger.warning(
+                f"[GridBot]{tag} Liquidation filled: "
+                f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f}"
+            )
+            self._alerter.send(
+                f"🔴 Position closed ({reason})\n"
+                f"Sold {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}"
+            )
+        else:
+            logger.error(
+                f"[GridBot]{tag} Liquidation fill TIMED OUT — "
+                f"{qty:.4f} BTC may still be open. MANUAL INTERVENTION REQUIRED."
+            )
+            self._alerter.send(
+                f"🚨 Liquidation TIMED OUT ({reason})\n"
+                f"{qty:.4f} BTC position may still be open.\n"
+                f"MANUAL INTERVENTION REQUIRED"
+            )
 
     def _rebuild_grid(self):
         mid = _price_cache.get_mid()
@@ -2185,35 +2305,20 @@ class GridBot:
             self._engine.stop()
             self._engine = None
 
+        _restart_note = ("Monitoring for auto-restart."
+                         if self._cfg.get("auto_restart_enabled", True)
+                         else "Restart manually.")
+
         if long_qty > 0:
-            logger.warning(f"[GridBot] Liquidating {long_qty:.4f} BTC long")
-            req  = OrderRequest.market(side="SELL", qty=long_qty,
-                                       instrument=INSTRUMENT, purpose="stop_loss")
-            self._oms.submit(req)
-            fill = self._oms.wait_fill(req.client_oid, timeout=15.0)
-            if fill and fill.is_filled:
-                logger.warning(
-                    f"[GridBot] Liquidation filled: {fill.filled_qty:.4f} @ {fill.avg_price:.2f}")
-                _restart_note = ("Monitoring for auto-restart."
-                                 if self._cfg.get("auto_restart_enabled", True)
-                                 else "Restart manually.")
-                self._alerter.send_sync(
-                    f"🚨 STOP-LOSS TRIGGERED\n"
-                    f"mid={mid:.2f} < stop={self._halt_stop_price:.2f}\n"
-                    f"Liquidated {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}\n"
-                    f"Bot HALTED — {_restart_note}"
-                )
-            else:
-                logger.error("[GridBot] Liquidation fill timed out — MANUAL INTERVENTION REQUIRED")
-                self._alerter.send_sync(
-                    f"🚨 STOP-LOSS: liquidation fill TIMED OUT\n"
-                    f"mid={mid:.2f} | {long_qty:.4f} BTC long still open\n"
-                    f"MANUAL INTERVENTION REQUIRED"
-                )
+            # _liquidate_position sends its own fill/timeout alert; we send the
+            # STOP-LOSS context alert separately so they're distinct in Telegram.
+            self._alerter.send_sync(
+                f"🚨 STOP-LOSS TRIGGERED\n"
+                f"mid={mid:.2f} < stop={self._halt_stop_price:.2f}\n"
+                f"Liquidating {long_qty:.4f} BTC — Bot HALTED — {_restart_note}"
+            )
+            self._liquidate_position(long_qty, reason="stop-loss")
         else:
-            _restart_note = ("Monitoring for auto-restart."
-                             if self._cfg.get("auto_restart_enabled", True)
-                             else "Restart manually.")
             self._alerter.send_sync(
                 f"🚨 STOP-LOSS TRIGGERED at mid={mid:.2f}\n"
                 f"No long position to liquidate. Bot HALTED — {_restart_note}"
