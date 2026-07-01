@@ -219,7 +219,13 @@ GRID_CONFIG: dict = {
     "ws_stale_threshold_s":   20,
     "ws_reconnect_backoff_s":  2,
     "ws_max_backoff_s":       60,
-    "min_warmup_seconds":     60,
+    # 1800s (30 min) = 30 one-minute candles → PriceCache.MIN_ATR_CANDLES threshold.
+    # With only 60s of warmup the bot built a grid from ATR≈$22 (2 candles) instead
+    # of the real daily ATR≈$300, producing a grid so tight the stop was hit in
+    # minutes.  30 min gives a proper intra-day ATR.  If you want a 1-day ATR you
+    # can set this to 86400, but the fallback to _from_config() is safer for
+    # restarts — the config defaults (grid_lower/upper) give a fixed ±8% range.
+    "min_warmup_seconds":     1800,
 
     # ── OMS / order params ────────────────────────────────────────────────────
     "maker_fill_timeout":  10.0,
@@ -649,8 +655,12 @@ class OMS:
         realistic queue-position simulation used for entry signals; the order
         just waits until price crosses its level, which the GridEngine tracks
         via live price ticks.  Fee: maker for limit, taker for market.
+        Market orders (price=None) fill at the current live mid price.
         """
-        fill_price = req.price or 0.0
+        if req.price is not None:
+            fill_price = req.price
+        else:
+            fill_price = _price_cache.get_mid() or 0.0
         is_maker   = bool(req.exec_inst)
         maker_fee  = self._cfg.get("maker_fee_rate", 0.0001)
         taker_fee  = self._cfg.get("taker_fee_rate", 0.0003)
@@ -1226,10 +1236,20 @@ class PriceCache:
         with self._lock:
             return self._bid, self._ask, self._mid
 
+    # Minimum number of 1-min candles required before compute_atr() is trusted.
+    # With only 1-2 candles (e.g. after a 60s warmup) the ATR is ~$20 instead
+    # of the ~$300 daily ATR — producing a dangerously tight grid that is almost
+    # immediately stopped out.  30 candles = 30 minutes of data, which is a
+    # reasonable minimum for a meaningful intra-day ATR.
+    MIN_ATR_CANDLES = 30
+
     def compute_atr(self, lookback_minutes: int = 1440) -> Optional[float]:
         """
         ATR from rolling 1-min candles built from tick history.
         Returns per-minute ATR in price points.
+        Returns None if fewer than MIN_ATR_CANDLES candles are available so
+        callers fall back to config defaults rather than using a misleadingly
+        small ATR derived from only a few ticks.
         """
         with self._lock:
             history = list(self._history)
@@ -1254,7 +1274,7 @@ class PriceCache:
                 c["close"] = mid
 
         sorted_c = [candles[k] for k in sorted(candles.keys())]
-        if len(sorted_c) < 2:
+        if len(sorted_c) < self.MIN_ATR_CANDLES:
             return None
 
         trs = []
@@ -1382,6 +1402,11 @@ class GridAutoTuner:
         stop    = self._cfg.get("stop_loss_price", lower * 0.97)
         notional = self._cfg.get("notional_per_level", 500.0)
         spacing = round((upper - lower) / max(levels, 1), 2)
+        logger.warning(
+            f"[AutoTuner] Using config fallback (ATR unavailable): "
+            f"range=[{lower:.2f},{upper:.2f}] levels={levels} "
+            f"spacing={spacing:.2f} stop={stop:.2f} mid={mid:.2f}"
+        )
         return GridParams(lower=lower, upper=upper, levels=levels,
                           spacing=spacing, stop_price=stop,
                           notional_per_level=notional)
