@@ -1,0 +1,2115 @@
+"""
+grid_bot.py — Neutral Futures Grid Bot for BTCUSD-PERP on Crypto.com
+Standalone: all dependencies copied in; no imports from trading_bot.py or funding_arb/.
+
+Architecture
+============
+  PriceCache       — tick-level L1 cache + ATR computation from 1-min candles
+  GridAutoTuner    — derives range/levels/stop from live ATR; dead-band re-tune
+  GridEngine       — manages the limit-order ladder; routes fills to counter-orders
+  StopLossGuard    — halts + liquidates on price breach below stop
+  _ReconnectingWS  — generation-tagged WS with DOA detection + stale watchdog
+                     (copied from funding_arb/ws_manager.py)
+  LoggerSetup      — async QueueHandler/QueueListener with HKT rotation + crash hook
+                     (copied from funding_arb/logger_setup.py)
+  AlertManager     — async Telegram queue with retry
+                     (copied from funding_arb/alerting.py)
+  OMS              — copied from trading_bot/oms.py (standalone REST+WS order manager)
+  GridBot          — top-level controller
+
+Neutral grid logic
+==================
+  Price range [lower, upper] divided into N equal levels.
+  Levels below mid → BUY limits; levels above mid → SELL limits.
+  BUY fill at level[i]  → place SELL at level[i+1]  (take-profit one level up)
+  SELL fill at level[i] → place BUY  at level[i-1]  (take-profit one level down)
+  Each completed cycle captures one grid spacing as gross profit.
+  Net profit per cycle ≈ spacing/mid - 2 × maker_fee_rate  (fraction of notional)
+
+Stop-loss
+=========
+  stop_price = lower - stop_buffer_atr × ATR
+  On breach: cancel all grid orders → market-SELL entire accumulated long → halt.
+
+Auto-tuner
+==========
+  lower = mid - atr_multiplier × ATR
+  upper = mid + atr_multiplier × ATR
+  stop  = lower - stop_buffer_atr × ATR
+  N     = floor(range / min_spacing);  min_spacing > 2 × maker_fee × mid (with buffer)
+  Re-tune triggers: price exits range OR retune_interval_hours elapsed.
+  Dead-band: skip if new range differs < retune_deadband_pct from current.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stdlib imports
+# ─────────────────────────────────────────────────────────────────────────────
+import atexit
+import collections
+import hashlib
+import hmac
+import json
+import logging
+import logging.handlers
+import math
+import os
+import queue
+import signal
+import sys
+import threading
+import time
+import traceback
+import uuid
+import datetime as _dt
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Tuple
+
+import requests
+import websocket
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRADING MODE  ← the ONLY line you need to change when switching environments
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   "paper"  — No real orders placed. Uses live Production market data for price
+#              feed and paper-fill simulation. Safe to run at any time; nothing
+#              touches your real account.
+#
+#   "uat"    — Real orders sent to Crypto.com UAT Sandbox exchange.
+#              Uses UAT REST + WS endpoints. Requires UAT API keys
+#              (create at https://exchange-uat.crypto.com — separate from prod).
+#              Funding rates and prices on UAT are synthetic, not real.
+#
+#   "live"   — Real orders sent to Production exchange. Real money.
+#
+TRADING_MODE = "paper"   # ← change this line only
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets  (keyring → env var → empty string fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Keyring setup (run ONCE in a terminal, same Windows user as the NSSM service):
+#   cmdkey /generic:cdc_grid_api_key    /user:api_key    /pass:YOUR_API_KEY
+#   cmdkey /generic:cdc_grid_api_secret /user:api_secret /pass:YOUR_API_SECRET
+#   cmdkey /generic:cdc_grid_tg_token   /user:token      /pass:YOUR_TG_TOKEN
+#   cmdkey /generic:cdc_grid_tg_chatid  /user:chatid     /pass:YOUR_CHAT_ID
+#
+# UAT keys use the same keyring names — swap them in/out when switching modes.
+#
+try:
+    import keyring as _keyring
+except ImportError:
+    _keyring = None
+
+def _secret(keyring_name: str, keyring_user: str, env_var: str) -> str:
+    if _keyring:
+        try:
+            val = _keyring.get_password(keyring_name, keyring_user)
+            if val:
+                return val
+        except Exception:
+            pass   # no keyring backend (headless / Linux CI) — fall through
+    return os.environ.get(env_var, "")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG  ← all other settings live here; do not touch for mode switching
+# ─────────────────────────────────────────────────────────────────────────────
+
+GRID_CONFIG: dict = {
+    # ── Identity ──────────────────────────────────────────────────────────────
+    "api_key":    _secret("cdc_grid_api_key",    "api_key",    "CDC_GRID_API_KEY"),
+    "api_secret": _secret("cdc_grid_api_secret", "api_secret", "CDC_GRID_API_SECRET"),
+
+    # ── Exchange / instrument ─────────────────────────────────────────────────
+    "instrument":    "BTCUSD-PERP",
+    "trading_mode":  TRADING_MODE,                   # "paper" | "uat" | "live"
+    "live_trading":  TRADING_MODE == "live",          # True only for Production
+
+    # ── Fee rates (your verified Crypto.com deriv maker/taker tier) ───────────
+    "maker_fee_rate": 0.0001,          # 0.01% deriv maker
+    "taker_fee_rate": 0.0003,          # 0.03% deriv taker
+
+    # ── Grid geometry (auto-tuned at startup; these are fallback defaults) ────
+    "grid_lower":         55000.0,
+    "grid_upper":         65000.0,
+    "grid_levels":        20,
+    "notional_per_level": 500.0,       # USD notional per grid order
+
+    # ── Auto-tuner ────────────────────────────────────────────────────────────
+    "auto_tune_enabled":    True,
+    "atr_lookback_minutes": 1440,      # 1-day lookback for ATR
+    "atr_multiplier":       3.0,       # range = mid ± N×ATR
+    "min_grid_pct":         0.0008,    # min grid spacing as fraction of price
+    "max_grid_levels":      50,
+    "min_grid_levels":      5,
+    "retune_interval_hours": 24,
+    "retune_deadband_pct":  0.10,      # skip re-tune if range shifts < 10%
+
+    # ── Trailing Up ───────────────────────────────────────────────────────────
+    # When price rises above the grid upper bound, instead of stopping and
+    # rebuilding the whole grid (which would reset all orders), the grid shifts
+    # up by one spacing interval: the lowest BUY level is cancelled and a new
+    # SELL level is added one spacing above the current upper bound.
+    # This lets the bot chase an uptrend incrementally without a full rebuild.
+    #
+    # trailing_up_enabled:   enable/disable the feature
+    # trailing_up_price_cap: optional hard ceiling — grid will not trail above
+    #                        this price (0.0 = no cap)
+    "trailing_up_enabled":   False,
+    "trailing_up_price_cap": 0.0,
+
+    # ── Trailing Down ─────────────────────────────────────────────────────────
+    # Mirror of Trailing Up for downtrends: when price drops below the lower
+    # bound, the grid shifts down by one spacing — the highest SELL level is
+    # cancelled and a new BUY level is added one spacing below the current lower
+    # bound. Stops at stop_loss_price even if trailing is enabled.
+    #
+    # WARNING: trailing down accumulates long exposure as BTC falls. Only enable
+    # if you accept that risk and have a meaningful stop_loss in place.
+    "trailing_down_enabled":   False,
+    "trailing_down_price_cap": 0.0,   # optional floor — grid will not trail below
+                                       # this price (0.0 = no cap, stop_loss applies)
+
+    # ── Stop-loss ─────────────────────────────────────────────────────────────
+    "stop_loss_enabled": True,
+    "stop_buffer_atr":   1.0,         # stop = lower - N×ATR
+
+    # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
+    "rest_base_url": {
+        "paper": "https://api.crypto.com/exchange/v1",
+        "uat":   "https://uat-api.3ona.co/exchange/v1",
+        "live":  "https://api.crypto.com/exchange/v1",
+    }[TRADING_MODE],
+    "ws_market_url": {
+        "paper": "wss://stream.crypto.com/exchange/v1/market",
+        "uat":   "wss://uat-stream.3ona.co/exchange/v1/market",
+        "live":  "wss://stream.crypto.com/exchange/v1/market",
+    }[TRADING_MODE],
+    "ws_user_url": {
+        "paper": "wss://stream.crypto.com/exchange/v1/user",
+        "uat":   "wss://uat-stream.3ona.co/exchange/v1/user",
+        "live":  "wss://stream.crypto.com/exchange/v1/user",
+    }[TRADING_MODE],
+
+    # ── WebSocket tuning ──────────────────────────────────────────────────────
+    "ws_stale_threshold_s":   20,
+    "ws_reconnect_backoff_s":  2,
+    "ws_max_backoff_s":       60,
+    "min_warmup_seconds":     60,
+
+    # ── OMS / order params ────────────────────────────────────────────────────
+    "maker_fill_timeout":  10.0,
+    "paper_latency_ms":    50.0,
+    "tick_size":            1.0,       # BTCUSD-PERP min price increment
+    "rtt_degraded_p95_ms": 300.0,
+
+    # ── Risk / circuit breaker ────────────────────────────────────────────────
+    "max_long_qty_btc":    0.5,        # alert if accumulated long exceeds this
+    "daily_loss_limit_usd": 500.0,
+
+    # ── Telegram (optional) ───────────────────────────────────────────────────
+    "telegram_bot_token": _secret("cdc_grid_tg_token",  "token",  "CDC_GRID_TG_BOT_TOKEN"),
+    "telegram_chat_id":   _secret("cdc_grid_tg_chatid", "chatid", "CDC_GRID_TG_CHAT_ID"),
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    "log_dir":          "logs_grid",
+    "log_level":        "INFO",
+    "log_backup_count": 30,
+
+    # ── CSV ───────────────────────────────────────────────────────────────────
+    "trades_csv_path":  "grid_trades.csv",
+}
+
+INSTRUMENT = GRID_CONFIG["instrument"]
+_HKT_TZ    = _dt.timezone(_dt.timedelta(hours=8))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging  (copied from funding_arb/logger_setup.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _HKTDailyRotatingHandler(logging.handlers.BaseRotatingHandler):
+    """Rotates at midnight HKT; keeps last backup_count files."""
+    def __init__(self, log_dir: str, base_name: str = "grid_bot", backup_count: int = 30):
+        self.log_dir      = log_dir
+        self.base_name    = base_name
+        self.backup_count = backup_count
+        self._current_date = self._hkt_date()
+        os.makedirs(log_dir, exist_ok=True)
+        super().__init__(self._build_path(self._current_date),
+                         mode="a", encoding="utf-8", delay=False)
+
+    def _hkt_date(self) -> str:
+        return _dt.datetime.now(_HKT_TZ).strftime("%Y_%m_%d")
+
+    def _build_path(self, date_str: str) -> str:
+        return os.path.join(self.log_dir, f"{self.base_name}_{date_str}.log")
+
+    def shouldRollover(self, record) -> bool:
+        return self._hkt_date() != self._current_date
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        self._current_date = self._hkt_date()
+        self.baseFilename   = self._build_path(self._current_date)
+        self.stream         = self._open()
+        self._prune_old_logs()
+
+    def _prune_old_logs(self) -> None:
+        try:
+            files = sorted(f for f in os.listdir(self.log_dir)
+                           if f.startswith(self.base_name) and f.endswith(".log"))
+            for old in files[:-self.backup_count]:
+                os.remove(os.path.join(self.log_dir, old))
+        except Exception:
+            pass
+
+    def emit(self, record) -> None:
+        if self.shouldRollover(record):
+            self.doRollover()
+        super().emit(record)
+
+
+class _SafeQueueListener(logging.handlers.QueueListener):
+    """QueueListener resilient to individual handler failures."""
+    def handle(self, record: logging.LogRecord) -> None:
+        record = self.prepare(record)
+        for handler in self.handlers:
+            if not self.respect_handler_level or record.levelno >= handler.level:
+                try:
+                    handler.handle(record)
+                except Exception as exc:
+                    print(f"[logger] handler {handler!r} error: {exc}", file=sys.stderr)
+
+    def _monitor(self) -> None:
+        q = self.queue
+        has_task_done = hasattr(q, "task_done")
+        while True:
+            try:
+                record = self.dequeue(True)
+                if record is self._sentinel:
+                    if has_task_done:
+                        q.task_done()
+                    break
+                try:
+                    self.handle(record)
+                except Exception as exc:
+                    print(f"[logger] QueueListener.handle error: {exc}", file=sys.stderr)
+                if has_task_done:
+                    q.task_done()
+            except queue.Empty:
+                break
+
+
+_log_queue:   queue.Queue        = queue.Queue(-1)
+_listener:    Optional[_SafeQueueListener] = None
+_file_handler: Optional[_HKTDailyRotatingHandler] = None
+
+
+def _init_logging(config: dict) -> logging.Logger:
+    global _listener, _file_handler
+    log_dir      = config.get("log_dir", "logs_grid")
+    backup_count = config.get("log_backup_count", 30)
+    level        = getattr(logging, config.get("log_level", "INFO").upper(), logging.INFO)
+    fmt          = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                                     datefmt="%Y-%m-%d %H:%M:%S")
+
+    _file_handler = _HKTDailyRotatingHandler(log_dir, backup_count=backup_count)
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(fmt)
+
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(fmt)
+
+    _listener = _SafeQueueListener(_log_queue, _file_handler, console,
+                                    respect_handler_level=True)
+    _listener.start()
+
+    # Crash hook — write uncaught exceptions directly to file before process dies
+    _orig_excepthook = sys.excepthook
+    def _excepthook(exc_type, exc_value, exc_tb):
+        msg  = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        ts   = _dt.datetime.now(_HKT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} [CRITICAL] [UNCAUGHT] {msg.rstrip()}\n"
+        if _file_handler and _file_handler.stream:
+            try:
+                _file_handler.stream.write(line)
+                _file_handler.stream.flush()
+            except Exception:
+                pass
+        print(line, file=sys.stderr, end="")
+        _orig_excepthook(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
+    atexit.register(lambda: _listener.stop() if _listener else None)
+
+    log = logging.getLogger("GridBot")
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    qh = logging.handlers.QueueHandler(_log_queue)
+    qh.setLevel(logging.DEBUG)
+    log.addHandler(qh)
+    return log
+
+
+# Initialise immediately so logger is available for everything below
+logger = _init_logging(GRID_CONFIG)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram AlertManager  (copied from funding_arb/alerting.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AlertManager:
+    """Async Telegram alerter. send() never blocks the caller."""
+    _TG_API      = "https://api.telegram.org"
+    _MAX_RETRIES = 3
+    _RETRY_DELAY = 5
+
+    def __init__(self, config: dict) -> None:
+        self._token   = config.get("telegram_bot_token", "")
+        self._chat_id = config.get("telegram_chat_id",   "")
+        self._enabled = bool(self._token and self._chat_id)
+        self._stop    = threading.Event()
+        self._queue: queue.Queue = queue.Queue(maxsize=200)
+        self._thread  = threading.Thread(target=self._worker,
+                                         name="GridAlerts", daemon=True)
+        self._thread.start()
+        if self._enabled:
+            logger.info("[AlertManager] Telegram enabled")
+        else:
+            logger.warning("[AlertManager] Telegram not configured — log only")
+
+    def send(self, text: str) -> None:
+        logger.info(f"[Alert] {text[:120].replace(chr(10), ' ')}")
+        if self._enabled:
+            try:
+                self._queue.put_nowait((text, "Markdown"))
+            except queue.Full:
+                pass
+
+    def send_sync(self, text: str) -> bool:
+        logger.info(f"[Alert][sync] {text[:120].replace(chr(10), ' ')}")
+        return self._post(text, "Markdown") if self._enabled else False
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._queue.put(None)
+        self._thread.join(timeout=15)
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            self._post(*item)
+
+    def _post(self, text: str, parse_mode: str = "Markdown") -> bool:
+        url     = f"{self._TG_API}/bot{self._token}/sendMessage"
+        payload = {"chat_id": self._chat_id, "text": text,
+                   "disable_web_page_preview": True}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                resp = requests.post(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    return True
+                if resp.status_code == 429:
+                    ra = resp.json().get("parameters", {}).get("retry_after", 5)
+                    time.sleep(ra)
+                    continue
+            except Exception as e:
+                logger.warning(f"[AlertManager] attempt {attempt} error: {e}")
+            if attempt < self._MAX_RETRIES:
+                time.sleep(self._RETRY_DELAY)
+        logger.error("[AlertManager] failed to deliver after retries")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OMS — Order Management System
+# Copied from trading_bot/oms.py; stripped to essentials needed by grid bot.
+# Kept: paper fill (instant, no realistic simulation needed for limit grid orders),
+#       live REST+WS fill, _sign, _params_to_str, FillEvent, OrderStatus.
+# Removed: _paper_fill_realistic, RTT tracking, reconcile_positions, smoke_test.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrderStatus(Enum):
+    PENDING   = "PENDING"
+    ACTIVE    = "ACTIVE"
+    FILLED    = "FILLED"
+    PARTIAL   = "PARTIAL"
+    CANCELLED = "CANCELLED"
+    REJECTED  = "REJECTED"
+
+
+@dataclass
+class OrderRequest:
+    side:        str
+    qty:         float
+    instrument:  str
+    order_type:  str
+    price:       Optional[float]
+    exec_inst:   List[str]
+    purpose:     str
+    client_oid:  str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    @classmethod
+    def limit_maker(cls, side: str, qty: float, price: float,
+                    instrument: str, purpose: str = "grid") -> "OrderRequest":
+        """POST_ONLY limit — maker fee, rests on book."""
+        return cls(side=side, qty=qty, instrument=instrument,
+                   order_type="LIMIT", price=price,
+                   exec_inst=["POST_ONLY"], purpose=purpose)
+
+    @classmethod
+    def market(cls, side: str, qty: float,
+               instrument: str, purpose: str = "stop") -> "OrderRequest":
+        """Market order — taker, immediate fill."""
+        return cls(side=side, qty=qty, instrument=instrument,
+                   order_type="MARKET", price=None,
+                   exec_inst=[], purpose=purpose)
+
+
+@dataclass
+class FillEvent:
+    client_oid:  str
+    order_id:    str
+    status:      OrderStatus
+    filled_qty:  float = 0.0
+    avg_price:   float = 0.0
+    fee:         float = 0.0
+    purpose:     str   = ""
+
+    @property
+    def is_filled(self) -> bool:
+        return self.status == OrderStatus.FILLED
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.status == OrderStatus.CANCELLED
+
+    @property
+    def is_rejected(self) -> bool:
+        return self.status == OrderStatus.REJECTED
+
+
+@dataclass
+class _LiveOrder:
+    req:          OrderRequest
+    exchange_id:  str           = ""
+    status:       OrderStatus   = OrderStatus.PENDING
+    filled_qty:   float         = 0.0
+    avg_price:    float         = 0.0
+    fee:          float         = 0.0
+    submit_time:  float         = field(default_factory=time.time)
+    fill_event:   Optional[FillEvent] = None
+    cancel_delivered: bool      = False
+
+
+_OMS_REST_BASE   = GRID_CONFIG["rest_base_url"]
+_OMS_WS_USER_URL = GRID_CONFIG["ws_user_url"]
+_MAKER_FILL_TIMEOUT = 30.0    # grid orders rest longer than entry orders
+
+
+class OMS:
+    """
+    Minimal OMS for grid bot.
+    Paper mode: instant fill at req.price with correct fee.
+    Live mode:  REST submit + WS fill notification.
+    """
+
+    def __init__(self, api_key: str, api_secret: str, instrument: str,
+                 live_trading: bool = False, config: Optional[dict] = None):
+        self.api_key      = api_key
+        self.api_secret   = api_secret
+        self.instrument   = instrument
+        self.live_trading = live_trading
+        self._cfg         = config or {}
+
+        self._order_queue: queue.Queue = queue.Queue()
+        self._fill_queues: Dict[str, queue.Queue] = {}
+        self._fill_queues_lock = threading.Lock()
+        self._orders: Dict[str, _LiveOrder] = {}
+        self._orders_lock = threading.Lock()
+        self._exid_to_coid: Dict[str, str] = {}
+
+        self._stop_event  = threading.Event()
+        self._ws_app      = None
+        self._ws_thread   = None
+        self._worker_thread = None
+        self._ws_ready    = threading.Event()
+
+        self._qty_decimals   = 4
+        self._price_decimals = 2
+
+    def start(self):
+        self._load_instrument_spec()
+        if self.live_trading:
+            self._start_ws()
+            if not self._ws_ready.wait(timeout=10.0):
+                raise RuntimeError("[OMS] WS auth timed out")
+            logger.info("[OMS] WS authenticated")
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, name="OMS-worker", daemon=True)
+        self._worker_thread.start()
+        logger.info(f"[OMS] Started (live={self.live_trading})")
+
+    def stop(self):
+        self._stop_event.set()
+        if self.live_trading:
+            self._cancel_all_dangling()
+        if self._ws_app:
+            try:
+                self._ws_app.close()
+            except Exception:
+                pass
+        if self._worker_thread:
+            self._worker_thread.join(timeout=5)
+
+    def submit(self, req: OrderRequest):
+        with self._fill_queues_lock:
+            self._fill_queues[req.client_oid] = queue.Queue(maxsize=1)
+        self._order_queue.put(req)
+
+    def wait_fill(self, client_oid: str, timeout: float = 3.0) -> Optional[FillEvent]:
+        with self._fill_queues_lock:
+            q = self._fill_queues.get(client_oid)
+        if q is None:
+            return None
+        try:
+            return q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        finally:
+            with self._fill_queues_lock:
+                self._fill_queues.pop(client_oid, None)
+
+    # ── Worker ────────────────────────────────────────────────────────────────
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                req = self._order_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._process_order(req)
+            except Exception as e:
+                logger.error(f"[OMS] order error {req.client_oid[:8]}: {e}", exc_info=True)
+                self._deliver_fill(FillEvent(
+                    client_oid=req.client_oid, order_id="",
+                    status=OrderStatus.REJECTED, purpose=req.purpose))
+
+    def _process_order(self, req: OrderRequest):
+        qty = self._round_qty(req.qty)
+        if qty <= 0:
+            self._deliver_fill(FillEvent(client_oid=req.client_oid, order_id="",
+                                         status=OrderStatus.REJECTED, purpose=req.purpose))
+            return
+        req.qty = qty
+        if not self.live_trading:
+            self._paper_fill(req)
+        else:
+            self._live_fill(req)
+
+    # ── Paper fill (instant at limit price) ───────────────────────────────────
+
+    def _paper_fill(self, req: OrderRequest):
+        """
+        Instant fill at req.price for grid orders.
+        Grid limit orders are resting POST_ONLY makers — we don't need the
+        realistic queue-position simulation used for entry signals; the order
+        just waits until price crosses its level, which the GridEngine tracks
+        via live price ticks.  Fee: maker for limit, taker for market.
+        """
+        fill_price = req.price or 0.0
+        is_maker   = bool(req.exec_inst)
+        maker_fee  = self._cfg.get("maker_fee_rate", 0.0001)
+        taker_fee  = self._cfg.get("taker_fee_rate", 0.0003)
+        fee_rate   = maker_fee if is_maker else taker_fee
+        fee        = fill_price * req.qty * fee_rate
+
+        logger.debug(
+            f"[OMS][PAPER] FILL {req.purpose} {req.side} {req.qty:.4f} @ "
+            f"{fill_price:.2f} fee={fee:+.6f} ({'maker' if is_maker else 'taker'}) "
+            f"[{req.client_oid[:8]}]"
+        )
+        self._deliver_fill(FillEvent(
+            client_oid=req.client_oid,
+            order_id=f"paper-{req.client_oid[:8]}",
+            status=OrderStatus.FILLED,
+            filled_qty=req.qty,
+            avg_price=fill_price,
+            fee=fee,
+            purpose=req.purpose,
+        ))
+
+    # ── Live fill (REST + WS) ─────────────────────────────────────────────────
+
+    def _live_fill(self, req: OrderRequest):
+        live_order = _LiveOrder(req=req, submit_time=time.time())
+        with self._orders_lock:
+            self._orders[req.client_oid] = live_order
+
+        ok, exchange_id, err = self._rest_create_order(req)
+        if not ok:
+            logger.error(f"[OMS] REST rejected: {err} [{req.client_oid[:8]}]")
+            with self._orders_lock:
+                del self._orders[req.client_oid]
+            self._deliver_fill(FillEvent(client_oid=req.client_oid, order_id="",
+                                         status=OrderStatus.REJECTED, purpose=req.purpose))
+            return
+
+        live_order.exchange_id = exchange_id
+        with self._orders_lock:
+            self._exid_to_coid[exchange_id] = req.client_oid
+
+        logger.info(
+            f"[OMS] Submitted: {req.purpose} {req.side} {req.qty:.4f} @ "
+            f"{req.price or 'MKT'} exid={exchange_id} [{req.client_oid[:8]}]"
+        )
+
+        if req.exec_inst:
+            self._maker_timeout_handler(req.client_oid, exchange_id, req)
+
+    def _maker_timeout_handler(self, client_oid: str, exchange_id: str, req: OrderRequest):
+        deadline = time.time() + _MAKER_FILL_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(0.5)
+            with self._orders_lock:
+                order = self._orders.get(client_oid)
+                if order is None or order.fill_event is not None:
+                    return
+                if order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED,
+                                    OrderStatus.REJECTED):
+                    return
+
+        logger.info(f"[OMS] Maker timeout — cancelling exid={exchange_id} [{client_oid[:8]}]")
+        self._rest_cancel_order(exchange_id)
+        fill_to_deliver = None
+        with self._orders_lock:
+            order = self._orders.pop(client_oid, None)
+            if order and order.exchange_id:
+                self._exid_to_coid.pop(order.exchange_id, None)
+            if order and not order.cancel_delivered:
+                order.cancel_delivered = True
+                fill_to_deliver = FillEvent(
+                    client_oid=client_oid, order_id=exchange_id,
+                    status=OrderStatus.CANCELLED, filled_qty=order.filled_qty,
+                    avg_price=order.avg_price, fee=order.fee, purpose=req.purpose)
+        if fill_to_deliver:
+            self._deliver_fill(fill_to_deliver)
+
+    # ── REST helpers ──────────────────────────────────────────────────────────
+
+    def _rest_create_order(self, req: OrderRequest):
+        params = {"instrument_name": req.instrument, "side": req.side,
+                  "type": req.order_type, "quantity": str(req.qty),
+                  "client_oid": req.client_oid}
+        if req.price is not None:
+            params["price"] = str(req.price)
+        if req.exec_inst:
+            params["exec_inst"] = req.exec_inst
+        resp = self._signed_post("private/create-order", params)
+        if resp is None:
+            return False, "", "network error"
+        if resp.get("code", -1) != 0:
+            return False, "", f"code={resp.get('code')} msg={resp.get('message')}"
+        order_id = str(resp.get("result", {}).get("order_id", ""))
+        return True, order_id, ""
+
+    def _rest_cancel_order(self, order_id: str) -> bool:
+        resp = self._signed_post("private/cancel-order", {"order_id": order_id})
+        if resp is None:
+            return False
+        return resp.get("code") in (0, 316)   # 316 = already gone
+
+    def _signed_post(self, method: str, params: dict) -> Optional[dict]:
+        req_id = int(time.time() * 1000) % 1_000_000
+        nonce  = int(time.time() * 1000)
+        body   = {"id": req_id, "method": method, "params": params,
+                  "api_key": self.api_key, "nonce": nonce}
+        body["sig"] = self._sign(method, req_id, params, nonce)
+        url = f"{_OMS_REST_BASE}/{method}"
+        try:
+            resp = requests.post(url, json=body, timeout=5.0)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error(f"[OMS] REST error {method}: {e}")
+            return None
+
+    def _sign(self, method: str, req_id: int, params: dict, nonce: int) -> str:
+        param_str = self._params_to_str(params, level=0)
+        payload   = f"{method}{req_id}{self.api_key}{param_str}{nonce}"
+        return hmac.new(self.api_secret.encode("utf-8"),
+                        payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _params_to_str(obj, level: int, max_level: int = 3) -> str:
+        if level >= max_level:
+            return str(obj)
+        if isinstance(obj, dict):
+            result = ""
+            for k in sorted(obj.keys()):
+                v = obj[k]
+                if v is None:
+                    result += k + "null"
+                elif isinstance(v, (dict, list)):
+                    result += k + OMS._params_to_str(v, level + 1, max_level)
+                else:
+                    result += k + str(v)
+            return result
+        if isinstance(obj, list):
+            return "".join(OMS._params_to_str(i, level + 1, max_level) for i in obj)
+        return str(obj)
+
+    # ── WS (live mode) ────────────────────────────────────────────────────────
+
+    def _start_ws(self):
+        self._ws_thread = threading.Thread(
+            target=self._ws_run_forever, name="OMS-ws", daemon=True)
+        self._ws_thread.start()
+
+    def _ws_run_forever(self):
+        delay = 2.0
+        while not self._stop_event.is_set():
+            try:
+                self._ws_app = websocket.WebSocketApp(
+                    _OMS_WS_USER_URL,
+                    on_open    = self._on_ws_open,
+                    on_message = self._on_ws_message,
+                    on_error   = lambda ws, e: logger.error(f"[OMS] WS error: {e}"),
+                    on_close   = lambda ws, c, m: (logger.info(f"[OMS] WS closed {c}"),
+                                                    self._ws_ready.clear()),
+                )
+                self._ws_app.run_forever(ping_interval=0)
+            except Exception as e:
+                logger.error(f"[OMS] WS exception: {e}")
+            if self._stop_event.is_set():
+                break
+            logger.info(f"[OMS] WS reconnecting in {delay:.1f}s")
+            self._ws_ready.clear()
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+
+    def _on_ws_open(self, ws):
+        time.sleep(1.0)
+        nonce  = int(time.time() * 1000)
+        req_id = 10001
+        body   = {"id": req_id, "method": "public/auth",
+                  "api_key": self.api_key, "nonce": nonce}
+        body["sig"] = self._sign("public/auth", req_id, {}, nonce)
+        ws.send(json.dumps(body))
+
+    def _on_ws_message(self, ws, raw: str):
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        method = msg.get("method", "")
+        if method == "public/heartbeat":
+            ws.send(json.dumps({"id": msg["id"], "method": "public/respond-heartbeat"}))
+            return
+        if method == "public/auth":
+            if msg.get("code", -1) == 0:
+                ws.send(json.dumps({
+                    "id": 10002, "method": "subscribe",
+                    "params": {"channels": [f"user.order.{self.instrument}"]},
+                    "nonce": int(time.time() * 1000),
+                }))
+                self._ws_ready.set()
+            else:
+                logger.error(f"[OMS] WS auth FAILED code={msg.get('code')}")
+            return
+        if method == "subscribe":
+            result  = msg.get("result", {})
+            channel = result.get("channel", "")
+            if channel == "user.order":
+                for item in result.get("data", []):
+                    self._handle_order_update(item)
+
+    def _handle_order_update(self, data: dict):
+        exchange_id = str(data.get("order_id", ""))
+        ws_status   = data.get("status", "")
+        filled_qty  = float(data.get("cumulative_quantity", 0))
+        avg_price   = float(data.get("avg_price", 0))
+        cum_fee     = float(data.get("cumulative_fee", 0))
+
+        with self._orders_lock:
+            client_oid = self._exid_to_coid.get(exchange_id)
+            if client_oid is None:
+                return
+            order = self._orders.get(client_oid)
+            if order is None:
+                return
+
+        order.filled_qty = filled_qty
+        order.avg_price  = avg_price
+        order.fee        = cum_fee
+
+        if ws_status == "FILLED":
+            order.status = OrderStatus.FILLED
+            fill = FillEvent(client_oid=client_oid, order_id=exchange_id,
+                             status=OrderStatus.FILLED, filled_qty=filled_qty,
+                             avg_price=avg_price, fee=cum_fee, purpose=order.req.purpose)
+            order.fill_event = fill
+            with self._orders_lock:
+                self._orders.pop(client_oid, None)
+                self._exid_to_coid.pop(exchange_id, None)
+            self._deliver_fill(fill)
+
+        elif ws_status == "CANCELED":
+            fill_to_deliver = None
+            with self._orders_lock:
+                live = self._orders.get(client_oid)
+                if live and not live.cancel_delivered:
+                    live.cancel_delivered = True
+                    self._orders.pop(client_oid, None)
+                    self._exid_to_coid.pop(exchange_id, None)
+                    fill_to_deliver = FillEvent(
+                        client_oid=client_oid, order_id=exchange_id,
+                        status=OrderStatus.CANCELLED, filled_qty=filled_qty,
+                        avg_price=avg_price, fee=cum_fee, purpose=live.req.purpose)
+            if fill_to_deliver:
+                self._deliver_fill(fill_to_deliver)
+
+        elif ws_status == "REJECTED":
+            with self._orders_lock:
+                self._orders.pop(client_oid, None)
+                self._exid_to_coid.pop(exchange_id, None)
+            self._deliver_fill(FillEvent(client_oid=client_oid, order_id=exchange_id,
+                                         status=OrderStatus.REJECTED, purpose=order.req.purpose))
+
+        elif ws_status in ("NEW", "ACTIVE"):
+            order.status = OrderStatus.ACTIVE
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _deliver_fill(self, fill: FillEvent):
+        with self._fill_queues_lock:
+            q = self._fill_queues.get(fill.client_oid)
+        if q is not None:
+            try:
+                q.put_nowait(fill)
+            except queue.Full:
+                pass
+        logger.debug(
+            f"[OMS] Fill delivered: {fill.purpose} {fill.status.value} "
+            f"qty={fill.filled_qty:.4f} avg={fill.avg_price:.2f} "
+            f"fee={fill.fee:+.6f} [{fill.client_oid[:8]}]"
+        )
+
+    def _round_qty(self, qty: float) -> float:
+        factor = 10 ** self._qty_decimals
+        return round(round(qty * factor) / factor, self._qty_decimals)
+
+    def _load_instrument_spec(self):
+        try:
+            url  = f"{_OMS_REST_BASE}/public/get-instruments"
+            resp = requests.get(url, params={"instrument_name": self.instrument}, timeout=5.0)
+            resp.raise_for_status()
+            data = resp.json()
+            for inst in data.get("result", {}).get("data", []):
+                if inst.get("symbol") == self.instrument:
+                    qty_tick = float(inst.get("qty_tick_size", 0.0001))
+                    tick_str = f"{qty_tick:.10f}".rstrip("0")
+                    if "." in tick_str:
+                        self._qty_decimals = len(tick_str.split(".")[1])
+                    self._price_decimals = int(inst.get("quote_decimals", 2))
+                    logger.info(
+                        f"[OMS] Instrument spec: {self.instrument} "
+                        f"qty_tick={qty_tick} qty_dec={self._qty_decimals} "
+                        f"price_dec={self._price_decimals}"
+                    )
+                    return
+        except Exception as e:
+            logger.warning(f"[OMS] Could not load instrument spec: {e} — using defaults")
+
+    def _cancel_all_dangling(self):
+        with self._orders_lock:
+            dangling = list(self._orders.items())
+        for client_oid, order in dangling:
+            if (order.exchange_id and
+                    order.status in (OrderStatus.PENDING, OrderStatus.ACTIVE)):
+                logger.info(f"[OMS] Cancelling dangling order {order.exchange_id}")
+                self._rest_cancel_order(order.exchange_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket market feed  (copied from funding_arb/ws_manager.py _ReconnectingWS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ReconnectingWS:
+    """
+    Generation-tagged WS with DOA detection + stale-data watchdog.
+    Copied from funding_arb/ws_manager.py.
+    """
+    _DOA_THRESHOLD_S  = 10
+    _DOA_BACKOFF_STEP = 60
+    _DOA_MAX_BACKOFF  = 300
+    _DOA_LONG_STREAK  = 5
+    _DOA_LONG_PAUSE   = 1800
+
+    def __init__(self, name: str, url: str,
+                 subscribe_msg_fn: Callable[[], List[dict]],
+                 on_message_fn: Callable[[dict], None],
+                 stale_s: float, backoff_init: float, backoff_max: float,
+                 stop_event: threading.Event) -> None:
+        self._name             = name
+        self._url              = url
+        self._subscribe_msg_fn = subscribe_msg_fn
+        self._on_message_fn    = on_message_fn
+        self._stale_s          = stale_s
+        self._backoff_init     = backoff_init
+        self._backoff_max      = backoff_max
+        self._stop             = stop_event
+
+        self._gen_lock  = threading.Lock()
+        self._gen       = 0
+        self._ws_app: Optional[websocket.WebSocketApp] = None
+
+        self._last_msg_time = time.time()
+        self._last_msg_lock = threading.Lock()
+
+        self._consecutive_doa   = 0
+        self._doa_lock          = threading.Lock()
+        self._connect_time      = 0.0
+        self._connect_time_lock = threading.Lock()
+        self._first_msg_event   = threading.Event()
+        self._reconnect_pending = threading.Event()
+        self._abandon_event     = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._reconnect_loop,
+                         name=f"WSLoop-{self._name}", daemon=True).start()
+        threading.Thread(target=self._watchdog,
+                         name=f"WSWatchdog-{self._name}", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._abandon_event.set()
+        with self._gen_lock:
+            if self._ws_app:
+                try:
+                    self._ws_app.close()
+                except Exception:
+                    pass
+
+    def _reconnect_loop(self) -> None:
+        backoff = self._backoff_init
+        while not self._stop.is_set():
+            with self._connect_time_lock:
+                self._connect_time = time.time()
+            self._first_msg_event.clear()
+            self._abandon_event.clear()
+            self._reconnect_pending.clear()
+
+            with self._gen_lock:
+                self._gen += 1
+                my_gen = self._gen
+                app = websocket.WebSocketApp(
+                    self._url,
+                    on_open    = lambda ws:               self._on_open(ws, my_gen),
+                    on_message = lambda ws, msg:          self._on_raw_message(ws, msg, my_gen),
+                    on_error   = lambda ws, err:          self._on_error(ws, err, my_gen),
+                    on_close   = lambda ws, code, reason: self._on_close(ws, code, reason, my_gen),
+                )
+                app._gen     = my_gen
+                self._ws_app = app
+
+            logger.info(f"[{self._name}] connecting (gen={my_gen})")
+
+            def _worker(a=app, g=my_gen):
+                try:
+                    a.run_forever(ping_interval=0)
+                except Exception as e:
+                    if g == self._gen:
+                        logger.error(f"[{self._name}] run_forever error (gen={g}): {e}")
+
+            worker = threading.Thread(target=_worker,
+                                       name=f"WSWorker-{self._name}-g{my_gen}", daemon=True)
+            worker.start()
+
+            doa = False
+            while True:
+                worker.join(timeout=1.0)
+                if not worker.is_alive():
+                    break
+                if self._stop.is_set():
+                    break
+                with self._connect_time_lock:
+                    ct = self._connect_time
+                if (ct > 0 and not self._first_msg_event.is_set()
+                        and (time.time() - ct) > self._DOA_THRESHOLD_S):
+                    logger.warning(
+                        f"[{self._name}] DOA gen={my_gen}: "
+                        f"no messages {self._DOA_THRESHOLD_S}s after on_open")
+                    doa = True
+                    self._reconnect_pending.set()
+                    try:
+                        app.close()
+                    except Exception:
+                        pass
+                    worker.join(timeout=5.0)
+                    break
+                if self._abandon_event.is_set():
+                    logger.warning(f"[{self._name}] gen={my_gen} abandoned by watchdog")
+                    self._reconnect_pending.set()
+                    try:
+                        app.close()
+                    except Exception:
+                        pass
+                    worker.join(timeout=5.0)
+                    break
+
+            if self._stop.is_set():
+                break
+
+            if doa:
+                with self._doa_lock:
+                    self._consecutive_doa += 1
+                    streak = self._consecutive_doa
+                if streak >= self._DOA_LONG_STREAK:
+                    sleep_s = self._DOA_LONG_PAUSE
+                    logger.warning(f"[{self._name}] {streak} DOAs — long pause {sleep_s}s")
+                else:
+                    sleep_s = min(self._backoff_init + self._DOA_BACKOFF_STEP * streak,
+                                  self._DOA_MAX_BACKOFF)
+                    logger.warning(f"[{self._name}] DOA streak={streak} — backoff {sleep_s}s")
+            else:
+                with self._doa_lock:
+                    self._consecutive_doa = 0
+                sleep_s = backoff
+                backoff  = min(backoff * 2, self._backoff_max)
+                logger.info(f"[{self._name}] disconnected — reconnecting in {sleep_s}s")
+
+            for _ in range(int(sleep_s)):
+                if self._stop.is_set():
+                    break
+                time.sleep(1)
+
+    def _is_current(self, ws) -> bool:
+        return getattr(ws, "_gen", None) == self._gen
+
+    def _on_open(self, ws, gen: int) -> None:
+        if not self._is_current(ws):
+            return
+        logger.info(f"[{self._name}] connected (gen={gen})")
+        with self._connect_time_lock:
+            self._connect_time = time.time()
+        with self._last_msg_lock:
+            self._last_msg_time = time.time()
+        time.sleep(1.0)
+        for msg in self._subscribe_msg_fn():
+            ws.send(json.dumps(msg))
+
+    def _on_raw_message(self, ws, raw: str, gen: int) -> None:
+        if not self._is_current(ws):
+            return
+        with self._last_msg_lock:
+            self._last_msg_time = time.time()
+        if not self._first_msg_event.is_set():
+            self._first_msg_event.set()
+            with self._doa_lock:
+                self._consecutive_doa = 0
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        method = data.get("method", "")
+        if method == "public/heartbeat":
+            ws.send(json.dumps({"id": data.get("id"),
+                                 "method": "public/respond-heartbeat"}))
+            return
+        if method == "subscribe":
+            code = data.get("code", -1)
+            if code != 0:
+                logger.error(f"[{self._name}] subscription FAILED code={code} "
+                              f"msg={data.get('message','')} (gen={gen})")
+                return
+            result_block = data.get("result", {})
+            if not result_block.get("data"):
+                sub = (result_block.get("subscription", "")
+                       or result_block.get("channel", "") or repr(result_block))
+                logger.debug(f"[{self._name}] subscribed: {sub} (gen={gen})")
+                return
+        try:
+            self._on_message_fn(data)
+        except Exception as e:
+            logger.error(f"[{self._name}] on_message_fn error: {e}", exc_info=True)
+
+    def _on_error(self, ws, error, gen: int) -> None:
+        if self._is_current(ws):
+            logger.warning(f"[{self._name}] WS error (gen={gen}): {error}")
+
+    def _on_close(self, ws, code, reason, gen: int) -> None:
+        if self._is_current(ws):
+            logger.info(f"[{self._name}] disconnected (gen={gen}) code={code}")
+
+    def _watchdog(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(5)
+            if self._reconnect_pending.is_set():
+                continue
+            with self._last_msg_lock:
+                age = time.time() - self._last_msg_time
+            if age > self._stale_s:
+                logger.warning(
+                    f"[{self._name}] stale data ({age:.0f}s > {self._stale_s}s)"
+                    f" — signalling reconnect")
+                self._reconnect_pending.set()
+                self._abandon_event.set()
+                with self._last_msg_lock:
+                    self._last_msg_time = time.time()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Price cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PriceCache:
+    """Thread-safe L1 cache + rolling tick history for ATR computation."""
+    HISTORY_WINDOW_S = 86400   # keep 24h
+
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self._bid: Optional[float] = None
+        self._ask: Optional[float] = None
+        self._mid: Optional[float] = None
+        self._history: collections.deque = collections.deque(maxlen=30000)
+
+    def update_l1(self, bid: float, ask: float):
+        with self._lock:
+            self._bid = bid
+            self._ask = ask
+            self._mid = (bid + ask) / 2.0
+            now = time.time()
+            self._history.append((now, self._mid))
+            cutoff = now - self.HISTORY_WINDOW_S
+            while self._history and self._history[0][0] < cutoff:
+                self._history.popleft()
+
+    def get_mid(self) -> Optional[float]:
+        with self._lock:
+            return self._mid
+
+    def get_l1(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        with self._lock:
+            return self._bid, self._ask, self._mid
+
+    def compute_atr(self, lookback_minutes: int = 1440) -> Optional[float]:
+        """
+        ATR from rolling 1-min candles built from tick history.
+        Returns per-minute ATR in price points.
+        """
+        with self._lock:
+            history = list(self._history)
+
+        if len(history) < 10:
+            return None
+
+        cutoff = time.time() - lookback_minutes * 60
+        recent = [(ts, mid) for ts, mid in history if ts >= cutoff]
+        if len(recent) < 10:
+            recent = history[-100:]
+
+        candles: Dict[int, dict] = {}
+        for ts, mid in recent:
+            k = int(ts // 60)
+            if k not in candles:
+                candles[k] = {"open": mid, "high": mid, "low": mid, "close": mid}
+            else:
+                c = candles[k]
+                c["high"]  = max(c["high"], mid)
+                c["low"]   = min(c["low"],  mid)
+                c["close"] = mid
+
+        sorted_c = [candles[k] for k in sorted(candles.keys())]
+        if len(sorted_c) < 2:
+            return None
+
+        trs = []
+        for i in range(1, len(sorted_c)):
+            prev = sorted_c[i - 1]["close"]
+            curr = sorted_c[i]
+            trs.append(max(curr["high"] - curr["low"],
+                           abs(curr["high"] - prev),
+                           abs(curr["low"]  - prev)))
+        return sum(trs) / len(trs) if trs else None
+
+    def warmup_complete(self, min_seconds: int) -> bool:
+        with self._lock:
+            if not self._history:
+                return False
+            return (time.time() - self._history[0][0]) >= min_seconds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grid geometry
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class GridParams:
+    lower:      float
+    upper:      float
+    levels:     int
+    spacing:    float
+    stop_price: float
+    notional_per_level: float
+    computed_at: float = field(default_factory=time.time)
+
+    @property
+    def level_prices(self) -> List[float]:
+        return [round(self.lower + i * self.spacing, 2) for i in range(self.levels + 1)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-tuner
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GridAutoTuner:
+    def __init__(self, config: dict, cache: PriceCache):
+        self._cfg   = config
+        self._cache = cache
+
+    def compute(self) -> Optional[GridParams]:
+        mid = self._cache.get_mid()
+        if mid is None:
+            logger.warning("[AutoTuner] No mid price")
+            return None
+
+        atr = self._cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
+        if atr is None or atr <= 0:
+            logger.warning("[AutoTuner] ATR unavailable — using config fallback")
+            return self._from_config(mid)
+
+        atr_mult   = self._cfg.get("atr_multiplier", 3.0)
+        stop_buf   = self._cfg.get("stop_buffer_atr", 1.0)
+        maker_fee  = self._cfg.get("maker_fee_rate", 0.0001)
+        min_sp_pct = self._cfg.get("min_grid_pct", 0.0008)
+        max_levels = self._cfg.get("max_grid_levels", 50)
+        min_levels = self._cfg.get("min_grid_levels", 5)
+        notional   = self._cfg.get("notional_per_level", 500.0)
+
+        lower = round(mid - atr_mult * atr, 2)
+        upper = round(mid + atr_mult * atr, 2)
+        stop  = round(lower - stop_buf * atr, 2)
+
+        min_spacing = max(min_sp_pct * mid, 2.0 * maker_fee * mid * 1.5)
+        raw_levels  = int((upper - lower) / min_spacing)
+        levels      = max(min_levels, min(max_levels, raw_levels))
+        spacing     = round((upper - lower) / levels, 2)
+
+        logger.info(
+            f"[AutoTuner] mid={mid:.2f} ATR={atr:.2f} "
+            f"range=[{lower:.2f},{upper:.2f}] levels={levels} "
+            f"spacing={spacing:.2f} stop={stop:.2f}"
+        )
+        return GridParams(lower=lower, upper=upper, levels=levels,
+                          spacing=spacing, stop_price=stop,
+                          notional_per_level=notional)
+
+    def _from_config(self, mid: float) -> GridParams:
+        lower   = self._cfg.get("grid_lower",   mid * 0.92)
+        upper   = self._cfg.get("grid_upper",   mid * 1.08)
+        levels  = self._cfg.get("grid_levels",  20)
+        stop    = self._cfg.get("stop_loss_price", lower * 0.97)
+        notional = self._cfg.get("notional_per_level", 500.0)
+        spacing = round((upper - lower) / max(levels, 1), 2)
+        return GridParams(lower=lower, upper=upper, levels=levels,
+                          spacing=spacing, stop_price=stop,
+                          notional_per_level=notional)
+
+    def should_retune(self, current: GridParams, mid: float, last_tune: float) -> bool:
+        if mid < current.lower or mid > current.upper:
+            logger.info(f"[AutoTuner] Price {mid:.2f} outside range → retune")
+            return True
+        interval_s = self._cfg.get("retune_interval_hours", 24) * 3600
+        if time.time() - last_tune > interval_s:
+            logger.info("[AutoTuner] Periodic retune interval elapsed")
+            return True
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grid level state
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LevelState(Enum):
+    IDLE      = "IDLE"
+    BUY_OPEN  = "BUY_OPEN"
+    SELL_OPEN = "SELL_OPEN"
+
+
+@dataclass
+class GridLevel:
+    index:      int
+    price:      float
+    state:      LevelState = LevelState.IDLE
+    client_oid: str        = ""
+    qty:        float      = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grid engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GridEngine:
+    """
+    Manages limit order ladder on BTCUSD-PERP.
+
+    Paper-mode fill detection:
+      OMS._paper_fill() returns FillEvent instantly when submit() is called.
+      But the engine does NOT actually poll wait_fill() — instead, in paper mode
+      the GridBot main loop calls check_price_fills(mid) on every tick:
+      if mid crossed a level's limit price, the engine simulates the fill
+      directly (avoids background OMS threading complexity for grid orders).
+
+    Live-mode fill detection:
+      OMS WS delivers FILLED events; engine polls wait_fill(timeout=0) each tick.
+    """
+
+    def __init__(self, params: GridParams, oms: OMS,
+                 instrument: str, config: dict):
+        self._params     = params
+        self._oms        = oms
+        self._instrument = instrument
+        self._cfg        = config
+        self._lock       = threading.Lock()
+        self._levels: List[GridLevel] = []
+        self._stop_event = threading.Event()
+
+        # Accounting
+        self._long_qty:     float = 0.0
+        self._realized_pnl: float = 0.0
+        self._total_fees:   float = 0.0
+        self._cycle_count:  int   = 0
+
+        # Fill queue for _fill_thread
+        self._fill_queue: collections.deque = collections.deque()
+        self._fill_event  = threading.Event()
+        self._fill_thread: Optional[threading.Thread] = None
+
+        self._build_levels()
+
+    def _build_levels(self):
+        prices = self._params.level_prices
+        with self._lock:
+            self._levels = [GridLevel(index=i, price=p) for i, p in enumerate(prices)]
+        logger.info(
+            f"[GridEngine] {len(self._levels)} levels: "
+            f"{self._levels[0].price:.2f} … {self._levels[-1].price:.2f}"
+        )
+
+    def start(self, mid: float):
+        self._fill_thread = threading.Thread(
+            target=self._fill_loop, name="Grid-fills", daemon=True)
+        self._fill_thread.start()
+        self._place_initial_orders(mid)
+        logger.info("[GridEngine] Started")
+
+    def stop(self):
+        self._stop_event.set()
+        self._fill_event.set()
+        if self._fill_thread:
+            self._fill_thread.join(timeout=5)
+        with self._lock:
+            for lv in self._levels:
+                lv.state      = LevelState.IDLE
+                lv.client_oid = ""
+
+    # ── Initial placement ─────────────────────────────────────────────────────
+
+    def _place_initial_orders(self, mid: float):
+        with self._lock:
+            levels = list(self._levels)
+        for lv in levels:
+            if self._stop_event.is_set():
+                break
+            if lv.price < mid:
+                self._place_buy(lv)
+            elif lv.price > mid:
+                self._place_sell(lv)
+            time.sleep(0.05)
+
+    # ── Order placement ───────────────────────────────────────────────────────
+
+    def _qty(self, price: float) -> float:
+        raw = self._params.notional_per_level / price
+        return round(math.floor(raw * 10000) / 10000, 4)
+
+    def _place_buy(self, lv: GridLevel):
+        qty = self._qty(lv.price)
+        if qty <= 0:
+            return
+        req = OrderRequest.limit_maker(
+            side="BUY", qty=qty, price=lv.price,
+            instrument=self._instrument, purpose="grid_buy")
+        with self._lock:
+            lv.state      = LevelState.BUY_OPEN
+            lv.client_oid = req.client_oid
+            lv.qty        = qty
+        self._oms.submit(req)
+        logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
+
+    def _place_sell(self, lv: GridLevel):
+        qty = self._qty(lv.price)
+        if qty <= 0:
+            return
+        req = OrderRequest.limit_maker(
+            side="SELL", qty=qty, price=lv.price,
+            instrument=self._instrument, purpose="grid_sell")
+        with self._lock:
+            lv.state      = LevelState.SELL_OPEN
+            lv.client_oid = req.client_oid
+            lv.qty        = qty
+        self._oms.submit(req)
+        logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
+
+    # ── Fill detection ────────────────────────────────────────────────────────
+
+    def check_price_fills(self, mid: float):
+        """
+        Called every tick by GridBot.
+        Paper mode: detects fill by price crossing; simulates accounting directly.
+        Live mode: polls OMS wait_fill(timeout=0) for each open order.
+        Also checks trailing up/down conditions.
+        """
+        if self._oms.live_trading:
+            self._poll_live_fills()
+        else:
+            self._simulate_paper_fills(mid)
+
+        # Trailing checks run after fills so counter-orders are placed first
+        self._check_trailing(mid)
+
+    def _simulate_paper_fills(self, mid: float):
+        """
+        Paper fill simulation:
+          BUY  fills when mid drops to/below lv.price (seller crosses our bid)
+          SELL fills when mid rises to/above lv.price (buyer crosses our ask)
+        This matches real exchange matching: our resting limit is hit by a
+        market order on the opposite side.
+        """
+        with self._lock:
+            levels = list(self._levels)
+
+        for lv in levels:
+            filled = False
+            if lv.state == LevelState.BUY_OPEN  and mid <= lv.price:
+                filled = True
+            elif lv.state == LevelState.SELL_OPEN and mid >= lv.price:
+                filled = True
+
+            if filled:
+                maker_fee = self._cfg.get("maker_fee_rate", 0.0001)
+                fee = lv.price * lv.qty * maker_fee
+                fill = FillEvent(
+                    client_oid=lv.client_oid,
+                    order_id=f"paper-{lv.client_oid[:8]}",
+                    status=OrderStatus.FILLED,
+                    filled_qty=lv.qty,
+                    avg_price=lv.price,
+                    fee=fee,
+                    purpose=lv.state.value.lower(),   # "buy_open" → "grid_buy" below
+                )
+                # Rewrite purpose to match convention
+                fill.purpose = ("grid_buy" if lv.state == LevelState.BUY_OPEN
+                                else "grid_sell")
+                with self._lock:
+                    lv.state      = LevelState.IDLE
+                    lv.client_oid = ""
+                self._fill_queue.append((lv.index, fill))
+                self._fill_event.set()
+
+    def _poll_live_fills(self):
+        """Live mode: check each open order for OMS fill delivery."""
+        with self._lock:
+            levels = list(self._levels)
+
+        for lv in levels:
+            if lv.state == LevelState.IDLE or not lv.client_oid:
+                continue
+            fill = self._oms.wait_fill(lv.client_oid, timeout=0.0)
+            if fill is None:
+                continue
+            with self._lock:
+                if fill.is_filled:
+                    lv.state      = LevelState.IDLE
+                    lv.client_oid = ""
+                    self._fill_queue.append((lv.index, fill))
+                    self._fill_event.set()
+                elif fill.is_cancelled:
+                    # Timeout cancel — re-place same side
+                    lv.state      = LevelState.IDLE
+                    lv.client_oid = ""
+                    # Will be re-placed by _replace_idle_levels() next tick
+
+        self._replace_idle_levels()
+
+    def _replace_idle_levels(self):
+        """Re-place any IDLE levels that should have an order."""
+        mid = _price_cache.get_mid()
+        if mid is None:
+            return
+        with self._lock:
+            idle = [lv for lv in self._levels if lv.state == LevelState.IDLE]
+        for lv in idle:
+            if lv.price < mid:
+                self._place_buy(lv)
+            elif lv.price > mid:
+                self._place_sell(lv)
+
+    # ── Trailing ──────────────────────────────────────────────────────────────
+
+    def _check_trailing(self, mid: float):
+        """
+        Evaluate trailing up/down conditions and shift grid one level if triggered.
+
+        Trailing Up:
+          Trigger: mid >= upper + spacing  (price has cleared one full level above grid)
+          Action:  cancel lowest BUY level → drop it from grid → append new SELL
+                   level one spacing above current upper.
+          Cap:     do not trail if new upper would exceed trailing_up_price_cap.
+
+        Trailing Down:
+          Trigger: mid <= lower - spacing  (price has dropped one full level below grid)
+          Action:  cancel highest SELL level → drop it from grid → prepend new BUY
+                   level one spacing below current lower.
+          Cap:     do not trail if new lower would go below trailing_down_price_cap
+                   (or stop_loss_price, whichever is higher).
+        """
+        with self._lock:
+            if len(self._levels) < 2:
+                return
+            current_lower   = self._levels[0].price
+            current_upper   = self._levels[-1].price
+            spacing         = self._params.spacing
+
+        trail_up   = self._cfg.get("trailing_up_enabled",   False)
+        trail_down = self._cfg.get("trailing_down_enabled", False)
+
+        if trail_up and mid >= current_upper + spacing:
+            cap = self._cfg.get("trailing_up_price_cap", 0.0)
+            new_upper = round(current_upper + spacing, 2)
+            if cap and new_upper > cap:
+                logger.info(
+                    f"[GridEngine] Trail-up blocked: new_upper={new_upper:.2f} "
+                    f"> cap={cap:.2f}"
+                )
+            else:
+                self._trail_up(current_lower, current_upper, spacing)
+
+        if trail_down and mid <= current_lower - spacing:
+            floor = self._cfg.get("trailing_down_price_cap", 0.0)
+            stop  = self._params.stop_price
+            effective_floor = max(floor, stop) if floor else stop
+            new_lower = round(current_lower - spacing, 2)
+            if effective_floor and new_lower < effective_floor:
+                logger.info(
+                    f"[GridEngine] Trail-down blocked: new_lower={new_lower:.2f} "
+                    f"< floor={effective_floor:.2f}"
+                )
+            else:
+                self._trail_down(current_lower, current_upper, spacing)
+
+    def _trail_up(self, old_lower: float, old_upper: float, spacing: float):
+        """
+        Shift grid up by one level:
+          1. Cancel the lowest BUY level (old_lower).
+          2. Remove it from the levels list.
+          3. Append a new SELL level at old_upper + spacing.
+        """
+        new_upper = round(old_upper + spacing, 2)
+        logger.info(
+            f"[GridEngine] TRAIL UP: dropping lower={old_lower:.2f}, "
+            f"adding upper={new_upper:.2f}"
+        )
+
+        with self._lock:
+            # Step 1: remove bottom level and cancel its order
+            if not self._levels:
+                return
+            bottom = self._levels[0]
+            if bottom.state != LevelState.IDLE and bottom.client_oid:
+                # Mark idle so poll_fills won't try to re-place it
+                bottom.state      = LevelState.IDLE
+                bottom.client_oid = ""
+            self._levels.pop(0)
+            # Re-index remaining levels
+            for i, lv in enumerate(self._levels):
+                lv.index = i
+
+            # Step 2: append new SELL level at the top
+            new_idx = len(self._levels)
+            new_lv  = GridLevel(index=new_idx, price=new_upper)
+            self._levels.append(new_lv)
+            self._params = GridParams(
+                lower=self._levels[0].price,
+                upper=new_upper,
+                levels=len(self._levels) - 1,
+                spacing=spacing,
+                stop_price=self._params.stop_price,
+                notional_per_level=self._params.notional_per_level,
+            )
+
+        # Place the new SELL outside the lock
+        self._place_sell(new_lv)
+        self._alerter_send(
+            f"⬆️ Grid trailed UP → [{self._params.lower:.0f}, {new_upper:.0f}]"
+        )
+
+    def _trail_down(self, old_lower: float, old_upper: float, spacing: float):
+        """
+        Shift grid down by one level:
+          1. Cancel the highest SELL level (old_upper).
+          2. Remove it from the levels list.
+          3. Prepend a new BUY level at old_lower - spacing.
+        """
+        new_lower = round(old_lower - spacing, 2)
+        logger.info(
+            f"[GridEngine] TRAIL DOWN: dropping upper={old_upper:.2f}, "
+            f"adding lower={new_lower:.2f}"
+        )
+
+        with self._lock:
+            if not self._levels:
+                return
+            top = self._levels[-1]
+            if top.state != LevelState.IDLE and top.client_oid:
+                top.state      = LevelState.IDLE
+                top.client_oid = ""
+            self._levels.pop()
+
+            # Prepend new BUY level at the bottom
+            new_lv = GridLevel(index=0, price=new_lower)
+            self._levels.insert(0, new_lv)
+            # Re-index
+            for i, lv in enumerate(self._levels):
+                lv.index = i
+            self._params = GridParams(
+                lower=new_lower,
+                upper=self._levels[-1].price,
+                levels=len(self._levels) - 1,
+                spacing=spacing,
+                stop_price=self._params.stop_price,
+                notional_per_level=self._params.notional_per_level,
+            )
+
+        # Place the new BUY outside the lock
+        self._place_buy(new_lv)
+        self._alerter_send(
+            f"⬇️ Grid trailed DOWN → [{new_lower:.0f}, {self._params.upper:.0f}]"
+        )
+
+    def _alerter_send(self, msg: str):
+        """Best-effort alert — engine holds no reference to alerter; uses module global."""
+        try:
+            _grid_bot_alerter.send(msg)
+        except Exception:
+            pass
+
+    # ── Fill processing thread ────────────────────────────────────────────────
+
+    def _fill_loop(self):
+        while not self._stop_event.is_set():
+            self._fill_event.wait(timeout=1.0)
+            self._fill_event.clear()
+            while self._fill_queue:
+                try:
+                    idx, fill = self._fill_queue.popleft()
+                except IndexError:
+                    break
+                self._on_fill(idx, fill)
+
+    def _on_fill(self, idx: int, fill: FillEvent):
+        # Snapshot the level reference and intent under lock, then release
+        # before calling _place_buy/_place_sell (which acquire lock themselves).
+        with self._lock:
+            if idx < 0 or idx >= len(self._levels):
+                return
+            is_buy = fill.purpose == "grid_buy"
+
+        self._total_fees += fill.fee
+
+        if is_buy:
+            self._long_qty += fill.filled_qty
+            logger.info(
+                f"[GridEngine] FILL BUY  [{idx}] @ {fill.avg_price:.2f} "
+                f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} "
+                f"long={self._long_qty:.4f} BTC"
+            )
+            # Snapshot counter-level under lock, then place outside lock
+            sell_lv = None
+            sell_idx = idx + 1
+            with self._lock:
+                if sell_idx < len(self._levels):
+                    candidate = self._levels[sell_idx]
+                    if candidate.state == LevelState.IDLE:
+                        sell_lv = candidate
+            if sell_lv is not None:
+                self._place_sell(sell_lv)
+        else:
+            self._long_qty -= fill.filled_qty
+            buy_price = self._get_paired_buy_price(idx)
+            gross_pnl = (fill.avg_price - buy_price) * fill.filled_qty if buy_price else 0.0
+            self._realized_pnl += gross_pnl
+            self._cycle_count  += 1
+            net_pnl = gross_pnl - fill.fee
+            logger.info(
+                f"[GridEngine] FILL SELL [{idx}] @ {fill.avg_price:.2f} "
+                f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} | "
+                f"cycle #{self._cycle_count} gross={gross_pnl:+.4f} net={net_pnl:+.4f} "
+                f"cumulative_net={self._realized_pnl - self._total_fees:+.4f} USD"
+            )
+            # Snapshot counter-level under lock, then place outside lock
+            buy_lv = None
+            buy_idx = idx - 1
+            with self._lock:
+                if buy_idx >= 0:
+                    candidate = self._levels[buy_idx]
+                    if candidate.state == LevelState.IDLE:
+                        buy_lv = candidate
+            if buy_lv is not None:
+                self._place_buy(buy_lv)
+
+    def _get_paired_buy_price(self, sell_idx: int) -> Optional[float]:
+        with self._lock:
+            buy_idx = sell_idx - 1
+            if 0 <= buy_idx < len(self._levels):
+                return self._levels[buy_idx].price
+        return None
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            open_buys  = sum(1 for lv in self._levels if lv.state == LevelState.BUY_OPEN)
+            open_sells = sum(1 for lv in self._levels if lv.state == LevelState.SELL_OPEN)
+        return {
+            "levels":       len(self._levels),
+            "open_buys":    open_buys,
+            "open_sells":   open_sells,
+            "long_qty":     round(self._long_qty, 4),
+            "realized_pnl": round(self._realized_pnl, 4),
+            "total_fees":   round(self._total_fees, 6),
+            "net_pnl":      round(self._realized_pnl - self._total_fees, 4),
+            "cycles":       self._cycle_count,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stop-loss guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StopLossGuard:
+    def __init__(self, stop_price: float, config: dict):
+        self._stop_price = stop_price
+        self._enabled    = config.get("stop_loss_enabled", True)
+        self._triggered  = False
+
+    def update_price(self, price: float):
+        self._stop_price = price
+
+    def check(self, mid: float) -> bool:
+        if self._triggered or not self._enabled:
+            return self._triggered
+        if self._stop_price > 0 and mid < self._stop_price:
+            logger.warning(
+                f"[StopLoss] TRIGGERED: mid={mid:.2f} < stop={self._stop_price:.2f}")
+            self._triggered = True
+        return self._triggered
+
+    @property
+    def triggered(self) -> bool:
+        return self._triggered
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level price cache (shared across components)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_price_cache = PriceCache()
+
+# Module-level alerter reference set by GridBot.__init__ so GridEngine can
+# send trailing alerts without holding a back-reference to GridBot.
+class _NullAlerter:
+    def send(self, msg: str): pass
+_grid_bot_alerter: AlertManager = _NullAlerter()  # type: ignore
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GridBot — top-level controller
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GridBot:
+    STATUS_INTERVAL_S     = 60.0
+    RETUNE_CHECK_INTERVAL = 300.0
+
+    def __init__(self, config: dict):
+        self._cfg         = config
+        self._stop_event  = threading.Event()
+        self._engine:     Optional[GridEngine]    = None
+        self._params:     Optional[GridParams]    = None
+        self._sl_guard:   Optional[StopLossGuard] = None
+        self._alerter:    AlertManager            = AlertManager(config)
+        global _grid_bot_alerter
+        _grid_bot_alerter = self._alerter
+        self._last_tune:  float = 0.0
+        self._last_status:float = 0.0
+        self._last_retune_check: float = 0.0
+        self._halted:     bool  = False
+
+        self._oms = OMS(
+            api_key      = config.get("api_key", ""),
+            api_secret   = config.get("api_secret", ""),
+            instrument   = INSTRUMENT,
+            live_trading = config.get("live_trading", False),
+            config       = config,
+        )
+        self._auto_tuner = GridAutoTuner(config, _price_cache)
+
+        # WS market feed
+        self._ws_stop = threading.Event()
+        self._market_ws = _ReconnectingWS(
+            name             = "MarketWS",
+            url              = config.get("ws_market_url", "wss://stream.crypto.com/exchange/v1/market"),
+            subscribe_msg_fn = self._ws_subscriptions,
+            on_message_fn    = self._handle_market_message,
+            stale_s          = config.get("ws_stale_threshold_s", 20),
+            backoff_init     = config.get("ws_reconnect_backoff_s", 2),
+            backoff_max      = config.get("ws_max_backoff_s", 60),
+            stop_event       = self._ws_stop,
+        )
+
+    # ── WS subscriptions ──────────────────────────────────────────────────────
+
+    def _ws_subscriptions(self) -> List[dict]:
+        return [{
+            "id": 1,
+            "method": "subscribe",
+            "params": {"channels": [f"ticker.{INSTRUMENT}"]},
+        }]
+
+    def _handle_market_message(self, data: dict) -> None:
+        result  = data.get("result", {})
+        channel = result.get("subscription", "") or result.get("channel", "")
+        items   = result.get("data", [])
+        if not items:
+            return
+        if "ticker" in channel:
+            t   = items[0]
+            bid = t.get("b")
+            ask = t.get("k")
+            if bid and ask:
+                _price_cache.update_l1(float(bid), float(ask))
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self):
+        logger.info("[GridBot] Starting")
+        self._oms.start()
+        self._market_ws.start()
+
+        warmup_s = self._cfg.get("min_warmup_seconds", 60)
+        logger.info(f"[GridBot] Waiting {warmup_s}s for price data warmup...")
+        while not _price_cache.warmup_complete(warmup_s):
+            if self._stop_event.is_set():
+                return
+            mid = _price_cache.get_mid()
+            logger.info(f"[GridBot] Warming up... mid={'%.2f' % mid if mid else 'N/A'}")
+            time.sleep(5)
+
+        logger.info("[GridBot] Warmup complete")
+        self._alerter.send(f"🟢 GridBot started — {TRADING_MODE.upper()} | {INSTRUMENT}")
+
+        self._rebuild_grid()
+        self._run()
+
+    def stop(self):
+        logger.info("[GridBot] Stopping")
+        self._stop_event.set()
+        self._ws_stop.set()
+        self._market_ws.stop()
+        if self._engine:
+            self._engine.stop()
+        self._oms.stop()
+        self._alerter.send_sync(f"🔴 GridBot stopped")
+        self._alerter.stop()
+        logger.info("[GridBot] Stopped")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def _run(self):
+        logger.info("[GridBot] Main loop running")
+        while not self._stop_event.is_set():
+            if self._halted:
+                time.sleep(1)
+                continue
+
+            mid = _price_cache.get_mid()
+            if mid is None:
+                time.sleep(0.2)
+                continue
+
+            # Stop-loss
+            if self._sl_guard and self._sl_guard.check(mid):
+                self._emergency_halt(mid)
+                continue
+
+            # Fill detection
+            if self._engine:
+                self._engine.check_price_fills(mid)
+
+            now = time.time()
+
+            # Re-tune check
+            if (self._cfg.get("auto_tune_enabled", True)
+                    and self._params is not None
+                    and now - self._last_retune_check > self.RETUNE_CHECK_INTERVAL):
+                self._last_retune_check = now
+                if self._auto_tuner.should_retune(self._params, mid, self._last_tune):
+                    self._rebuild_grid()
+
+            # Periodic status
+            if now - self._last_status > self.STATUS_INTERVAL_S:
+                self._last_status = now
+                self._log_status(mid)
+
+            time.sleep(0.1)
+
+    # ── Grid management ───────────────────────────────────────────────────────
+
+    def _rebuild_grid(self):
+        mid = _price_cache.get_mid()
+        if mid is None:
+            logger.warning("[GridBot] No mid price — cannot build grid")
+            return
+
+        logger.info("[GridBot] (Re)building grid...")
+
+        if self._engine:
+            self._engine.stop()
+            self._engine = None
+
+        new_params = self._auto_tuner.compute()
+        if new_params is None:
+            logger.error("[GridBot] Auto-tuner returned None — keeping existing params")
+            new_params = self._params
+        if new_params is None:
+            logger.error("[GridBot] No grid params available — aborting rebuild")
+            return
+
+        # Dead-band check
+        if self._params is not None:
+            old_width = self._params.upper - self._params.lower
+            new_width = new_params.upper - new_params.lower
+            if old_width > 0:
+                delta = abs(new_width - old_width) / old_width
+                deadband = self._cfg.get("retune_deadband_pct", 0.10)
+                if delta < deadband:
+                    logger.info(
+                        f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
+                        f"dead-band {deadband:.1%})"
+                    )
+                    return
+
+        self._params    = new_params
+        self._last_tune = time.time()
+        self._sl_guard  = StopLossGuard(new_params.stop_price, self._cfg)
+
+        self._engine = GridEngine(
+            params=new_params, oms=self._oms,
+            instrument=INSTRUMENT, config=self._cfg)
+        self._engine.start(mid)
+
+        logger.info(
+            f"[GridBot] Grid live: [{new_params.lower:.2f},{new_params.upper:.2f}] "
+            f"levels={new_params.levels} spacing={new_params.spacing:.2f} "
+            f"stop={new_params.stop_price:.2f}"
+        )
+        self._alerter.send(
+            f"📐 Grid set: [{new_params.lower:.0f},{new_params.upper:.0f}] "
+            f"{new_params.levels} levels spacing={new_params.spacing:.0f} "
+            f"stop={new_params.stop_price:.0f}"
+        )
+
+    def _emergency_halt(self, mid: float):
+        logger.warning(f"[GridBot] EMERGENCY HALT at mid={mid:.2f}")
+        self._halted = True
+
+        long_qty = 0.0
+        if self._engine:
+            long_qty = self._engine.get_stats().get("long_qty", 0.0)
+            self._engine.stop()
+            self._engine = None
+
+        if long_qty > 0:
+            logger.warning(f"[GridBot] Liquidating {long_qty:.4f} BTC long")
+            req  = OrderRequest.market(side="SELL", qty=long_qty,
+                                       instrument=INSTRUMENT, purpose="stop_loss")
+            self._oms.submit(req)
+            fill = self._oms.wait_fill(req.client_oid, timeout=15.0)
+            if fill and fill.is_filled:
+                logger.warning(
+                    f"[GridBot] Liquidation filled: {fill.filled_qty:.4f} @ {fill.avg_price:.2f}")
+                self._alerter.send_sync(
+                    f"🚨 STOP-LOSS TRIGGERED\n"
+                    f"mid={mid:.2f} < stop={self._params.stop_price:.2f}\n"
+                    f"Liquidated {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}\n"
+                    f"Bot HALTED — restart manually."
+                )
+            else:
+                logger.error("[GridBot] Liquidation fill timed out — MANUAL INTERVENTION REQUIRED")
+                self._alerter.send_sync(
+                    f"🚨 STOP-LOSS: liquidation fill TIMED OUT\n"
+                    f"mid={mid:.2f} | {long_qty:.4f} BTC long still open\n"
+                    f"MANUAL INTERVENTION REQUIRED"
+                )
+        else:
+            self._alerter.send_sync(
+                f"🚨 STOP-LOSS TRIGGERED at mid={mid:.2f}\n"
+                f"No long position to liquidate. Bot HALTED."
+            )
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def _log_status(self, mid: float):
+        stats  = self._engine.get_stats() if self._engine else {}
+        params = self._params
+        if params:
+            logger.info(
+                f"[Status] mid={mid:.2f} "
+                f"range=[{params.lower:.2f},{params.upper:.2f}] stop={params.stop_price:.2f} | "
+                f"buys={stats.get('open_buys',0)} sells={stats.get('open_sells',0)} "
+                f"long={stats.get('long_qty',0):.4f} BTC | "
+                f"cycles={stats.get('cycles',0)} "
+                f"net_pnl={stats.get('net_pnl',0):+.4f} USD"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    bot = GridBot(GRID_CONFIG)
+
+    def _shutdown(sig, frame):
+        logger.info(f"[Main] Signal {sig} — shutting down")
+        bot.stop()
+
+    signal.signal(signal.SIGINT,  _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    bot.start()
+
+
+if __name__ == "__main__":
+    main()
