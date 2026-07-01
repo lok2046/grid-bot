@@ -234,13 +234,11 @@ GRID_CONFIG: dict = {
     "ws_stale_threshold_s":   20,
     "ws_reconnect_backoff_s":  2,
     "ws_max_backoff_s":       60,
-    # 1800s (30 min) = 30 one-minute candles → PriceCache.MIN_ATR_CANDLES threshold.
-    # With only 60s of warmup the bot built a grid from ATR≈$22 (2 candles) instead
-    # of the real daily ATR≈$300, producing a grid so tight the stop was hit in
-    # minutes.  30 min gives a proper intra-day ATR.  If you want a 1-day ATR you
-    # can set this to 86400, but the fallback to _from_config() is safer for
-    # restarts — the config defaults (grid_lower/upper) give a fixed ±8% range.
-    "min_warmup_seconds":     1800,
+    # Minimum seconds to wait for the first live price tick (Phase 1 warmup).
+    # Phase 2 waits separately inside start() until compute_atr() returns a
+    # valid value (MIN_ATR_CANDLES=30 one-minute candles, ~30 min wall time).
+    # 10s is enough to detect a dead WS at startup; no need to set this large.
+    "min_warmup_seconds":     10,
 
     # ── OMS / order params ────────────────────────────────────────────────────
     "maker_fill_timeout":  10.0,
@@ -1370,6 +1368,19 @@ class PriceCache:
                 return False
             return (time.time() - self._history[0][0]) >= min_seconds
 
+    def atr_candle_count(self, lookback_minutes: int = 1440) -> int:
+        """Return the number of complete 1-min candle buckets currently in the cache."""
+        with self._lock:
+            history = list(self._history)
+        if not history:
+            return 0
+        cutoff = time.time() - lookback_minutes * 60
+        recent = [(ts, mid) for ts, mid in history if ts >= cutoff]
+        if len(recent) < 2:
+            recent = history
+        buckets = set(int(ts // 60) for ts, _ in recent)
+        return len(buckets)
+
     def compute_stability(self, window_minutes: int) -> dict:
         """
         Compute price stability metrics over the last window_minutes.
@@ -2096,13 +2107,49 @@ class GridBot:
 
         self._market_ws.start()
 
-        warmup_s = self._cfg.get("min_warmup_seconds", 60)
-        logger.info(f"[GridBot] Waiting {warmup_s}s for price data warmup...")
-        while not _price_cache.warmup_complete(warmup_s):
+        # ── Phase 1: wait for first live price tick ───────────────────────────
+        # Just confirms the WS is alive and delivering data.  Typically 2-5s.
+        warmup_s = self._cfg.get("min_warmup_seconds", 10)
+        logger.info(f"[GridBot] Phase 1 warmup: waiting up to {warmup_s}s for first price tick...")
+        deadline = time.time() + warmup_s
+        while _price_cache.get_mid() is None:
             if self._stop_event.is_set():
                 return
-            mid = _price_cache.get_mid()
-            logger.info(f"[GridBot] Warming up... mid={'%.2f' % mid if mid else 'N/A'}")
+            if time.time() > deadline:
+                logger.warning("[GridBot] Phase 1 warmup: no price tick received — WS may be down")
+                break
+            time.sleep(1)
+        mid = _price_cache.get_mid()
+        logger.info(f"[GridBot] Phase 1 complete: mid={'%.2f' % mid if mid else 'N/A'}")
+
+        # ── Phase 2: wait until ATR is computable ─────────────────────────────
+        # Needs MIN_ATR_CANDLES (30) one-minute buckets — typically ~30 min.
+        # Logs progress every 60s so you can see it advancing.
+        atr_lookback = self._cfg.get("atr_lookback_minutes", 1440)
+        min_candles  = _price_cache.MIN_ATR_CANDLES
+        logger.info(
+            f"[GridBot] Phase 2 warmup: collecting {min_candles} one-minute candles "
+            f"for ATR — this takes ~{min_candles} minutes..."
+        )
+        _last_progress = time.time()
+        while True:
+            if self._stop_event.is_set():
+                return
+            atr = _price_cache.compute_atr(atr_lookback)
+            if atr is not None:
+                n = _price_cache.atr_candle_count(atr_lookback)
+                logger.info(
+                    f"[GridBot] Phase 2 complete: ATR={atr:.2f} from {n} candles"
+                )
+                break
+            now = time.time()
+            if now - _last_progress >= 60:
+                n = _price_cache.atr_candle_count(atr_lookback)
+                logger.info(
+                    f"[GridBot] Phase 2 warmup: {n}/{min_candles} candles "
+                    f"({n*100//min_candles}%) — ATR not yet ready"
+                )
+                _last_progress = now
             time.sleep(5)
 
         logger.info("[GridBot] Warmup complete")
