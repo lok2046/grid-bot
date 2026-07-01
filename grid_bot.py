@@ -175,6 +175,21 @@ GRID_CONFIG: dict = {
     "stop_loss_enabled": True,
     "stop_buffer_atr":   1.0,         # stop = lower - N×ATR
 
+    # Minimum headroom between current mid and the newly-computed stop price,
+    # expressed as a multiple of ATR.  If mid < stop + N×ATR at the moment the
+    # grid is (re)built, the build is aborted: price is already too close to the
+    # stop for the grid to be useful.  This prevents the bot from arming a stop
+    # that fires within seconds of startup or auto-restart.
+    #
+    # How it relates to stop_buffer_atr:
+    #   stop = lower - stop_buffer_atr × ATR = (mid - atr_multiplier×ATR) - stop_buffer_atr×ATR
+    #   headroom at startup = mid - stop = (atr_multiplier + stop_buffer_atr) × ATR
+    #                       = (3.0 + 1.0) × ATR = 4.0 × ATR  (normal case)
+    # Setting min_stop_headroom_atr = 0.5 means we require at least 0.5×ATR of
+    # buffer beyond the stop — a very light sanity check that only blocks the build
+    # when price has already drifted to within 0.5×ATR of the stop.
+    "min_stop_headroom_atr": 0.5,
+
     # ── Auto-restart after stop-loss ──────────────────────────────────────────
     # After a stop-loss halt, the bot monitors price and automatically rebuilds
     # the grid when market conditions are stable again.
@@ -2106,6 +2121,35 @@ class GridBot:
                     logger.info(
                         f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
                         f"dead-band {deadband:.1%})"
+                    )
+                    return
+
+        # ── Stop-proximity guard ──────────────────────────────────────────────
+        # Abort the grid build if current mid is already too close to the
+        # newly-computed stop.  This prevents arming a StopLossGuard that
+        # would fire within seconds of startup or auto-restart because price
+        # drifted down while we were computing params.
+        #
+        # Normal headroom at startup = (atr_multiplier + stop_buffer_atr) × ATR
+        # = 4 × ATR.  We only block when headroom < min_stop_headroom_atr × ATR,
+        # so this guard is intentionally a light sanity check, not a strategy gate.
+        headroom_mult = self._cfg.get("min_stop_headroom_atr", 0.5)
+        if headroom_mult > 0:
+            atr_now = _price_cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
+            if atr_now is not None and atr_now > 0:
+                min_headroom = headroom_mult * atr_now
+                actual_headroom = mid - new_params.stop_price
+                if actual_headroom < min_headroom:
+                    logger.warning(
+                        f"[GridBot] Grid build aborted: mid={mid:.2f} too close to "
+                        f"stop={new_params.stop_price:.2f} "
+                        f"(headroom={actual_headroom:.2f} < {headroom_mult}×ATR={min_headroom:.2f}). "
+                        f"Waiting for price to recover."
+                    )
+                    self._alerter.send(
+                        f"⚠️ Grid build aborted: price too close to stop\n"
+                        f"mid={mid:.2f} stop={new_params.stop_price:.2f} "
+                        f"headroom={actual_headroom:.0f} < {min_headroom:.0f} required"
                     )
                     return
 
