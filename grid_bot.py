@@ -259,8 +259,8 @@ GRID_CONFIG: dict = {
     "log_level":        "INFO",
     "log_backup_count": 30,
 
-    # ── CSV ───────────────────────────────────────────────────────────────────
-    "trades_csv_path":  "grid_trades.csv",
+    # ── SQLite persistence ────────────────────────────────────────────────────
+    "db_path": "grid_bot.db",     # fills, daily PnL, and accumulated PnL survive restarts
 }
 
 INSTRUMENT = GRID_CONFIG["instrument"]
@@ -470,6 +470,143 @@ class AlertManager:
                 time.sleep(self._RETRY_DELAY)
         logger.error("[AlertManager] failed to deliver after retries")
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram command poller
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TelegramCommandPoller:
+    """
+    Long-polls the Telegram Bot API for incoming messages and dispatches
+    registered command handlers.
+
+    Commands are registered via register(command, handler) where `command`
+    is a string like "/status" (case-insensitive) and `handler` is a callable
+    that returns a str (the reply text).  The reply is sent back to the same
+    chat_id that issued the command.
+
+    Only messages from the configured chat_id are processed; others are silently
+    dropped to prevent unauthorised control of the bot.
+
+    Uses long-polling (timeout=30s) so the thread blocks mostly in the HTTP
+    request rather than spinning.  A fresh offset is tracked after each batch
+    so acknowledged messages are never re-delivered.
+    """
+    _TG_API      = "https://api.telegram.org"
+    _POLL_TIMEOUT = 30       # Telegram long-poll window in seconds
+    _HTTP_TIMEOUT = 40       # requests timeout > poll timeout to avoid spurious errors
+    _RETRY_DELAY  = 5        # seconds to wait after a failed poll before retrying
+
+    def __init__(self, token: str, allowed_chat_id: str) -> None:
+        self._token          = token
+        self._allowed_chat   = str(allowed_chat_id).strip()
+        self._enabled        = bool(token and allowed_chat_id)
+        self._handlers: Dict[str, Callable[[], str]] = {}
+        self._offset: Optional[int] = None
+        self._stop    = threading.Event()
+        self._thread  = threading.Thread(target=self._poll_loop,
+                                          name="TgCmdPoller", daemon=True)
+
+    def register(self, command: str, handler: Callable[[], str]) -> None:
+        """Register a handler for a bot command (e.g. '/status')."""
+        self._handlers[command.lower().strip()] = handler
+
+    def start(self) -> None:
+        if not self._enabled:
+            logger.warning("[TgPoller] Token/chat_id not configured — command polling disabled")
+            return
+        self._thread.start()
+        logger.info("[TgPoller] Command polling started")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self._HTTP_TIMEOUT + 5)
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _poll_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                updates = self._get_updates()
+                if updates is None:
+                    # Network error — back off before retrying
+                    for _ in range(self._RETRY_DELAY):
+                        if self._stop.is_set():
+                            return
+                        time.sleep(1)
+                    continue
+                for update in updates:
+                    self._dispatch(update)
+            except Exception as e:
+                logger.error(f"[TgPoller] Unexpected error in poll loop: {e}", exc_info=True)
+                time.sleep(self._RETRY_DELAY)
+
+    def _get_updates(self) -> Optional[list]:
+        params: dict = {"timeout": self._POLL_TIMEOUT, "allowed_updates": ["message"]}
+        if self._offset is not None:
+            params["offset"] = self._offset
+        url = f"{self._TG_API}/bot{self._token}/getUpdates"
+        try:
+            resp = requests.get(url, params=params, timeout=self._HTTP_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                logger.warning(f"[TgPoller] getUpdates not ok: {data}")
+                return None
+            updates = data.get("result", [])
+            if updates:
+                self._offset = updates[-1]["update_id"] + 1
+            return updates
+        except requests.RequestException as e:
+            logger.warning(f"[TgPoller] getUpdates request error: {e}")
+            return None
+
+    def _dispatch(self, update: dict) -> None:
+        msg = update.get("message", {})
+        if not msg:
+            return
+
+        # Security: only accept messages from the configured chat
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        if chat_id != self._allowed_chat:
+            logger.warning(f"[TgPoller] Ignoring message from unknown chat_id={chat_id}")
+            return
+
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+
+        # Strip bot username suffix (e.g. /status@MyBot → /status)
+        command = text.split()[0].split("@")[0].lower()
+        handler = self._handlers.get(command)
+        if handler is None:
+            logger.debug(f"[TgPoller] No handler for command: {command}")
+            return
+
+        logger.info(f"[TgPoller] Dispatching command: {command}")
+        try:
+            reply = handler()
+        except Exception as e:
+            logger.error(f"[TgPoller] Handler error for {command}: {e}", exc_info=True)
+            reply = f"⚠️ Error handling {command}: {e}"
+
+        self._send_reply(chat_id, reply)
+
+    def _send_reply(self, chat_id: str, text: str) -> None:
+        url = f"{self._TG_API}/bot{self._token}/sendMessage"
+        payload = {
+            "chat_id":                  chat_id,
+            "text":                     text,
+            "parse_mode":               "Markdown",
+            "disable_web_page_preview": True,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"[TgPoller] sendMessage failed: {resp.text[:200]}")
+        except requests.RequestException as e:
+            logger.warning(f"[TgPoller] sendMessage error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1550,20 +1687,38 @@ class GridEngine:
     """
 
     def __init__(self, params: GridParams, oms: OMS,
-                 instrument: str, config: dict):
+                 instrument: str, config: dict,
+                 store: Optional["GridStateStore"] = None):
         self._params     = params
         self._oms        = oms
         self._instrument = instrument
         self._cfg        = config
+        self._store      = store          # may be None in tests / paper mode without DB
         self._lock       = threading.Lock()
         self._levels: List[GridLevel] = []
         self._stop_event = threading.Event()
 
-        # Accounting
-        self._long_qty:     float = 0.0
-        self._realized_pnl: float = 0.0
-        self._total_fees:   float = 0.0
-        self._cycle_count:  int   = 0
+        # Accounting — seeded from DB so a restart or re-tune doesn't zero out history.
+        # In-memory values are the authoritative running total for this process;
+        # the DB is appended to on every fill, and all-time sums are queried from it.
+        if store is not None:
+            acc = store.get_accumulated()
+            self._realized_pnl: float = acc["gross_pnl"]
+            self._total_fees:   float = -acc["fees"]        # fees stored negative in DB → flip sign
+            self._cycle_count:  int   = acc["cycle_count"]
+            logger.info(
+                f"[GridEngine] Seeded from DB: gross_pnl={self._realized_pnl:+.4f} "
+                f"fees={self._total_fees:.6f} cycles={self._cycle_count}"
+            )
+        else:
+            self._realized_pnl = 0.0
+            self._total_fees   = 0.0
+            self._cycle_count  = 0
+
+        # long_qty is NOT seeded from DB — it reflects live open orders only.
+        # On a fresh start the grid is rebuilt from scratch (all orders re-placed),
+        # so the accumulated long starts at 0 and grows as BUY fills come in.
+        self._long_qty: float = 0.0
 
         # Fill queue for _fill_thread
         self._fill_queue: collections.deque = collections.deque()
@@ -1911,6 +2066,7 @@ class GridEngine:
             is_buy = fill.purpose == "grid_buy"
 
         self._total_fees += fill.fee
+        now = time.time()
 
         if is_buy:
             self._long_qty += fill.filled_qty
@@ -1919,6 +2075,17 @@ class GridEngine:
                 f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} "
                 f"long={self._long_qty:.4f} BTC"
             )
+            # Persist to DB (gross_pnl=0 for BUY fills — profit only realised on SELL)
+            if self._store is not None:
+                try:
+                    self._store.record_fill(
+                        ts_utc=now, side="BUY", level_idx=idx,
+                        price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                        fee_usd=fill.fee, gross_pnl=0.0, cycle_num=self._cycle_count,
+                    )
+                except Exception as e:
+                    logger.error(f"[GridEngine] DB record_fill BUY error: {e}", exc_info=True)
+
             # Snapshot counter-level under lock, then place outside lock
             sell_lv = None
             sell_idx = idx + 1
@@ -1942,6 +2109,17 @@ class GridEngine:
                 f"cycle #{self._cycle_count} gross={gross_pnl:+.4f} net={net_pnl:+.4f} "
                 f"cumulative_net={self._realized_pnl - self._total_fees:+.4f} USD"
             )
+            # Persist to DB
+            if self._store is not None:
+                try:
+                    self._store.record_fill(
+                        ts_utc=now, side="SELL", level_idx=idx,
+                        price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                        fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=self._cycle_count,
+                    )
+                except Exception as e:
+                    logger.error(f"[GridEngine] DB record_fill SELL error: {e}", exc_info=True)
+
             # Snapshot counter-level under lock, then place outside lock
             buy_lv = None
             buy_idx = idx - 1
@@ -2019,6 +2197,240 @@ _grid_bot_alerter: AlertManager = _NullAlerter()  # type: ignore
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GridStateStore — SQLite persistence
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Tables
+# ──────
+#   grid_fills   — every BUY/SELL fill (permanent audit log)
+#   daily_pnl    — pre-aggregated per HKT day; updated incrementally on each fill
+#   meta         — schema version + misc key/value (e.g. accumulated counters)
+#
+# Thread safety
+# ─────────────
+#   A single threading.Lock() guards all DB access. sqlite3 connections must not
+#   be shared across threads without serialisation (check_same_thread=False only
+#   disables the built-in guard; it does not make the connection thread-safe).
+#   WAL journal mode lets readers proceed concurrently with the single writer.
+#
+# Schema evolution
+# ────────────────
+#   SCHEMA_VERSION is stored in meta. Future changes add ALTER TABLE migrations
+#   keyed on version; existing data is preserved in-place.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import sqlite3 as _sqlite3
+
+_GRID_DB_SCHEMA_VERSION = 1
+
+_GRID_DB_DDL = """
+-- Every grid fill: permanent, append-only audit log.
+-- gross_pnl is meaningful only for SELL fills (price gain over paired BUY level).
+-- fee_usd is always positive (a cost).
+CREATE TABLE IF NOT EXISTS grid_fills (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc      REAL    NOT NULL,          -- Unix timestamp of fill
+    hkt_date    TEXT    NOT NULL,          -- 'YYYY-MM-DD' derived from ts_utc (HKT)
+    side        TEXT    NOT NULL,          -- 'BUY' | 'SELL'
+    level_idx   INTEGER NOT NULL,          -- grid level index
+    price_usd   REAL    NOT NULL,
+    qty_btc     REAL    NOT NULL,
+    fee_usd     REAL    NOT NULL,          -- maker fee paid (positive = cost)
+    gross_pnl   REAL    NOT NULL DEFAULT 0.0,  -- (sell_price - buy_price) * qty; 0 for BUY fills
+    cycle_num   INTEGER NOT NULL DEFAULT 0     -- monotonic cycle counter at time of fill
+);
+
+-- Pre-aggregated daily PnL (HKT date); updated atomically with each fill.
+-- gross_pnl_usd: sum of (sell_price - buy_level_price) * qty for completed cycles
+-- fees_usd:      total maker fees paid (stored as negative — a cost)
+-- net_pnl_usd:   gross_pnl_usd + fees_usd  (fees are negative, so this subtracts)
+CREATE TABLE IF NOT EXISTS daily_pnl (
+    hkt_date      TEXT PRIMARY KEY,
+    gross_pnl_usd REAL NOT NULL DEFAULT 0.0,
+    fees_usd      REAL NOT NULL DEFAULT 0.0,
+    net_pnl_usd   REAL NOT NULL DEFAULT 0.0,
+    fill_count    INTEGER NOT NULL DEFAULT 0,
+    cycle_count   INTEGER NOT NULL DEFAULT 0
+);
+
+-- Key/value metadata store.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+def _db_hkt_date(ts_utc: float) -> str:
+    """Return 'YYYY-MM-DD' in HKT for a Unix timestamp."""
+    return _dt.datetime.fromtimestamp(ts_utc, tz=_HKT_TZ).strftime("%Y-%m-%d")
+
+
+class GridStateStore:
+    """
+    Thread-safe SQLite wrapper for grid bot persistence.
+
+    Persists every fill, daily PnL buckets, and accumulated totals so that
+    a service restart (or re-tune that rebuilds GridEngine) does not lose
+    historical accounting.
+
+    Public API used by GridEngine
+    ──────────────────────────────
+      record_fill(ts, side, idx, price, qty, fee, gross_pnl, cycle_num)
+          → called inside _on_fill(); updates grid_fills + daily_pnl atomically
+
+    Public API used by GridBot / /status handler
+    ─────────────────────────────────────────────
+      get_accumulated()  → {gross_pnl, fees, net_pnl, fill_count, cycle_count}
+      get_daily(date)    → same dict for one HKT day (today if None)
+      get_recent_daily(n)→ list of last n daily rows, newest first
+    """
+
+    def __init__(self, db_path: str = "grid_bot.db") -> None:
+        self._db_path = db_path
+        self._lock    = threading.Lock()
+        self._conn    = _sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = _sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")   # readers don't block writer
+        self._conn.execute("PRAGMA synchronous=NORMAL") # safe with WAL; faster than FULL
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._apply_schema()
+        logger.info(f"[GridStateStore] opened {os.path.abspath(db_path)}")
+
+    # ── Schema bootstrap ─────────────────────────────────────────────────────
+
+    def _apply_schema(self) -> None:
+        with self._lock:
+            self._conn.executescript(_GRID_DB_DDL)
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('schema_version',?)",
+                    (str(_GRID_DB_SCHEMA_VERSION),),
+                )
+                self._conn.commit()
+            # Future schema migrations go here (ALTER TABLE guarded by version check)
+
+    # ── Fill recording ────────────────────────────────────────────────────────
+
+    def record_fill(
+        self,
+        ts_utc:    float,
+        side:      str,       # 'BUY' | 'SELL'
+        level_idx: int,
+        price_usd: float,
+        qty_btc:   float,
+        fee_usd:   float,     # positive = cost
+        gross_pnl: float,     # 0.0 for BUY fills
+        cycle_num: int,
+    ) -> None:
+        """
+        Append one fill row and update the daily_pnl bucket atomically.
+        Called from GridEngine._on_fill() — must be fast and non-blocking
+        (the fill thread processes fills sequentially; a slow DB write here
+        delays counter-order placement).  WAL + NORMAL sync keeps writes
+        to ~1-2 ms on spinning rust; SSD is faster.
+        """
+        hkt_date = _db_hkt_date(ts_utc)
+        cycles_delta = 1 if side == "SELL" else 0
+
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO grid_fills
+                   (ts_utc, hkt_date, side, level_idx, price_usd,
+                    qty_btc, fee_usd, gross_pnl, cycle_num)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (ts_utc, hkt_date, side, level_idx, price_usd,
+                 qty_btc, fee_usd, gross_pnl, cycle_num),
+            )
+            # Update daily bucket — fees stored as negative (cost subtracted from net)
+            self._conn.execute(
+                """INSERT INTO daily_pnl
+                   (hkt_date, gross_pnl_usd, fees_usd, net_pnl_usd, fill_count, cycle_count)
+                   VALUES (?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(hkt_date) DO UPDATE SET
+                       gross_pnl_usd = gross_pnl_usd + excluded.gross_pnl_usd,
+                       fees_usd      = fees_usd      + excluded.fees_usd,
+                       net_pnl_usd   = net_pnl_usd   + excluded.gross_pnl_usd + excluded.fees_usd,
+                       fill_count    = fill_count    + 1,
+                       cycle_count   = cycle_count   + excluded.cycle_count""",
+                (hkt_date, gross_pnl, -fee_usd, gross_pnl - fee_usd, cycles_delta),
+            )
+            self._conn.commit()
+
+    # ── Accumulated totals ────────────────────────────────────────────────────
+
+    def get_accumulated(self) -> dict:
+        """Sum all rows in daily_pnl → all-time totals."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT
+                       COALESCE(SUM(gross_pnl_usd), 0.0) AS gross_pnl,
+                       COALESCE(SUM(fees_usd),      0.0) AS fees,
+                       COALESCE(SUM(net_pnl_usd),   0.0) AS net_pnl,
+                       COALESCE(SUM(fill_count),     0)   AS fill_count,
+                       COALESCE(SUM(cycle_count),    0)   AS cycle_count
+                   FROM daily_pnl"""
+            ).fetchone()
+        return dict(row) if row else {
+            "gross_pnl": 0.0, "fees": 0.0, "net_pnl": 0.0,
+            "fill_count": 0,  "cycle_count": 0,
+        }
+
+    # ── Daily PnL ─────────────────────────────────────────────────────────────
+
+    def get_daily(self, hkt_date: Optional[str] = None) -> dict:
+        """Return the daily_pnl row for hkt_date (today HKT if None)."""
+        if hkt_date is None:
+            hkt_date = _db_hkt_date(time.time())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM daily_pnl WHERE hkt_date=?", (hkt_date,)
+            ).fetchone()
+        if row:
+            return dict(row)
+        return {
+            "hkt_date": hkt_date, "gross_pnl_usd": 0.0, "fees_usd": 0.0,
+            "net_pnl_usd": 0.0, "fill_count": 0, "cycle_count": 0,
+        }
+
+    def get_recent_daily(self, days: int = 7) -> list:
+        """Return last N HKT-day rows, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM daily_pnl ORDER BY hkt_date DESC LIMIT ?", (days,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Meta ──────────────────────────────────────────────────────────────────
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+        logger.info("[GridStateStore] database connection closed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GridBot — top-level controller
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2051,6 +2463,18 @@ class GridBot:
             config       = config,
         )
         self._auto_tuner = GridAutoTuner(config, _price_cache)
+
+        # ── SQLite persistence ────────────────────────────────────────────────────
+        # Opened once here and shared with every GridEngine instance so that
+        # fills survive restarts, re-tunes, and stop-loss rebuilds.
+        self._store = GridStateStore(config.get("db_path", "grid_bot.db"))
+
+        # ── Telegram command poller ────────────────────────────────────────────
+        self._cmd_poller = TelegramCommandPoller(
+            token           = config.get("telegram_bot_token", ""),
+            allowed_chat_id = config.get("telegram_chat_id",   ""),
+        )
+        self._cmd_poller.register("/status", self._handle_status_command)
 
         # WS market feed
         self._ws_stop = threading.Event()
@@ -2092,6 +2516,7 @@ class GridBot:
     def start(self):
         logger.info("[GridBot] Starting")
         self._oms.start()
+        self._cmd_poller.start()   # start Telegram command polling early so /status works during warmup
 
         # ── Startup reconciliation ────────────────────────────────────────────
         # Detect and close any position left over from a previous run (crash,
@@ -2122,15 +2547,24 @@ class GridBot:
         mid = _price_cache.get_mid()
         logger.info(f"[GridBot] Phase 1 complete: mid={'%.2f' % mid if mid else 'N/A'}")
 
-        # ── Phase 2: wait until ATR is computable ─────────────────────────────
-        # Needs MIN_ATR_CANDLES (30) one-minute buckets — typically ~30 min.
-        # Logs progress every 60s so you can see it advancing.
+        # ── Phase 2: seed ATR from REST historical candles ────────────────────
+        # Fetch recent 1-min candles via public/get-candlestick so we don't
+        # have to sit idle for ~30 minutes collecting live ticks.  On success
+        # the Phase 2 poll loop below exits immediately.  On failure we fall
+        # through to the original live-accumulation path with a warning.
         atr_lookback = self._cfg.get("atr_lookback_minutes", 1440)
+        self._seed_atr_from_rest()
+
+        # ── Phase 2: wait until ATR is computable ─────────────────────────────
+        # Normally instant after _seed_atr_from_rest().  Falls back to the
+        # original live-accumulation path if the REST seed failed.
         min_candles  = _price_cache.MIN_ATR_CANDLES
-        logger.info(
-            f"[GridBot] Phase 2 warmup: collecting {min_candles} one-minute candles "
-            f"for ATR — this takes ~{min_candles} minutes..."
-        )
+        atr = _price_cache.compute_atr(atr_lookback)
+        if atr is None:
+            logger.info(
+                f"[GridBot] Phase 2 warmup: REST seed insufficient — "
+                f"collecting {min_candles} one-minute candles live (~{min_candles} min)..."
+            )
         _last_progress = time.time()
         while True:
             if self._stop_event.is_set():
@@ -2158,6 +2592,158 @@ class GridBot:
         self._rebuild_grid()
         self._run()
 
+    # ── ATR seeding from REST historical candles ──────────────────────────────
+
+    def _seed_atr_from_rest(self) -> None:
+        """
+        Fetch recent 1-minute candles from public/get-candlestick and inject
+        them into PriceCache._history so that compute_atr() is immediately
+        satisfiable without waiting ~30 minutes for live ticks to accumulate.
+
+        Injection strategy
+        ──────────────────
+        PriceCache._history stores (unix_timestamp, mid_price) tuples.
+        compute_atr() groups them into 1-minute buckets via int(ts // 60).
+        For each historical candle (open, high, low, close) we inject 4 ticks
+        spaced evenly within the candle's 60-second window.  This fully
+        satisfies the candle-bucketing logic and gives a realistic OHLC ATR.
+
+        We fetch MIN_ATR_CANDLES + 2 candles (extra slack for the current
+        open candle and bucket-boundary edge cases) and inject only those
+        strictly older than the current live-tick bucket to avoid mixing
+        REST and WS data for the same minute.
+
+        Failure modes
+        ─────────────
+        Any REST error (network, rate-limit, unexpected response shape) is
+        caught and logged; the method returns silently so Phase 2 falls back
+        to the original live-accumulation path.
+        """
+        min_candles = _price_cache.MIN_ATR_CANDLES
+        fetch_count = min_candles + 2   # extra slack for open candle + edge cases
+
+        rest_base = self._cfg.get("rest_base_url",
+                                   "https://api.crypto.com/exchange/v1")
+        url = f"{rest_base}/public/get-candlestick"
+        params = {
+            "instrument_name": INSTRUMENT,
+            "timeframe":       "1m",
+            "count":           fetch_count,
+        }
+
+        logger.info(
+            f"[GridBot] Phase 2: seeding ATR from REST "
+            f"(fetching {fetch_count} × 1-min candles)..."
+        )
+        try:
+            resp = requests.get(url, params=params, timeout=10.0)
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as exc:
+            logger.warning(
+                f"[GridBot] ATR seed: REST request failed ({exc}) — "
+                f"falling back to live candle accumulation"
+            )
+            return
+
+        if body.get("code", -1) != 0:
+            logger.warning(
+                f"[GridBot] ATR seed: API returned code={body.get('code')} "
+                f"msg={body.get('message', '')} — falling back to live accumulation"
+            )
+            return
+
+        candles = (body.get("result", {}).get("data", [])
+                   or body.get("result", {}).get("instrument_name", {})
+                   or [])
+        # CDC v1 candlestick response nests data under result.data
+        if not candles and isinstance(body.get("result"), dict):
+            candles = body["result"].get("data", [])
+
+        if not candles:
+            logger.warning(
+                "[GridBot] ATR seed: empty candle list in response — "
+                "falling back to live accumulation"
+            )
+            return
+
+        # Current open 1-min bucket — we skip injecting into this bucket
+        # because live WS ticks are already filling it; mixing would
+        # produce an artificially wide H-L for that minute.
+        current_bucket = int(time.time() // 60)
+
+        injected = 0
+        synthetic_ticks: list = []
+
+        for c in candles:
+            # CDC v1 format: {"t": <ms>, "o": "...", "h": "...", "l": "...", "c": "..."}
+            try:
+                ts_ms  = int(c.get("t", 0))
+                o_px   = float(c.get("o", 0))
+                h_px   = float(c.get("h", 0))
+                l_px   = float(c.get("l", 0))
+                cl_px  = float(c.get("c", 0))
+            except (TypeError, ValueError) as exc:
+                logger.debug(f"[GridBot] ATR seed: skipping malformed candle {c}: {exc}")
+                continue
+
+            if ts_ms <= 0 or any(p <= 0 for p in (o_px, h_px, l_px, cl_px)):
+                continue
+
+            ts_s   = ts_ms / 1000.0
+            bucket = int(ts_s // 60)
+
+            if bucket >= current_bucket:
+                # Skip the live (still-open) bucket
+                continue
+
+            # Inject 4 ticks spread across the candle's 60-second window:
+            #   t+0s  → open
+            #   t+15s → high  (first half peak)
+            #   t+45s → low   (second half trough)
+            #   t+59s → close
+            # The exact intra-candle ordering doesn't affect ATR since
+            # compute_atr() only uses each bucket's H/L/close aggregate.
+            synthetic_ticks.extend([
+                (ts_s +  0.0, o_px),
+                (ts_s + 15.0, h_px),
+                (ts_s + 45.0, l_px),
+                (ts_s + 59.0, cl_px),
+            ])
+            injected += 1
+
+        if injected == 0:
+            logger.warning(
+                "[GridBot] ATR seed: no usable historical candles after filtering — "
+                "falling back to live accumulation"
+            )
+            return
+
+        # Inject into PriceCache under its own lock.
+        # We extend _history directly (it's a bounded deque); existing live
+        # ticks from Phase 1 are already in there and remain untouched.
+        # Sort ascending so the deque is in chronological order.
+        synthetic_ticks.sort(key=lambda x: x[0])
+        with _price_cache._lock:
+            # Prepend: historical ticks go before the Phase-1 live tick.
+            # We rebuild the deque to maintain chronological order and
+            # respect the maxlen cap (30 000 entries).
+            existing = list(_price_cache._history)
+            merged   = synthetic_ticks + existing
+            # Deduplicate by bucket+price is unnecessary — slight overlap
+            # in the open bucket is prevented by the current_bucket guard.
+            _price_cache._history.clear()
+            for item in merged[-(30000):]:    # honour maxlen
+                _price_cache._history.append(item)
+
+        n_buckets = _price_cache.atr_candle_count(
+            self._cfg.get("atr_lookback_minutes", 1440)
+        )
+        logger.info(
+            f"[GridBot] ATR seed complete: injected {injected} historical candles "
+            f"({injected * 4} ticks) → {n_buckets} buckets now in cache"
+        )
+
     def stop(self):
         logger.info("[GridBot] Stopping")
         self._stop_event.set()
@@ -2176,7 +2762,9 @@ class GridBot:
         if long_qty > 0:
             self._liquidate_position(long_qty, reason="GridBot stop")
 
+        self._cmd_poller.stop()
         self._oms.stop()
+        self._store.close()
         self._alerter.send_sync(f"🔴 GridBot stopped")
         self._alerter.stop()
         logger.info("[GridBot] Stopped")
@@ -2326,7 +2914,8 @@ class GridBot:
 
         self._engine = GridEngine(
             params=new_params, oms=self._oms,
-            instrument=INSTRUMENT, config=self._cfg)
+            instrument=INSTRUMENT, config=self._cfg,
+            store=self._store)
         self._engine.start(mid)
 
         logger.info(
@@ -2486,6 +3075,116 @@ class GridBot:
                 f"[AutoRestart] Max attempts ({max_attempts}) reached. "
                 f"If bot halts again it will require manual restart."
             )
+
+    # ── /status Telegram command ──────────────────────────────────────────────
+
+    def _handle_status_command(self) -> str:
+        """
+        Builds and returns the /status reply string.
+        Called by TelegramCommandPoller on the poller thread — must be thread-safe.
+
+        Daily PnL and accumulated PnL are read from GridStateStore (SQLite) so
+        they are correct across restarts, re-tunes, and stop-loss rebuilds.
+
+        Reply sections
+        ──────────────
+        1. Current position  — net long BTC, open buy/sell order counts, live mid price
+        2. Daily PnL         — net PnL from DB for today's HKT date
+        3. Accumulated PnL   — all-time net PnL summed from daily_pnl table
+        4. Last 7 days       — per-day breakdown
+        """
+        now_hkt = _dt.datetime.now(_HKT_TZ).strftime("%Y-%m-%d %H:%M HKT")
+
+        # ── Engine snapshot (thread-safe via get_stats()) ─────────────────────
+        if self._engine is not None:
+            stats = self._engine.get_stats()
+        else:
+            stats = {"long_qty": 0.0, "open_buys": 0, "open_sells": 0, "levels": 0}
+
+        long_qty   = stats.get("long_qty",   0.0)
+        open_buys  = stats.get("open_buys",  0)
+        open_sells = stats.get("open_sells", 0)
+        levels     = stats.get("levels",     0)
+
+        # ── DB queries ────────────────────────────────────────────────────────
+        today   = self._store.get_daily(_db_hkt_date(time.time()))
+        acc     = self._store.get_accumulated()
+        history = self._store.get_recent_daily(7)
+
+        daily_net = today["net_pnl_usd"]
+        acc_net   = acc["net_pnl"]
+        acc_gross = acc["gross_pnl"]
+        acc_fees  = acc["fees"]          # stored as negative in DB
+        acc_cycles= acc["cycle_count"]
+
+        # ── Live price ────────────────────────────────────────────────────────
+        mid = _price_cache.get_mid()
+        mid_str = f"${mid:,.2f}" if mid is not None else "N/A"
+
+        # ── Grid range ────────────────────────────────────────────────────────
+        params = self._params
+        if params:
+            range_str   = f"[{params.lower:,.0f} – {params.upper:,.0f}]  stop={params.stop_price:,.0f}"
+            spacing_str = f"{params.spacing:.2f}"
+        else:
+            range_str   = "N/A (grid not built)"
+            spacing_str = "N/A"
+
+        # ── Bot state ─────────────────────────────────────────────────────────
+        if self._halted:
+            state_line = "🔴 *HALTED* (stop-loss triggered)"
+        elif self._engine is None:
+            state_line = "🟡 Warming up / building grid..."
+        else:
+            state_line = f"🟢 Running ({TRADING_MODE.upper()})"
+
+        # ── PnL emoji helper ──────────────────────────────────────────────────
+        def _e(v: float) -> str:
+            return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
+
+        # ── Last 7 days table ─────────────────────────────────────────────────
+        hist_lines = []
+        for row in history:
+            sign = "✅" if row["net_pnl_usd"] >= 0 else "❌"
+            hist_lines.append(
+                f"  {sign} {row['hkt_date']}  "
+                f"net={row['net_pnl_usd']:+.4f}  "
+                f"cycles={row['cycle_count']}"
+            )
+        hist_block = "\n".join(hist_lines) if hist_lines else "  (no data yet)"
+
+        lines = [
+            f"📊 *Grid Bot Status* — {now_hkt}",
+            f"_{state_line}_",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "*1️⃣  Current Position*",
+            f"  • Net long:   `{long_qty:.4f} BTC`",
+            f"  • Mid price:  `{mid_str}`",
+            f"  • Open buys:  `{open_buys}` / Open sells: `{open_sells}`",
+            f"  • Grid range: `{range_str}`",
+            f"  • Levels:     `{levels}` (spacing ≈ {spacing_str})",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"*2️⃣  Daily PnL* (today {today['hkt_date']} HKT)",
+            f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD`",
+            f"  • Gross: `{today['gross_pnl_usd']:+.4f}`  Fees: `{today['fees_usd']:+.4f}`",
+            f"  • Cycles today: `{today['cycle_count']}`",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "*3️⃣  Accumulated PnL* (all-time from DB)",
+            f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD`",
+            f"  • Gross realised: `{acc_gross:+.4f} USD`",
+            f"  • Total fees:     `{acc_fees:+.4f} USD`",
+            f"  • Total cycles:   `{acc_cycles}`",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "*📅  Last 7 Days*",
+            hist_block,
+        ]
+
+        logger.info("[GridBot] /status command served via Telegram")
+        return "\n".join(lines)
 
     # ── Status ────────────────────────────────────────────────────────────────
 
