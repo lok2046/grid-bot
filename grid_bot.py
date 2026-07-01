@@ -175,6 +175,29 @@ GRID_CONFIG: dict = {
     "stop_loss_enabled": True,
     "stop_buffer_atr":   1.0,         # stop = lower - N×ATR
 
+    # ── Auto-restart after stop-loss ──────────────────────────────────────────
+    # After a stop-loss halt, the bot monitors price and automatically rebuilds
+    # the grid when market conditions are stable again.
+    #
+    # ALL four conditions must be true simultaneously before restarting:
+    #   1. Cooldown: at least auto_restart_cooldown_minutes since halt.
+    #      Prevents restarting into a dead-cat bounce.
+    #   2. Price recovered: mid > halt_stop_price (the original stop-loss level).
+    #      The halt trigger must no longer be active.
+    #   3. Stable range: hi-lo over last auto_restart_stability_minutes
+    #      < auto_restart_stability_atr_mult × ATR.
+    #      Confirms BTC is oscillating in a tight band, not still crashing.
+    #   4. Flat/rising trend: current mid >= mean(prices over stability window).
+    #      Rejects a slow bleed where range is small but price drifts lower.
+    #
+    # Set auto_restart_enabled=False to keep the original "halt until manual
+    # restart" behaviour.
+    "auto_restart_enabled":           True,
+    "auto_restart_cooldown_minutes":  30,    # minimum wait after halt
+    "auto_restart_stability_minutes": 60,    # look-back window for stability check
+    "auto_restart_stability_atr_mult": 1.0,  # hi-lo must be < N × ATR
+    "auto_restart_max_attempts":      3,     # give up after N failed attempts; 0 = unlimited
+
     # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
     "rest_base_url": {
         "paper": "https://api.crypto.com/exchange/v1",
@@ -1249,6 +1272,43 @@ class PriceCache:
                 return False
             return (time.time() - self._history[0][0]) >= min_seconds
 
+    def compute_stability(self, window_minutes: int) -> dict:
+        """
+        Compute price stability metrics over the last window_minutes.
+
+        Returns a dict with:
+          "hi"        — highest mid price in window
+          "lo"        — lowest mid price in window
+          "hi_lo"     — hi - lo (range)
+          "mean"      — arithmetic mean of mid prices in window
+          "current"   — most recent mid price
+          "n_ticks"   — number of ticks in window (quality indicator)
+          "ok"        — False if insufficient data (< 10 ticks)
+        """
+        with self._lock:
+            history = list(self._history)
+
+        cutoff = time.time() - window_minutes * 60
+        window = [mid for ts, mid in history if ts >= cutoff]
+
+        if len(window) < 10:
+            return {"ok": False, "hi": 0.0, "lo": 0.0, "hi_lo": 0.0,
+                    "mean": 0.0, "current": 0.0, "n_ticks": len(window)}
+
+        hi      = max(window)
+        lo      = min(window)
+        mean    = sum(window) / len(window)
+        current = window[-1]
+        return {
+            "ok":      True,
+            "hi":      hi,
+            "lo":      lo,
+            "hi_lo":   hi - lo,
+            "mean":    mean,
+            "current": current,
+            "n_ticks": len(window),
+        }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Grid geometry
@@ -1865,6 +1925,9 @@ class GridBot:
         self._last_status:float = 0.0
         self._last_retune_check: float = 0.0
         self._halted:     bool  = False
+        self._halt_time:  float = 0.0       # timestamp of the last halt
+        self._halt_stop_price: float = 0.0  # stop_price that triggered the halt
+        self._restart_attempts: int = 0     # number of auto-restart attempts made
 
         self._oms = OMS(
             api_key      = config.get("api_key", ""),
@@ -1950,7 +2013,8 @@ class GridBot:
         logger.info("[GridBot] Main loop running")
         while not self._stop_event.is_set():
             if self._halted:
-                time.sleep(1)
+                self._check_auto_restart()
+                time.sleep(10)   # poll every 10s while halted
                 continue
 
             mid = _price_cache.get_mid()
@@ -2042,7 +2106,9 @@ class GridBot:
 
     def _emergency_halt(self, mid: float):
         logger.warning(f"[GridBot] EMERGENCY HALT at mid={mid:.2f}")
-        self._halted = True
+        self._halted      = True
+        self._halt_time   = time.time()
+        self._halt_stop_price = self._params.stop_price if self._params else mid
 
         long_qty = 0.0
         if self._engine:
@@ -2059,11 +2125,14 @@ class GridBot:
             if fill and fill.is_filled:
                 logger.warning(
                     f"[GridBot] Liquidation filled: {fill.filled_qty:.4f} @ {fill.avg_price:.2f}")
+                _restart_note = ("Monitoring for auto-restart."
+                                 if self._cfg.get("auto_restart_enabled", True)
+                                 else "Restart manually.")
                 self._alerter.send_sync(
                     f"🚨 STOP-LOSS TRIGGERED\n"
-                    f"mid={mid:.2f} < stop={self._params.stop_price:.2f}\n"
+                    f"mid={mid:.2f} < stop={self._halt_stop_price:.2f}\n"
                     f"Liquidated {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}\n"
-                    f"Bot HALTED — restart manually."
+                    f"Bot HALTED — {_restart_note}"
                 )
             else:
                 logger.error("[GridBot] Liquidation fill timed out — MANUAL INTERVENTION REQUIRED")
@@ -2073,9 +2142,128 @@ class GridBot:
                     f"MANUAL INTERVENTION REQUIRED"
                 )
         else:
+            _restart_note = ("Monitoring for auto-restart."
+                             if self._cfg.get("auto_restart_enabled", True)
+                             else "Restart manually.")
             self._alerter.send_sync(
                 f"🚨 STOP-LOSS TRIGGERED at mid={mid:.2f}\n"
-                f"No long position to liquidate. Bot HALTED."
+                f"No long position to liquidate. Bot HALTED — {_restart_note}"
+            )
+
+    # ── Auto-restart ──────────────────────────────────────────────────────────
+
+    def _check_auto_restart(self):
+        """
+        Called every 10s while the bot is halted. Evaluates four stability
+        conditions and restarts the grid if all pass.
+
+        Conditions:
+          1. auto_restart_enabled = True
+          2. max_attempts not exceeded (0 = unlimited)
+          3. Cooldown since halt elapsed
+          4. Price above the stop-loss level that triggered the halt
+          5. Hi-lo range over stability window < stability_atr_mult × ATR
+          6. Current price >= mean of stability window (flat or rising)
+        """
+        if not self._cfg.get("auto_restart_enabled", True):
+            return
+
+        max_attempts = self._cfg.get("auto_restart_max_attempts", 3)
+        if max_attempts > 0 and self._restart_attempts >= max_attempts:
+            # Already exhausted all attempts — stay halted, require manual intervention
+            return
+
+        mid = _price_cache.get_mid()
+        if mid is None:
+            return
+
+        now           = time.time()
+        cooldown_s    = self._cfg.get("auto_restart_cooldown_minutes", 30) * 60
+        elapsed       = now - self._halt_time
+
+        # Condition 1: cooldown
+        if elapsed < cooldown_s:
+            remaining = int(cooldown_s - elapsed)
+            logger.debug(
+                f"[AutoRestart] Cooldown: {remaining}s remaining "
+                f"(halt={self._halt_stop_price:.2f} mid={mid:.2f})"
+            )
+            return
+
+        # Condition 2: price must be above the stop that triggered the halt
+        if mid <= self._halt_stop_price:
+            logger.info(
+                f"[AutoRestart] Price {mid:.2f} still at/below halt stop "
+                f"{self._halt_stop_price:.2f} — waiting"
+            )
+            return
+
+        # Condition 3 + 4: stability window
+        stab_min = self._cfg.get("auto_restart_stability_minutes", 60)
+        stab     = _price_cache.compute_stability(stab_min)
+
+        if not stab["ok"]:
+            logger.info(
+                f"[AutoRestart] Insufficient price history "
+                f"({stab.get('n_ticks', 0)} ticks in {stab_min}m window) — waiting"
+            )
+            return
+
+        atr = _price_cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
+        if atr is None or atr <= 0:
+            logger.info("[AutoRestart] ATR unavailable — waiting")
+            return
+
+        atr_mult  = self._cfg.get("auto_restart_stability_atr_mult", 1.0)
+        max_range = atr_mult * atr
+        hi_lo     = stab["hi_lo"]
+        mean      = stab["mean"]
+
+        # Condition 3: range must be tight
+        if hi_lo > max_range:
+            logger.info(
+                f"[AutoRestart] Still volatile: hi-lo={hi_lo:.2f} > "
+                f"{atr_mult}×ATR={max_range:.2f} — waiting"
+            )
+            return
+
+        # Condition 4: price must be flat or rising (not bleeding lower)
+        # Allow a small tolerance of 0.1×ATR below mean to avoid false blocks
+        # from end-of-sine-wave positioning in a tight oscillation.
+        trend_floor = mean - 0.1 * atr
+        if mid < trend_floor:
+            logger.info(
+                f"[AutoRestart] Downtrend in window: mid={mid:.2f} < "
+                f"trend_floor={trend_floor:.2f} (mean={mean:.2f} - 0.1×ATR) — waiting"
+            )
+            return
+
+        # All conditions met — restart
+        self._restart_attempts += 1
+        logger.info(
+            f"[AutoRestart] Stability confirmed: "
+            f"hi-lo={hi_lo:.2f} < max={max_range:.2f}, "
+            f"mid={mid:.2f} >= mean={mean:.2f}, "
+            f"above stop={self._halt_stop_price:.2f} "
+            f"(attempt {self._restart_attempts}/{max_attempts if max_attempts else '∞'})"
+        )
+        self._alerter.send(
+            f"🔄 Auto-restart #{self._restart_attempts}: stability confirmed\n"
+            f"mid={mid:.2f} | hi-lo={hi_lo:.0f} < {max_range:.0f} ({stab_min}m window)\n"
+            f"Rebuilding grid..."
+        )
+
+        self._halted = False
+        # Reset the stop-loss guard so it can fire again on the new grid
+        self._sl_guard = None
+
+        # Rebuild grid with fresh ATR-based params
+        self._rebuild_grid()
+
+        if max_attempts > 0 and self._restart_attempts >= max_attempts:
+            logger.warning(
+                f"[AutoRestart] Max attempts ({max_attempts}) reached. "
+                f"If bot halts again it will require manual restart."
             )
 
     # ── Status ────────────────────────────────────────────────────────────────
