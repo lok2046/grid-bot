@@ -1277,6 +1277,8 @@ class _ReconnectingWS:
                 except Exception as e:
                     if g == self._gen:
                         logger.error(f"[{self._name}] run_forever error (gen={g}): {e}")
+                    else:
+                        logger.debug(f"[{self._name}] run_forever error in orphaned worker (gen={g}): {e}")
 
             worker = threading.Thread(target=_worker,
                                        name=f"WSWorker-{self._name}-g{my_gen}", daemon=True)
