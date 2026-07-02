@@ -202,6 +202,10 @@ GRID_CONFIG: dict = {
     #   3. Stable range: hi-lo over last auto_restart_stability_minutes
     #      < auto_restart_stability_atr_mult × ATR.
     #      Confirms BTC is oscillating in a tight band, not still crashing.
+    #      ATR is a per-1-minute figure; the stability window is 60 minutes.
+    #      The multiplier must scale accordingly: sqrt(stability_minutes) ≈ 7.75
+    #      so that the threshold represents the expected random-walk range over
+    #      the window.  Setting mult=1.0 makes the gate permanently unsatisfiable.
     #   4. Flat/rising trend: current mid >= mean(prices over stability window).
     #      Rejects a slow bleed where range is small but price drifts lower.
     #
@@ -210,7 +214,7 @@ GRID_CONFIG: dict = {
     "auto_restart_enabled":           True,
     "auto_restart_cooldown_minutes":  30,    # minimum wait after halt
     "auto_restart_stability_minutes": 60,    # look-back window for stability check
-    "auto_restart_stability_atr_mult": 1.0,  # hi-lo must be < N × ATR
+    "auto_restart_stability_atr_mult": 7.75, # hi-lo < N × ATR; 7.75 = sqrt(60) scales 1-min ATR to 60-min window
     "auto_restart_max_attempts":      3,     # give up after N failed attempts; 0 = unlimited
 
     # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
@@ -3026,7 +3030,7 @@ class GridBot:
             logger.info("[AutoRestart] ATR unavailable — waiting")
             return
 
-        atr_mult  = self._cfg.get("auto_restart_stability_atr_mult", 1.0)
+        atr_mult  = self._cfg.get("auto_restart_stability_atr_mult", 7.75)
         max_range = atr_mult * atr
         hi_lo     = stab["hi_lo"]
         mean      = stab["mean"]
