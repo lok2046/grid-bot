@@ -197,8 +197,12 @@ GRID_CONFIG: dict = {
     # ALL four conditions must be true simultaneously before restarting:
     #   1. Cooldown: at least auto_restart_cooldown_minutes since halt.
     #      Prevents restarting into a dead-cat bounce.
-    #   2. Price recovered: mid > halt_stop_price (the original stop-loss level).
-    #      The halt trigger must no longer be active.
+    #   2. Price recovered: mid > halt_stop_price − auto_restart_recovery_atr_buffer × ATR.
+    #      The buffer (default 0.5×ATR ≈ half a minute's noise) prevents the bot from
+    #      staying pinned when BTC consolidates $1–2 below the exact stop cent value.
+    #      The _rebuild_grid stop-proximity guard (headroom > 0.5×ATR) acts as a second
+    #      line of defence: if price is genuinely too close to the stop, the rebuild
+    #      aborts and the bot reverts to halted.  Set buffer=0.0 for strict behaviour.
     #   3. Stable range: hi-lo over last auto_restart_stability_minutes
     #      < auto_restart_stability_atr_mult × ATR.
     #      Confirms BTC is oscillating in a tight band, not still crashing.
@@ -215,6 +219,13 @@ GRID_CONFIG: dict = {
     "auto_restart_cooldown_minutes":  30,    # minimum wait after halt
     "auto_restart_stability_minutes": 60,    # look-back window for stability check
     "auto_restart_stability_atr_mult": 7.75, # hi-lo < N × ATR; 7.75 = sqrt(60) scales 1-min ATR to 60-min window
+    "auto_restart_recovery_atr_buffer": 0.5, # price gate: allow restart when mid > halt_stop - N×ATR
+                                             # 0.5×ATR ≈ half a minute's typical move — genuine noise, not a
+                                             # resumed downtrend.  The _rebuild_grid stop-proximity guard
+                                             # (headroom > 0.5×ATR) is the second line of defence: if price
+                                             # is truly too close to the new stop, the rebuild aborts and the
+                                             # bot reverts to halted state.  Set to 0.0 to keep the old
+                                             # strict behaviour (mid must exceed halt_stop exactly).
     "auto_restart_max_attempts":      3,     # give up after N failed attempts; 0 = unlimited
 
     # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
@@ -3006,8 +3017,17 @@ class GridBot:
             )
             return
 
-        # Condition 2: price must be above the stop that triggered the halt
-        if mid <= self._halt_stop_price:
+        # Condition 2: price must be above (or within ATR noise of) the stop that
+        # triggered the halt.  We fetch ATR now so we can apply the buffer; if ATR
+        # is unavailable we fall back to the strict exact comparison.
+        atr_for_buffer = _price_cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
+        recovery_buffer_mult = self._cfg.get("auto_restart_recovery_atr_buffer", 0.5)
+        if atr_for_buffer and atr_for_buffer > 0:
+            recovery_floor = self._halt_stop_price - recovery_buffer_mult * atr_for_buffer
+        else:
+            recovery_floor = self._halt_stop_price   # strict fallback
+
+        if mid <= recovery_floor:
             logger.info(
                 f"[AutoRestart] Price {mid:.2f} still at/below halt stop "
                 f"{self._halt_stop_price:.2f} — waiting"
@@ -3025,7 +3045,7 @@ class GridBot:
             )
             return
 
-        atr = _price_cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
+        atr = atr_for_buffer   # already fetched for condition 2; reuse it
         if atr is None or atr <= 0:
             logger.info("[AutoRestart] ATR unavailable — waiting")
             return
