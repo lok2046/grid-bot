@@ -134,7 +134,26 @@ GRID_CONFIG: dict = {
     "grid_lower":         55000.0,
     "grid_upper":         65000.0,
     "grid_levels":        20,
-    "notional_per_level": 500.0,       # USD notional per grid order
+
+    # ── Investment amount ─────────────────────────────────────────────────────
+    # Total capital to deploy across all grid levels.  Specify EITHER USD or BTC
+    # — exactly one must be non-zero.  BTC is valued at the mid price at each
+    # grid build time and converted to a USD notional for order sizing.
+    #
+    # "total_investment_usd":  deploy this many USD across all levels, e.g. 2000.0
+    # "total_investment_btc":  deploy this many BTC across all levels, e.g. 0.03
+    #   (BTC mode is natural if you hold BTC in your wallet and want the bot to
+    #    cycle it — the grid starts with sell orders above mid, converting BTC→USD,
+    #    then buy orders below mid buy it back.)
+    #
+    # notional_per_level is derived at build time:
+    #   notional_per_level = total_investment_usd / levels
+    #   (BTC: first converted → USD at mid price)
+    #
+    # Legacy key "notional_per_level" is still accepted as a direct override
+    # (skips total_investment logic entirely) for backwards compatibility.
+    "total_investment_usd": 2000.0,   # set to 0.0 if using BTC instead
+    "total_investment_btc": 0.0,      # e.g. 0.03 BTC; 0.0 = use USD above
 
     # ── Auto-tuner ────────────────────────────────────────────────────────────
     "auto_tune_enabled":    True,
@@ -173,7 +192,24 @@ GRID_CONFIG: dict = {
 
     # ── Stop-loss ─────────────────────────────────────────────────────────────
     "stop_loss_enabled": True,
-    "stop_buffer_atr":   1.0,         # stop = lower - N×ATR
+    # stop = lower − stop_buffer_atr × ATR
+    #
+    # Observed data (Jul 3-4): halts 2-4 were triggered by moves of only
+    # 1.3-2.0×ATR below the grid lower bound.  With buffer=1.0 the stop sat
+    # only ~1×ATR below lower, making it trivially reachable by normal BTC noise.
+    #
+    # stop_buffer_atr = 3.0 means the stop fires when price drops 3×ATR below
+    # lower (= 6×ATR below mid for the default atr_multiplier=3.0).  At current
+    # ATR≈30-42 this places the stop ~$90-126 below lower, surviving the 1.3-2×ATR
+    # noise moves seen in the logs while still stopping a genuine crash.
+    #
+    # Auto-expansion: if the rolling ATR has expanded by more than
+    # stop_buffer_atr_expansion_threshold× its own recent mean, the buffer is
+    # scaled up proportionally (capped at stop_buffer_atr_max_mult× the base)
+    # to protect against sudden volatility regime shifts.
+    "stop_buffer_atr":                    3.0,
+    "stop_buffer_atr_expansion_threshold": 1.5,  # ATR/mean_ATR ratio that triggers widening
+    "stop_buffer_atr_max_mult":            2.0,  # cap: buffer never exceeds base × this
 
     # Minimum headroom between current mid and the newly-computed stop price,
     # expressed as a multiple of ATR.  If mid < stop + N×ATR at the moment the
@@ -1619,8 +1655,49 @@ class GridParams:
 
 class GridAutoTuner:
     def __init__(self, config: dict, cache: PriceCache):
-        self._cfg   = config
-        self._cache = cache
+        self._cfg        = config
+        self._cache      = cache
+        self._recent_atrs: List[float] = []   # for adaptive stop buffer
+
+    def _resolve_notional(self, levels: int, mid: float) -> float:
+        """
+        Derive notional_per_level from total_investment_usd or total_investment_btc.
+
+        Priority:
+          1. Legacy "notional_per_level" key present and non-zero → use directly
+          2. "total_investment_btc" non-zero → convert to USD at current mid
+          3. "total_investment_usd" non-zero → use as-is
+          4. Fallback: 500.0 USD (keeps existing behaviour)
+
+        Returns the USD notional to deploy per grid level.
+        """
+        # Legacy override
+        legacy = self._cfg.get("notional_per_level", 0.0)
+        if legacy and legacy > 0:
+            return float(legacy)
+
+        btc_inv = self._cfg.get("total_investment_btc", 0.0)
+        usd_inv = self._cfg.get("total_investment_usd", 0.0)
+
+        if btc_inv and btc_inv > 0 and mid > 0:
+            total_usd = btc_inv * mid
+            notional  = total_usd / max(levels, 1)
+            logger.info(
+                f"[AutoTuner] Investment: {btc_inv} BTC × {mid:.0f} = "
+                f"${total_usd:.0f} / {levels} levels = ${notional:.2f}/level"
+            )
+            return notional
+
+        if usd_inv and usd_inv > 0:
+            notional = usd_inv / max(levels, 1)
+            logger.info(
+                f"[AutoTuner] Investment: ${usd_inv:.0f} / {levels} levels "
+                f"= ${notional:.2f}/level"
+            )
+            return notional
+
+        logger.warning("[AutoTuner] No investment amount configured — defaulting to $500/level")
+        return 500.0
 
     def compute(self) -> Optional[GridParams]:
         mid = self._cache.get_mid()
@@ -1634,12 +1711,35 @@ class GridAutoTuner:
             return self._from_config(mid)
 
         atr_mult   = self._cfg.get("atr_multiplier", 3.0)
-        stop_buf   = self._cfg.get("stop_buffer_atr", 1.0)
+        stop_buf   = self._cfg.get("stop_buffer_atr", 3.0)
         maker_fee  = self._cfg.get("maker_fee_rate", 0.0001)
         min_sp_pct = self._cfg.get("min_grid_pct", 0.0008)
         max_levels = self._cfg.get("max_grid_levels", 50)
         min_levels = self._cfg.get("min_grid_levels", 5)
-        notional   = self._cfg.get("notional_per_level", 500.0)
+
+        # ── Adaptive stop buffer ──────────────────────────────────────────────
+        # If ATR has expanded sharply vs its own recent mean, widen the buffer
+        # proportionally to protect against sudden volatility regime shifts.
+        expansion_threshold = self._cfg.get("stop_buffer_atr_expansion_threshold", 1.5)
+        max_mult            = self._cfg.get("stop_buffer_atr_max_mult", 2.0)
+        recent_atrs = self._recent_atrs
+        recent_atrs.append(atr)
+        if len(recent_atrs) > 20:          # keep last 20 builds (~20 retune events)
+            recent_atrs.pop(0)
+        if len(recent_atrs) >= 3:
+            mean_atr = sum(recent_atrs[:-1]) / len(recent_atrs[:-1])
+            if mean_atr > 0:
+                expansion_ratio = atr / mean_atr
+                if expansion_ratio > expansion_threshold:
+                    adaptive_mult = min(expansion_ratio / expansion_threshold, max_mult)
+                    old_buf = stop_buf
+                    stop_buf = round(stop_buf * adaptive_mult, 2)
+                    logger.info(
+                        f"[AutoTuner] ATR expansion detected: "
+                        f"ATR={atr:.2f} vs mean={mean_atr:.2f} "
+                        f"(ratio={expansion_ratio:.2f}×) → "
+                        f"stop_buffer {old_buf}×ATR → {stop_buf}×ATR"
+                    )
 
         lower = round(mid - atr_mult * atr, 2)
         upper = round(mid + atr_mult * atr, 2)
@@ -1650,6 +1750,7 @@ class GridAutoTuner:
         levels      = max(min_levels, min(max_levels, raw_levels))
         spacing     = round((upper - lower) / levels, 2)
 
+        notional = self._resolve_notional(levels, mid)
         logger.info(
             f"[AutoTuner] mid={mid:.2f} ATR={atr:.2f} "
             f"range=[{lower:.2f},{upper:.2f}] levels={levels} "
@@ -1664,8 +1765,8 @@ class GridAutoTuner:
         upper   = self._cfg.get("grid_upper",   mid * 1.08)
         levels  = self._cfg.get("grid_levels",  20)
         stop    = self._cfg.get("stop_loss_price", lower * 0.97)
-        notional = self._cfg.get("notional_per_level", 500.0)
         spacing = round((upper - lower) / max(levels, 1), 2)
+        notional = self._resolve_notional(levels, mid)
         logger.warning(
             f"[AutoTuner] Using config fallback (ATR unavailable): "
             f"range=[{lower:.2f},{upper:.2f}] levels={levels} "
@@ -3141,10 +3242,6 @@ class GridBot:
 
         logger.info("[GridBot] (Re)building grid...")
 
-        if self._engine:
-            self._engine.stop()
-            self._engine = None
-
         new_params = self._auto_tuner.compute()
         if new_params is None:
             logger.error("[GridBot] Auto-tuner returned None — keeping existing params")
@@ -3153,7 +3250,10 @@ class GridBot:
             logger.error("[GridBot] No grid params available — aborting rebuild")
             return
 
-        # Dead-band check
+        # ── Dead-band check (BEFORE tearing down the existing grid) ──────────
+        # Must happen first: if the shift is too small we return immediately
+        # without disrupting the running grid.  The original code did this AFTER
+        # engine.stop(), leaving the bot orderless until the next retune trigger.
         if self._params is not None:
             old_width = self._params.upper - self._params.lower
             new_width = new_params.upper - new_params.lower
@@ -3163,9 +3263,14 @@ class GridBot:
                 if delta < deadband:
                     logger.info(
                         f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
-                        f"dead-band {deadband:.1%})"
+                        f"dead-band {deadband:.1%}) — existing grid kept running"
                     )
                     return
+
+        # Dead-band passed (or first build) — safe to tear down now
+        if self._engine:
+            self._engine.stop()
+            self._engine = None
 
         # ── Stop-proximity guard ──────────────────────────────────────────────
         # Abort the grid build if current mid is already too close to the
@@ -3482,6 +3587,8 @@ class GridBot:
             f"  • Open buys:  `{open_buys}` / Open sells: `{open_sells}`",
             f"  • Grid range: `{range_str}`",
             f"  • Levels:     `{levels}` (spacing ≈ {spacing_str})",
+            f"  • Notional/level: `${params.notional_per_level:.2f}` "
+            f"(total ≈ `${params.notional_per_level * params.levels:.0f}`)" if params else "",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
             f"*2️⃣  Daily PnL* (today {today['hkt_date']} HKT)",
