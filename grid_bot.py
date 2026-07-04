@@ -276,6 +276,27 @@ GRID_CONFIG: dict = {
 
     # ── SQLite persistence ────────────────────────────────────────────────────
     "db_path": "grid_bot.db",     # fills, daily PnL, and accumulated PnL survive restarts
+
+    # ── Trend signal (Phase 1 — read-only observer, no grid side-effects) ────
+    # Dual-EMA trend detection on hourly closes derived from PriceCache history.
+    # The signal is logged every STATUS_INTERVAL_S seconds and included in the
+    # /status Telegram reply.  It does NOT change grid behaviour yet.
+    #
+    # trend_signal_ema_fast_h        fast EMA period in hours (default 4h)
+    # trend_signal_ema_slow_h        slow EMA period in hours (default 24h)
+    # trend_signal_slope_window_h    hours over which fast-EMA slope is measured
+    # trend_signal_min_history_h     minimum hours of data before any signal is
+    #                                emitted (default slow_h + 2 = 26h)
+    # trend_signal_confirm_periods   consecutive evaluations before UP/DOWN is
+    #                                committed (hysteresis; default 3 × 60s = 3 min)
+    # trend_signal_slope_threshold_pct  minimum fast-EMA slope as % of slow-EMA
+    #                                to count as directional (default 0.05%)
+    "trend_signal_ema_fast_h":           4,
+    "trend_signal_ema_slow_h":           24,
+    "trend_signal_slope_window_h":       2,
+    "trend_signal_min_history_h":        26,   # slow_h + 2h EMA warm-up buffer
+    "trend_signal_confirm_periods":      3,
+    "trend_signal_slope_threshold_pct":  0.05,
 }
 
 INSTRUMENT = GRID_CONFIG["instrument"]
@@ -2214,6 +2235,250 @@ _grid_bot_alerter: AlertManager = _NullAlerter()  # type: ignore
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TrendSignal  — read-only mid/long-term trend observer (Phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Computes a dual-EMA trend signal from the 1-minute candle data already held
+# in PriceCache._history.  No external REST calls; no side-effects on the grid.
+#
+# Algorithm  (dual-EMA confirmation with daily band filter)
+# ─────────────────────────────────────────────────────────
+#   Fast signal  — EMA(fast_h) vs EMA(slow_h) on 1-hour close prices
+#     fast_h and slow_h are expressed in hours (default 4h / 24h).
+#     Uses the 1-min candle "close" prices already bucketed by PriceCache,
+#     then sub-samples every 60 buckets to get 1-hour candles.
+#
+#     UP   if  EMA_fast > EMA_slow  AND  EMA_fast slope is positive
+#     DOWN if  EMA_fast < EMA_slow  AND  EMA_fast slope is negative
+#     NEUTRAL otherwise (cross-zone or flat slope)
+#
+#   Trend strength  (auxiliary, logged only)
+#     separation = (EMA_fast - EMA_slow) / EMA_slow × 100  (%)
+#     slope_pct  = (EMA_fast_now - EMA_fast_N_hours_ago) / EMA_slow × 100 (%)
+#
+#   Hysteresis  (prevents flutter at the crossover)
+#     A transition NEUTRAL→UP or NEUTRAL→DOWN requires the signal to hold for
+#     trend_confirm_periods consecutive evaluation intervals before the regime
+#     changes.  A transition back to NEUTRAL is immediate.
+#
+# Data requirement
+# ────────────────
+#   min_history_hours (default 26h) of 1-min data in PriceCache before any
+#   signal is emitted.  This ensures EMA(24h) has enough warm-up candles.
+#   In practice, after the REST ATR seed this is available within seconds.
+#
+# Output
+# ──────
+#   TrendSignal.evaluate() returns a dict:
+#     "regime"      : "UP" | "DOWN" | "NEUTRAL" | "INSUFFICIENT_DATA"
+#     "ema_fast"    : float   current fast EMA (hourly close price)
+#     "ema_slow"    : float   current slow EMA
+#     "separation"  : float   % gap between fast and slow
+#     "slope_pct"   : float   % change in fast EMA over last slope_window_h hours
+#     "n_hourly"    : int     number of hourly candles used
+#     "changed"     : bool    True if regime changed vs previous call
+#     "prev_regime" : str     regime before this call
+
+class TrendSignal:
+    """
+    Dual-EMA trend observer.  Read-only — no grid side-effects.
+
+    All config comes from GRID_CONFIG under the "trend_signal_*" namespace.
+    GridBot hooks this into its periodic status log and /status command.
+    """
+
+    REGIME_UP      = "UP"
+    REGIME_DOWN    = "DOWN"
+    REGIME_NEUTRAL = "NEUTRAL"
+    REGIME_NODATA  = "INSUFFICIENT_DATA"
+
+    def __init__(self, config: dict, price_cache: "PriceCache"):
+        self._cfg   = config
+        self._cache = price_cache
+
+        # EMA periods in hours
+        self._fast_h  = config.get("trend_signal_ema_fast_h",  4)
+        self._slow_h  = config.get("trend_signal_ema_slow_h",  24)
+        self._slope_w = config.get("trend_signal_slope_window_h", 2)
+
+        # Minimum data before we trust the slow EMA  (slow_h + 2h buffer)
+        self._min_history_h = config.get("trend_signal_min_history_h",
+                                          self._slow_h + 2)
+
+        # Hysteresis: require this many consecutive agreeing periods
+        # before committing to UP/DOWN from NEUTRAL
+        self._confirm_n = config.get("trend_signal_confirm_periods", 3)
+
+        # Slope threshold: EMA_fast must move at least this many % of
+        # EMA_slow over slope_window_h before we call it directional
+        self._slope_threshold_pct = config.get(
+            "trend_signal_slope_threshold_pct", 0.05
+        )
+
+        self._regime: str     = self.REGIME_NEUTRAL  # start neutral; NODATA only when closes is None
+        self._pending: str    = self.REGIME_NEUTRAL  # candidate in hysteresis window
+        self._pending_count   = 0                    # consecutive periods for candidate
+
+        self._lock = threading.Lock()
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _build_hourly_closes(self) -> Optional[List[float]]:
+        """
+        Build a list of hourly close prices from PriceCache._history.
+
+        1-min buckets are grouped into 60-min buckets.  The last (open) hourly
+        bucket is excluded so all candles are complete.
+
+        Returns None if fewer than (slow_h + 2) hourly candles are available.
+        """
+        with self._cache._lock:
+            history = list(self._cache._history)
+
+        if not history:
+            return None
+
+        # Group ticks into 1-min buckets, take the last price as close
+        min_buckets: Dict[int, float] = {}
+        for ts, mid in history:
+            k = int(ts // 60)
+            min_buckets[k] = mid          # last write wins → close price
+
+        if not min_buckets:
+            return None
+
+        # Group 1-min buckets into hourly buckets (60 mins per hour)
+        hour_buckets: Dict[int, float] = {}
+        for min_k in sorted(min_buckets.keys()):
+            hour_k = min_k // 60
+            hour_buckets[hour_k] = min_buckets[min_k]   # last minute is hourly close
+
+        sorted_hours = sorted(hour_buckets.keys())
+        current_hour = int(time.time() // 3600)
+
+        # Drop the still-open current hourly candle
+        if sorted_hours and sorted_hours[-1] == current_hour:
+            sorted_hours = sorted_hours[:-1]
+
+        if len(sorted_hours) < self._min_history_h:
+            return None
+
+        return [hour_buckets[h] for h in sorted_hours]
+
+    @staticmethod
+    def _compute_ema(prices: List[float], period: int) -> List[float]:
+        """
+        Classic Wilder/exponential EMA.
+        alpha = 2 / (period + 1).
+        Returns an EMA series of the same length as prices (warm-up from index 0).
+        """
+        if not prices or period <= 0:
+            return []
+        alpha = 2.0 / (period + 1)
+        ema = [prices[0]]
+        for p in prices[1:]:
+            ema.append(alpha * p + (1 - alpha) * ema[-1])
+        return ema
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def evaluate(self) -> dict:
+        """
+        Compute the current trend regime.  Thread-safe; cheap (pure Python
+        over ~200-300 floats for a 24h window).  Call from the GridBot main
+        loop or status handler.
+
+        Returns a result dict (see class docstring).
+        """
+        closes = self._build_hourly_closes()
+
+        base = {
+            "ema_fast":   0.0,
+            "ema_slow":   0.0,
+            "separation": 0.0,
+            "slope_pct":  0.0,
+            "n_hourly":   0,
+            "changed":    False,
+            "prev_regime": self._regime,
+        }
+
+        if closes is None:
+            with self._lock:
+                prev = self._regime
+                self._regime = self.REGIME_NODATA
+                changed = (prev != self.REGIME_NODATA)
+            return {**base, "regime": self.REGIME_NODATA, "changed": changed,
+                    "prev_regime": prev}
+
+        n = len(closes)
+        ema_fast_series = self._compute_ema(closes, self._fast_h)
+        ema_slow_series = self._compute_ema(closes, self._slow_h)
+
+        ema_fast = ema_fast_series[-1]
+        ema_slow = ema_slow_series[-1]
+        separation_pct = (ema_fast - ema_slow) / ema_slow * 100.0
+
+        # Slope: change in fast EMA over slope_window_h periods
+        slope_idx = max(0, len(ema_fast_series) - 1 - self._slope_w)
+        slope_pct = (ema_fast - ema_fast_series[slope_idx]) / ema_slow * 100.0
+
+        # Raw signal before hysteresis
+        if (ema_fast > ema_slow and slope_pct > self._slope_threshold_pct):
+            raw = self.REGIME_UP
+        elif (ema_fast < ema_slow and slope_pct < -self._slope_threshold_pct):
+            raw = self.REGIME_DOWN
+        else:
+            raw = self.REGIME_NEUTRAL
+
+        # Apply hysteresis: instantaneous return to NEUTRAL; UP/DOWN need
+        # confirm_n consecutive agreeing evaluations to commit.
+        with self._lock:
+            prev_regime = self._regime
+
+            if raw == self.REGIME_NEUTRAL:
+                # Immediate reset — don't persist UP/DOWN through flat periods
+                self._pending       = self.REGIME_NEUTRAL
+                self._pending_count = 0
+                new_regime          = self.REGIME_NEUTRAL
+            elif raw == self._regime:
+                # Already in this regime — keep it; reset pending counter
+                self._pending       = raw
+                self._pending_count = self._confirm_n
+                new_regime          = raw
+            elif raw == self._pending:
+                # Building towards a new regime
+                self._pending_count += 1
+                if self._pending_count >= self._confirm_n:
+                    new_regime = raw
+                else:
+                    new_regime = self._regime   # not yet confirmed; hold current
+            else:
+                # New candidate, reset counter
+                self._pending       = raw
+                self._pending_count = 1
+                new_regime          = self._regime   # hold current until confirmed
+
+            self._regime = new_regime
+            changed = (new_regime != prev_regime)
+
+        return {
+            "regime":      new_regime,
+            "ema_fast":    ema_fast,
+            "ema_slow":    ema_slow,
+            "separation":  separation_pct,
+            "slope_pct":   slope_pct,
+            "n_hourly":    n,
+            "changed":     changed,
+            "prev_regime": prev_regime,
+        }
+
+    def regime(self) -> str:
+        """Return the last confirmed regime without recomputing."""
+        with self._lock:
+            return self._regime
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GridStateStore — SQLite persistence
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -2480,6 +2745,11 @@ class GridBot:
             config       = config,
         )
         self._auto_tuner = GridAutoTuner(config, _price_cache)
+
+        # ── Trend signal (Phase 1 — read-only observer) ───────────────────────
+        self._trend = TrendSignal(config, _price_cache)
+        self._last_trend_regime: str   = TrendSignal.REGIME_NODATA
+        self._last_trend_log:    float = 0.0   # ts of last trend log line
 
         # ── SQLite persistence ────────────────────────────────────────────────────
         # Opened once here and shared with every GridEngine instance so that
@@ -2820,10 +3090,11 @@ class GridBot:
                 if self._auto_tuner.should_retune(self._params, mid, self._last_tune):
                     self._rebuild_grid()
 
-            # Periodic status
+            # Periodic status + trend signal (share the same cadence)
             if now - self._last_status > self.STATUS_INTERVAL_S:
                 self._last_status = now
                 self._log_status(mid)
+                self._evaluate_trend()
 
             time.sleep(0.1)
 
@@ -3179,6 +3450,27 @@ class GridBot:
             )
         hist_block = "\n".join(hist_lines) if hist_lines else "  (no data yet)"
 
+        # ── Trend signal snapshot (re-evaluate on demand) ─────────────────────
+        tr = self._trend.evaluate()
+        tr_regime = tr["regime"]
+        regime_icons = {
+            TrendSignal.REGIME_UP:      "📈",
+            TrendSignal.REGIME_DOWN:    "📉",
+            TrendSignal.REGIME_NEUTRAL: "➡️",
+            TrendSignal.REGIME_NODATA:  "⏳",
+        }
+        tr_icon = regime_icons.get(tr_regime, "?")
+        if tr_regime == TrendSignal.REGIME_NODATA:
+            tr_block = f"  {tr_icon} Insufficient data (need {self._cfg.get('trend_signal_min_history_h', 26)}h)"
+        else:
+            tr_block = (
+                f"  {tr_icon} `{tr_regime}`\n"
+                f"  • EMA 4h:  `{tr['ema_fast']:,.2f}`\n"
+                f"  • EMA 24h: `{tr['ema_slow']:,.2f}`\n"
+                f"  • Sep: `{tr['separation']:+.3f}%`  Slope: `{tr['slope_pct']:+.3f}%`\n"
+                f"  • Based on `{tr['n_hourly']}` hourly candles _(read-only)_"
+            )
+
         lines = [
             f"📊 *Grid Bot Status* — {now_hkt}",
             f"_{state_line}_",
@@ -3207,6 +3499,10 @@ class GridBot:
             "━━━━━━━━━━━━━━━━━━━━━",
             "*📅  Last 7 Days*",
             hist_block,
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "*📡  Trend Signal* (EMA 4h / 24h — observer only)",
+            tr_block,
         ]
 
         logger.info("[GridBot] /status command served via Telegram")
@@ -3226,6 +3522,58 @@ class GridBot:
                 f"cycles={stats.get('cycles',0)} "
                 f"net_pnl={stats.get('net_pnl',0):+.4f} USD"
             )
+
+    # ── Trend signal evaluation ───────────────────────────────────────────────
+
+    def _evaluate_trend(self) -> dict:
+        """
+        Evaluate the TrendSignal and log/alert on regime changes.
+        Called from the main _run loop alongside the periodic status log.
+        Returns the latest result dict for use in _handle_status_command.
+        """
+        result = self._trend.evaluate()
+        regime = result["regime"]
+
+        # Always log at INFO so the signal is visible in the daily log file
+        regime_icons = {
+            TrendSignal.REGIME_UP:      "📈",
+            TrendSignal.REGIME_DOWN:    "📉",
+            TrendSignal.REGIME_NEUTRAL: "➡️ ",
+            TrendSignal.REGIME_NODATA:  "⏳",
+        }
+        icon = regime_icons.get(regime, "?")
+
+        if regime == TrendSignal.REGIME_NODATA:
+            logger.info(
+                f"[TrendSignal] {icon} INSUFFICIENT_DATA "
+                f"(need {self._cfg.get('trend_signal_min_history_h', 26)}h of 1-min candles)"
+            )
+        else:
+            logger.info(
+                f"[TrendSignal] {icon} {regime:7s} | "
+                f"EMA4h={result['ema_fast']:,.2f}  EMA24h={result['ema_slow']:,.2f} | "
+                f"sep={result['separation']:+.3f}%  slope={result['slope_pct']:+.3f}% | "
+                f"n_hourly={result['n_hourly']}"
+            )
+
+        # Telegram alert on regime change (not for NODATA transitions)
+        if (result["changed"]
+                and regime != TrendSignal.REGIME_NODATA
+                and result["prev_regime"] != TrendSignal.REGIME_NODATA):
+            prev = result["prev_regime"]
+            self._alerter.send(
+                f"{icon} *Trend regime changed*: `{prev}` → `{regime}`\n"
+                f"EMA4h={result['ema_fast']:,.2f}  EMA24h={result['ema_slow']:,.2f}\n"
+                f"sep={result['separation']:+.3f}%  slope={result['slope_pct']:+.3f}%\n"
+                f"_Read-only signal — grid not affected_"
+            )
+            logger.info(
+                f"[TrendSignal] ⚠️  Regime change: {prev} → {regime} "
+                f"(Telegram alert sent)"
+            )
+
+        self._last_trend_regime = regime
+        return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
