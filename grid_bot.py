@@ -263,6 +263,13 @@ GRID_CONFIG: dict = {
                                              # bot reverts to halted state.  Set to 0.0 to keep the old
                                              # strict behaviour (mid must exceed halt_stop exactly).
     "auto_restart_max_attempts":      3,     # give up after N failed attempts; 0 = unlimited
+    "auto_restart_attempt_reset_hours": 24,  # if the grid has been running healthily (no halt)
+                                             # for this long since the last auto-restart, the
+                                             # attempt counter is cleared before counting the
+                                             # next halt. Prevents attempts accumulated over
+                                             # separate, unrelated halt events (days/weeks apart)
+                                             # from permanently exhausting max_attempts. 0 = never
+                                             # reset (old lifetime-counter behaviour).
 
     # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
     "rest_base_url": {
@@ -2837,6 +2844,8 @@ class GridBot:
         self._halt_time:  float = 0.0       # timestamp of the last halt
         self._halt_stop_price: float = 0.0  # stop_price that triggered the halt
         self._restart_attempts: int = 0     # number of auto-restart attempts made
+        self._last_restart_time: float = 0.0  # timestamp of the last successful auto-restart
+                                               # (0.0 = no auto-restart has happened yet)
 
         self._oms = OMS(
             api_key      = config.get("api_key", ""),
@@ -3331,6 +3340,23 @@ class GridBot:
         self._halt_time   = time.time()
         self._halt_stop_price = self._params.stop_price if self._params else mid
 
+        # If the grid ran healthily for a long stretch since the last auto-restart
+        # (or since startup, if no auto-restart has happened yet) before hitting
+        # this new, unrelated halt, clear the attempt counter. Otherwise attempts
+        # from long-past, unrelated stop-loss events accumulate forever and can
+        # silently exhaust auto_restart_max_attempts for good.
+        reset_hours = self._cfg.get("auto_restart_attempt_reset_hours", 24)
+        if reset_hours > 0 and self._restart_attempts > 0:
+            healthy_since = self._last_restart_time or 0.0
+            if healthy_since and (self._halt_time - healthy_since) >= reset_hours * 3600:
+                logger.info(
+                    f"[AutoRestart] Grid ran for "
+                    f"{(self._halt_time - healthy_since) / 3600:.1f}h since last "
+                    f"auto-restart (≥ {reset_hours}h) — resetting attempt counter "
+                    f"from {self._restart_attempts} to 0"
+                )
+                self._restart_attempts = 0
+
         long_qty = 0.0
         if self._engine:
             long_qty = self._engine.get_stats().get("long_qty", 0.0)
@@ -3408,8 +3434,9 @@ class GridBot:
 
         if mid <= recovery_floor:
             logger.info(
-                f"[AutoRestart] Price {mid:.2f} still at/below halt stop "
-                f"{self._halt_stop_price:.2f} — waiting"
+                f"[AutoRestart] Price {mid:.2f} still at/below recovery floor "
+                f"{recovery_floor:.2f} (halt stop={self._halt_stop_price:.2f} "
+                f"buffer={recovery_buffer_mult}×ATR={(atr_for_buffer or 0):.2f}) — waiting"
             )
             return
 
@@ -3469,6 +3496,7 @@ class GridBot:
         )
 
         self._halted = False
+        self._last_restart_time = now
         # Reset the stop-loss guard so it can fire again on the new grid
         self._sl_guard = None
 
