@@ -3254,7 +3254,10 @@ class GridBot:
         # Must happen first: if the shift is too small we return immediately
         # without disrupting the running grid.  The original code did this AFTER
         # engine.stop(), leaving the bot orderless until the next retune trigger.
-        if self._params is not None:
+        #
+        # Skip if the engine is already None (halt, startup, etc.) — there is
+        # no live grid to protect, so always proceed with the rebuild.
+        if self._params is not None and self._engine is not None:
             old_width = self._params.upper - self._params.lower
             new_width = new_params.upper - new_params.lower
             if old_width > 0:
