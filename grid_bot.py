@@ -44,6 +44,7 @@ Auto-tuner
 # ─────────────────────────────────────────────────────────────────────────────
 # Stdlib imports
 # ─────────────────────────────────────────────────────────────────────────────
+import argparse
 import atexit
 import collections
 import hashlib
@@ -54,6 +55,7 @@ import logging.handlers
 import math
 import os
 import queue
+import shutil
 import signal
 import sys
 import threading
@@ -2814,6 +2816,58 @@ class GridStateStore:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    # ── Reset (fresh-start) ───────────────────────────────────────────────────
+
+    def reset_state(self, backup: bool = True) -> Optional[str]:
+        """
+        Wipe all persisted fills, daily PnL, and meta rows so the bot behaves
+        as if this is the very first startup.
+
+        Does NOT touch anything on the exchange — open orders/positions are
+        always independently handled by OMS.reconcile_on_startup() on every
+        launch, reset or not, so a stale live position is still detected and
+        liquidated exactly as before.
+
+        If backup=True (default), the WAL is checkpointed and the db file is
+        copied to "<db_path>.bak-<timestamp>" before anything is wiped, so
+        pre-reset history is never silently lost.
+
+        Returns the backup file path, or None if backup=False.
+        """
+        backup_path = None
+        with self._lock:
+            if backup:
+                self._conn.execute("PRAGMA wal_checkpoint(FULL)")
+                self._conn.commit()
+                ts = _dt.datetime.now(_HKT_TZ).strftime("%Y%m%d_%H%M%S")
+                backup_path = f"{self._db_path}.bak-{ts}"
+                try:
+                    shutil.copy2(self._db_path, backup_path)
+                except OSError as e:
+                    logger.error(f"[GridStateStore] Reset backup failed: {e}")
+                    backup_path = None
+
+            self._conn.execute("DELETE FROM grid_fills")
+            self._conn.execute("DELETE FROM daily_pnl")
+            self._conn.execute("DELETE FROM meta")
+            self._conn.execute(
+                "INSERT INTO meta(key,value) VALUES('schema_version',?)",
+                (str(_GRID_DB_SCHEMA_VERSION),),
+            )
+            self._conn.commit()
+            try:
+                self._conn.execute("VACUUM")
+            except _sqlite3.OperationalError as e:
+                logger.warning(f"[GridStateStore] VACUUM after reset skipped: {e}")
+
+        logger.warning(
+            "[GridStateStore] STATE RESET — all fills, daily PnL, and "
+            "accumulated PnL cleared. " +
+            (f"Pre-reset backup saved to {os.path.abspath(backup_path)}"
+             if backup_path else "No backup taken.")
+        )
+        return backup_path
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -2828,7 +2882,7 @@ class GridBot:
     STATUS_INTERVAL_S     = 60.0
     RETUNE_CHECK_INTERVAL = 300.0
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, reset_state: bool = False):
         self._cfg         = config
         self._stop_event  = threading.Event()
         self._engine:     Optional[GridEngine]    = None
@@ -2865,6 +2919,23 @@ class GridBot:
         # Opened once here and shared with every GridEngine instance so that
         # fills survive restarts, re-tunes, and stop-loss rebuilds.
         self._store = GridStateStore(config.get("db_path", "grid_bot.db"))
+
+        if reset_state:
+            # Fresh-start requested via --reset-state: wipe fill history, daily
+            # PnL, and accumulated PnL so /status reports as if this is the
+            # very first launch. A pre-reset backup of the db is kept on disk.
+            # Note: this only clears local bookkeeping — it does NOT touch the
+            # exchange. Any real open orders/position are still independently
+            # detected and liquidated by OMS.reconcile_on_startup() below, same
+            # as on every normal launch.
+            backup_path = self._store.reset_state()
+            note = (f" (backup: {os.path.abspath(backup_path)})"
+                    if backup_path else " (no backup — see log)")
+            logger.warning(f"[GridBot] --reset-state: persisted PnL/fill history cleared{note}")
+            self._alerter.send_sync(
+                f"🧹 State reset requested — fill history, daily PnL, and "
+                f"accumulated PnL cleared{note}.\nBot starting fresh."
+            )
 
         # ── Telegram command poller ────────────────────────────────────────────
         self._cmd_poller = TelegramCommandPoller(
@@ -3575,6 +3646,24 @@ class GridBot:
         def _e(v: float) -> str:
             return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
 
+        # ── Capital base for % returns ─────────────────────────────────────────
+        # Prefer the configured total_investment_usd (stable, config-driven).
+        # Fall back to total_investment_btc converted at current mid, then to
+        # the live grid's deployed notional, so % still shows if the operator
+        # is using BTC-denominated sizing or the config uses the legacy key.
+        capital_base = self._cfg.get("total_investment_usd", 0.0)
+        if not capital_base:
+            btc_inv = self._cfg.get("total_investment_btc", 0.0)
+            if btc_inv and mid:
+                capital_base = btc_inv * mid
+        if not capital_base and params:
+            capital_base = params.notional_per_level * params.levels
+
+        def _pct(v: float) -> str:
+            if not capital_base:
+                return "N/A"
+            return f"{(v / capital_base * 100):+.2f}%"
+
         # ── Last 7 days table ─────────────────────────────────────────────────
         hist_lines = []
         for row in history:
@@ -3623,13 +3712,13 @@ class GridBot:
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
             f"*2️⃣  Daily PnL* (today {today['hkt_date']} HKT)",
-            f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD`",
+            f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD` (`{_pct(daily_net)}`)",
             f"  • Gross: `{today['gross_pnl_usd']:+.4f}`  Fees: `{today['fees_usd']:+.4f}`",
             f"  • Cycles today: `{today['cycle_count']}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
             "*3️⃣  Accumulated PnL* (all-time from DB)",
-            f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD`",
+            f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD` (`{_pct(acc_net)}`)",
             f"  • Gross realised: `{acc_gross:+.4f} USD`",
             f"  • Total fees:     `{acc_fees:+.4f} USD`",
             f"  • Total cycles:   `{acc_cycles}`",
@@ -3718,8 +3807,55 @@ class GridBot:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Grid trading bot")
+    parser.add_argument(
+        "--reset-state", action="store_true",
+        help=(
+            "Wipe persisted fill history, daily PnL, and accumulated PnL "
+            "(grid_fills/daily_pnl/meta tables) so the bot starts fresh, "
+            "as if this were the very first launch. A timestamped backup "
+            "of the db file is taken automatically before wiping. This does "
+            "NOT close or affect any real position/orders on the exchange — "
+            "those are independently reconciled on every startup regardless "
+            "of this flag."
+        ),
+    )
+    parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the interactive confirmation prompt for --reset-state "
+             "(required when running non-interactively, e.g. under NSSM).",
+    )
+    return parser.parse_args()
+
+
 def main():
-    bot = GridBot(GRID_CONFIG)
+    args = _parse_args()
+
+    if args.reset_state:
+        warning = (
+            "\n" + "=" * 70 +
+            "\n⚠️  --reset-state: this will PERMANENTLY clear all persisted\n"
+            "   fill history, daily PnL, and accumulated PnL for this bot.\n"
+            "   (A backup of the db file is taken automatically first.)\n"
+            "   Live exchange orders/positions are NOT affected.\n" +
+            "=" * 70
+        )
+        print(warning)
+        if not args.yes:
+            if sys.stdin.isatty():
+                reply = input("Type RESET to confirm, anything else to abort: ")
+                if reply.strip() != "RESET":
+                    print("Aborted — no changes made.")
+                    sys.exit(1)
+            else:
+                print(
+                    "Refusing to reset state non-interactively without --yes. "
+                    "Re-run with: --reset-state --yes"
+                )
+                sys.exit(1)
+
+    bot = GridBot(GRID_CONFIG, reset_state=args.reset_state)
 
     def _shutdown(sig, frame):
         logger.info(f"[Main] Signal {sig} — shutting down")
