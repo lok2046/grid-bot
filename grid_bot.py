@@ -273,6 +273,46 @@ GRID_CONFIG: dict = {
                                              # from permanently exhausting max_attempts. 0 = never
                                              # reset (old lifetime-counter behaviour).
 
+    # ── Proactive stop-score gate ─────────────────────────────────────────────
+    # After a SELL fill, before placing the counter-BUY order, the bot computes
+    # a composite stop-loss risk score from three real-time signals:
+    #
+    #   Proximity  (weight 0.40):
+    #     (stop_price − mid) / ATR — how many ATRs away is the stop right now?
+    #     Clamped to [0, 1] where 1 = mid has reached the stop.
+    #
+    #   Velocity   (weight 0.35):
+    #     EMA of (prev_mid − mid) / ATR over the last N ticks.
+    #     Captures the speed and direction of price movement; values > 0 mean
+    #     price is falling, scaled by how large the move is relative to ATR.
+    #     Clamped to [0, 1].
+    #
+    #   Volatility (weight 0.25):
+    #     (ATR / mean_ATR) − 1, clamped to [0, 1].
+    #     Fires when ATR has expanded relative to its recent mean, indicating
+    #     a volatility regime shift that elevates stop-loss risk.
+    #
+    #   score = proximity × 0.40 + velocity × 0.35 + volatility × 0.25
+    #
+    # If score ≥ stop_score_threshold, the counter-BUY is suppressed: the level
+    # is set to SUPPRESSED instead of BUY_OPEN so _replace_idle_levels() skips
+    # it.  This lets the position close gradually as remaining sell orders fill,
+    # without adding new longs into a deteriorating market.
+    #
+    # Recovery: when score drops back to ≤ stop_score_resume_threshold, the bot
+    # releases one SUPPRESSED level per main-loop tick (every ~100ms), starting
+    # from the highest index (closest to mid, least exposed), so position rebuilds
+    # slowly and can be re-suppressed if conditions worsen again.
+    #
+    # Set stop_score_enabled=False to disable entirely (gate becomes a no-op).
+    "stop_score_enabled":           True,
+    "stop_score_threshold":         0.6,    # suppress buy if score ≥ this
+    "stop_score_resume_threshold":  0.35,   # release one suppressed level per tick when score ≤ this
+    "stop_score_velocity_ticks":    30,     # number of recent ticks for velocity EMA (default ~3s at 10Hz)
+    "stop_score_weight_proximity":  0.40,
+    "stop_score_weight_velocity":   0.35,
+    "stop_score_weight_volatility": 0.25,
+
     # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
     "rest_base_url": {
         "paper": "https://api.crypto.com/exchange/v1",
@@ -1795,15 +1835,28 @@ class GridAutoTuner:
             return True
         return False
 
+    def get_mean_atr(self) -> Optional[float]:
+        """
+        Return the mean of recent ATR samples collected during compute() calls
+        (excluding the most recent sample, same as the adaptive stop-buffer uses).
+        Returns None if fewer than 3 samples are available.
+        Used by StopScoreCalculator to measure ATR expansion vs its own history.
+        """
+        if len(self._recent_atrs) < 3:
+            return None
+        history = self._recent_atrs[:-1]   # exclude current sample, same as adaptive buffer
+        return sum(history) / len(history)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Grid level state
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LevelState(Enum):
-    IDLE      = "IDLE"
-    BUY_OPEN  = "BUY_OPEN"
-    SELL_OPEN = "SELL_OPEN"
+    IDLE       = "IDLE"
+    BUY_OPEN   = "BUY_OPEN"
+    SELL_OPEN  = "SELL_OPEN"
+    SUPPRESSED = "SUPPRESSED"   # buy suppressed by stop-score gate; skipped by _replace_idle_levels
 
 
 @dataclass
@@ -1836,12 +1889,18 @@ class GridEngine:
 
     def __init__(self, params: GridParams, oms: OMS,
                  instrument: str, config: dict,
-                 store: Optional["GridStateStore"] = None):
+                 store: Optional["GridStateStore"] = None,
+                 buy_gate_fn: Optional[Callable[[], bool]] = None):
         self._params     = params
         self._oms        = oms
         self._instrument = instrument
         self._cfg        = config
         self._store      = store          # may be None in tests / paper mode without DB
+        # buy_gate_fn: optional callable → bool.  Called before every counter-BUY
+        # placement after a SELL fill.  Return True to ALLOW the buy, False to
+        # SUPPRESS it (level is set to SUPPRESSED instead of placing an order).
+        # None = no gate (legacy behaviour, always allow).
+        self._buy_gate_fn: Optional[Callable[[], bool]] = buy_gate_fn
         self._lock       = threading.Lock()
         self._levels: List[GridLevel] = []
         self._stop_event = threading.Event()
@@ -2031,12 +2090,16 @@ class GridEngine:
         self._replace_idle_levels()
 
     def _replace_idle_levels(self):
-        """Re-place any IDLE levels that should have an order."""
+        """Re-place any IDLE levels that should have an order.
+        SUPPRESSED levels are intentionally skipped — they are managed by
+        GridBot._run() via release_one_suppressed_level() once the stop-score
+        recovers, so they must not be re-queued here."""
         mid = _price_cache.get_mid()
         if mid is None:
             return
         with self._lock:
-            idle = [lv for lv in self._levels if lv.state == LevelState.IDLE]
+            idle = [lv for lv in self._levels
+                    if lv.state == LevelState.IDLE]     # SUPPRESSED excluded
         for lv in idle:
             if lv.price < mid:
                 self._place_buy(lv)
@@ -2270,14 +2333,64 @@ class GridEngine:
 
             # Snapshot counter-level under lock, then place outside lock
             buy_lv = None
+            suppress = False
             buy_idx = idx - 1
             with self._lock:
                 if buy_idx >= 0:
                     candidate = self._levels[buy_idx]
                     if candidate.state == LevelState.IDLE:
-                        buy_lv = candidate
-            if buy_lv is not None:
+                        # Run the buy gate before committing to place the order.
+                        # Gate returns True = allow, False = suppress.
+                        if self._buy_gate_fn is not None and not self._buy_gate_fn():
+                            candidate.state = LevelState.SUPPRESSED
+                            suppress = True
+                            logger.info(
+                                f"[GridEngine] BUY [{buy_idx}] suppressed by stop-score gate "
+                                f"(sell fill at [{idx}] @ {fill.avg_price:.2f})"
+                            )
+                        else:
+                            buy_lv = candidate
+            if suppress:
+                self._alerter_send(
+                    f"🛡 Buy [{buy_idx}] suppressed — stop-score gate active"
+                )
+            elif buy_lv is not None:
                 self._place_buy(buy_lv)
+
+    def release_one_suppressed_level(self) -> bool:
+        """
+        Release the highest-index SUPPRESSED level (closest to mid, least
+        exposed) by placing its BUY order.  Returns True if a level was
+        released, False if none were suppressed.
+
+        Called by GridBot._run() once per tick when stop-score has recovered
+        below the resume threshold, so position rebuilds gradually rather than
+        all at once.
+        """
+        with self._lock:
+            # Find the highest-index SUPPRESSED level (closest to mid)
+            target = None
+            for lv in reversed(self._levels):
+                if lv.state == LevelState.SUPPRESSED:
+                    target = lv
+                    break
+            if target is None:
+                return False
+            # Reset to IDLE before releasing the lock — _place_buy() will
+            # re-acquire the lock to set it to BUY_OPEN.
+            target.state = LevelState.IDLE
+
+        self._place_buy(target)
+        logger.info(
+            f"[GridEngine] BUY [{target.index}] @ {target.price:.2f} "
+            f"released from SUPPRESSED (stop-score recovered)"
+        )
+        return True
+
+    def count_suppressed(self) -> int:
+        """Return number of levels currently in SUPPRESSED state."""
+        with self._lock:
+            return sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
 
     def _get_paired_buy_price(self, sell_idx: int) -> Optional[float]:
         with self._lock:
@@ -2314,18 +2427,122 @@ class GridEngine:
 
     def get_stats(self) -> dict:
         with self._lock:
-            open_buys  = sum(1 for lv in self._levels if lv.state == LevelState.BUY_OPEN)
-            open_sells = sum(1 for lv in self._levels if lv.state == LevelState.SELL_OPEN)
+            open_buys   = sum(1 for lv in self._levels if lv.state == LevelState.BUY_OPEN)
+            open_sells  = sum(1 for lv in self._levels if lv.state == LevelState.SELL_OPEN)
+            suppressed  = sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
         return {
             "levels":       len(self._levels),
             "open_buys":    open_buys,
             "open_sells":   open_sells,
+            "suppressed":   suppressed,
             "long_qty":     round(self._long_qty, 4),
             "realized_pnl": round(self._realized_pnl, 4),
             "total_fees":   round(self._total_fees, 6),
             "net_pnl":      round(self._realized_pnl - self._total_fees, 4),
             "cycles":       self._cycle_count,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stop-score calculator  (proactive buy-gate signal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StopScoreCalculator:
+    """
+    Computes a composite stop-loss risk score in [0, 1] from three real-time
+    signals.  Used by GridEngine._on_fill() to decide whether to suppress the
+    counter-BUY after a SELL fill, and by GridBot._run() to decide when to
+    release suppressed levels as conditions recover.
+
+    Three components (all independently clamped to [0, 1]):
+
+      Proximity  (default weight 0.40)
+        How close is the current mid to the stop price, in ATR units.
+        raw = max(0, (stop_price - mid) / ATR)
+        Equals 0 when mid is at the stop or above; ramps toward 1 as mid
+        approaches the stop.  Hard-clamped at 1.0.
+
+      Velocity   (default weight 0.35)
+        Exponential moving average of per-tick price drops, normalised by ATR.
+        Computed over the last stop_score_velocity_ticks price updates.
+        raw = EMA(max(0, prev_mid - mid) / ATR)
+        Positive only on falling ticks; rising ticks contribute 0.  Clamped at 1.
+
+      Volatility (default weight 0.25)
+        ATR expansion relative to its own recent mean (from GridAutoTuner's
+        _recent_atrs list, exposed via get_mean_atr()).
+        raw = max(0, ATR / mean_ATR - 1)  clamped at 1.
+        Fires when the current ATR is meaningfully above its recent mean, which
+        often precedes or accompanies a directional breakdown.
+
+    score = proximity × w_prox + velocity × w_vel + volatility × w_vol
+    """
+
+    def __init__(self, config: dict, cache: PriceCache,
+                 auto_tuner: "GridAutoTuner"):
+        self._cfg       = config
+        self._cache     = cache
+        self._tuner     = auto_tuner
+        self._enabled   = config.get("stop_score_enabled", True)
+
+        # Velocity EMA state
+        vel_ticks         = max(2, config.get("stop_score_velocity_ticks", 30))
+        self._vel_alpha   = 2.0 / (vel_ticks + 1)   # standard EMA smoothing factor
+        self._vel_ema:    float = 0.0
+        self._prev_mid:   Optional[float] = None
+
+        # Weights (normalised to sum to 1.0 for safety)
+        w_prox = config.get("stop_score_weight_proximity",  0.40)
+        w_vel  = config.get("stop_score_weight_velocity",   0.35)
+        w_vol  = config.get("stop_score_weight_volatility", 0.25)
+        total  = w_prox + w_vel + w_vol
+        if total > 0:
+            self._w_prox = w_prox / total
+            self._w_vel  = w_vel  / total
+            self._w_vol  = w_vol  / total
+        else:
+            self._w_prox, self._w_vel, self._w_vol = 0.40, 0.35, 0.25
+
+    def compute(self, mid: float, stop_price: float) -> float:
+        """
+        Returns score in [0, 1].  0.0 if disabled or ATR is unavailable.
+        Updates internal velocity EMA as a side effect — call once per tick.
+        """
+        if not self._enabled:
+            return 0.0
+
+        atr = self._cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
+        if atr is None or atr <= 0:
+            return 0.0
+
+        # ── Proximity ────────────────────────────────────────────────────────
+        proximity = min(1.0, max(0.0, (stop_price - mid) / atr))
+
+        # ── Velocity (EMA of per-tick downward moves normalised by ATR) ──────
+        if self._prev_mid is not None:
+            drop = max(0.0, self._prev_mid - mid)
+            raw_vel = min(1.0, drop / atr)
+            self._vel_ema = (self._vel_alpha * raw_vel
+                             + (1.0 - self._vel_alpha) * self._vel_ema)
+        self._prev_mid = mid
+        velocity = min(1.0, self._vel_ema)
+
+        # ── Volatility (ATR expansion vs recent mean) ─────────────────────
+        mean_atr = self._tuner.get_mean_atr()
+        if mean_atr and mean_atr > 0:
+            volatility = min(1.0, max(0.0, atr / mean_atr - 1.0))
+        else:
+            volatility = 0.0
+
+        score = (self._w_prox * proximity
+                 + self._w_vel  * velocity
+                 + self._w_vol  * volatility)
+        return round(min(1.0, max(0.0, score)), 4)
+
+    def reset_velocity(self) -> None:
+        """Reset velocity EMA on grid rebuild so stale fall history doesn't carry over."""
+        self._vel_ema  = 0.0
+        self._prev_mid = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2932,7 +3149,8 @@ class GridBot:
             live_trading = config.get("live_trading", False),
             config       = config,
         )
-        self._auto_tuner = GridAutoTuner(config, _price_cache)
+        self._auto_tuner   = GridAutoTuner(config, _price_cache)
+        self._stop_scorer  = StopScoreCalculator(config, _price_cache, self._auto_tuner)
 
         # ── Trend signal (Phase 1 — read-only observer) ───────────────────────
         self._trend = TrendSignal(config, _price_cache)
@@ -3285,6 +3503,22 @@ class GridBot:
                 self._emergency_halt(mid)
                 continue
 
+            # Stop-score tick — update velocity EMA on every price tick so the
+            # score stays fresh even between fills.  Also drives gradual release
+            # of SUPPRESSED levels when the score recovers.
+            if self._stop_scorer is not None and self._params is not None:
+                score = self._stop_scorer.compute(mid, self._params.stop_price)
+                resume_thr = self._cfg.get("stop_score_resume_threshold", 0.35)
+                if (score <= resume_thr
+                        and self._engine is not None
+                        and self._engine.count_suppressed() > 0):
+                    released = self._engine.release_one_suppressed_level()
+                    if released:
+                        logger.info(
+                            f"[GridBot] Released one suppressed level "
+                            f"(score={score:.4f} ≤ resume={resume_thr})"
+                        )
+
             # Fill detection
             if self._engine:
                 self._engine.check_price_fills(mid)
@@ -3447,10 +3681,37 @@ class GridBot:
         self._last_tune = time.time()
         self._sl_guard  = StopLossGuard(new_params.stop_price, self._cfg)
 
+        # Reset velocity EMA so stale fall history from before the rebuild
+        # doesn't inflate the velocity component of the new grid's stop score.
+        if self._stop_scorer is not None:
+            self._stop_scorer.reset_velocity()
+
+        # Build the buy-gate closure: captures stop_price at build time so it
+        # doesn't change under the engine when params are updated.
+        _stop_price_at_build = new_params.stop_price
+        _scorer = self._stop_scorer
+
+        def _buy_gate() -> bool:
+            """Return True (allow buy) or False (suppress buy)."""
+            if _scorer is None:
+                return True
+            mid_now = _price_cache.get_mid()
+            if mid_now is None:
+                return True
+            score = _scorer.compute(mid_now, _stop_price_at_build)
+            threshold = self._cfg.get("stop_score_threshold", 0.6)
+            allow = score < threshold
+            if not allow:
+                logger.debug(
+                    f"[BuyGate] score={score:.4f} ≥ threshold={threshold} → suppress"
+                )
+            return allow
+
         self._engine = GridEngine(
             params=new_params, oms=self._oms,
             instrument=INSTRUMENT, config=self._cfg,
-            store=self._store)
+            store=self._store,
+            buy_gate_fn=_buy_gate)
         self._engine.start(mid)
 
         logger.info(
@@ -3689,7 +3950,27 @@ class GridBot:
         long_qty   = stats.get("long_qty",   0.0)
         open_buys  = stats.get("open_buys",  0)
         open_sells = stats.get("open_sells", 0)
+        suppressed = stats.get("suppressed", 0)
         levels     = stats.get("levels",     0)
+
+        # Stop-score snapshot for /status
+        score_line = ""
+        if self._stop_scorer is not None and self._params is not None:
+            mid_now = _price_cache.get_mid() or 0.0
+            score   = self._stop_scorer.compute(mid_now, self._params.stop_price)
+            thr     = self._cfg.get("stop_score_threshold",        0.6)
+            res_thr = self._cfg.get("stop_score_resume_threshold", 0.35)
+            if score >= thr:
+                score_icon = "🔴"
+            elif score >= res_thr:
+                score_icon = "🟡"
+            else:
+                score_icon = "🟢"
+            score_line = (
+                f"  {score_icon} Stop-score: `{score:.3f}` "
+                f"(gate={thr} resume={res_thr})"
+                + (f"  🛡 `{suppressed}` suppressed" if suppressed else "")
+            )
 
         # ── DB queries ────────────────────────────────────────────────────────
         today   = self._store.get_daily(_db_hkt_date(time.time()))
@@ -3786,6 +4067,7 @@ class GridBot:
             f"  • Net long:   `{long_qty:.4f} BTC`",
             f"  • Mid price:  `{mid_str}`",
             f"  • Open buys:  `{open_buys}` / Open sells: `{open_sells}`",
+            score_line,
             f"  • Grid range: `{range_str}`",
             f"  • Levels:     `{levels}` (spacing ≈ {spacing_str})",
             f"  • Notional/level: `${params.notional_per_level:.2f}` "
@@ -3822,10 +4104,16 @@ class GridBot:
         stats  = self._engine.get_stats() if self._engine else {}
         params = self._params
         if params:
+            suppressed = stats.get('suppressed', 0)
+            score_str  = ""
+            if self._stop_scorer is not None:
+                score = self._stop_scorer.compute(mid, params.stop_price)
+                score_str = f" score={score:.3f}"
             logger.info(
                 f"[Status] mid={mid:.2f} "
                 f"range=[{params.lower:.2f},{params.upper:.2f}] stop={params.stop_price:.2f} | "
                 f"buys={stats.get('open_buys',0)} sells={stats.get('open_sells',0)} "
+                f"suppressed={suppressed}{score_str} "
                 f"long={stats.get('long_qty',0):.4f} BTC | "
                 f"cycles={stats.get('cycles',0)} "
                 f"net_pnl={stats.get('net_pnl',0):+.4f} USD"
