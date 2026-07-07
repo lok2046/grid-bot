@@ -3434,9 +3434,22 @@ class GridBot:
             self._engine.stop()
             self._engine = None
 
-        _restart_note = ("Monitoring for auto-restart."
-                         if self._cfg.get("auto_restart_enabled", True)
-                         else "Restart manually.")
+        max_attempts = self._cfg.get("auto_restart_max_attempts", 3)
+        attempts_exhausted = (
+            max_attempts > 0 and self._restart_attempts >= max_attempts
+        )
+        if not self._cfg.get("auto_restart_enabled", True):
+            _restart_note = "Restart manually."
+        elif attempts_exhausted:
+            _restart_note = (
+                f"⚠️ Max auto-restart attempts ({max_attempts}) already used "
+                f"— will NOT auto-restart. Manual restart required."
+            )
+        else:
+            _restart_note = (
+                f"Monitoring for auto-restart "
+                f"(attempt {self._restart_attempts + 1}/{max_attempts if max_attempts else '∞'})."
+            )
 
         if long_qty > 0:
             # _liquidate_position sends its own fill/timeout alert; we send the
@@ -3578,6 +3591,11 @@ class GridBot:
             logger.warning(
                 f"[AutoRestart] Max attempts ({max_attempts}) reached. "
                 f"If bot halts again it will require manual restart."
+            )
+            self._alerter.send(
+                f"⚠️ Auto-restart attempts exhausted ({self._restart_attempts}/{max_attempts}).\n"
+                f"Grid is running again for now, but if it hits stop-loss and "
+                f"halts again, it will NOT auto-restart — manual restart required."
             )
 
     # ── /status Telegram command ──────────────────────────────────────────────
