@@ -2854,7 +2854,7 @@ class TrendSignal:
 
 import sqlite3 as _sqlite3
 
-_GRID_DB_SCHEMA_VERSION = 1
+_GRID_DB_SCHEMA_VERSION = 2
 
 _GRID_DB_DDL = """
 -- Every grid fill: permanent, append-only audit log.
@@ -2890,6 +2890,20 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Persisted 1-minute candle history for TrendSignal warm-up.
+-- On startup the bot loads these rows into PriceCache._history so TrendSignal
+-- has 26h of data immediately without waiting for live ticks or hammering REST.
+-- Rows older than 27h are pruned on each save to bound table size.
+-- ts_bucket is the Unix minute bucket (int(candle_open_time_s // 60)).
+-- Storing OHLC lets us reconstruct the same 4-tick injection used by ATR seed.
+CREATE TABLE IF NOT EXISTS candle_cache (
+    ts_bucket INTEGER PRIMARY KEY,   -- Unix minute number (ts_s // 60)
+    open_px   REAL NOT NULL,
+    high_px   REAL NOT NULL,
+    low_px    REAL NOT NULL,
+    close_px  REAL NOT NULL
 );
 """
 
@@ -2944,7 +2958,21 @@ class GridStateStore:
                     (str(_GRID_DB_SCHEMA_VERSION),),
                 )
                 self._conn.commit()
-            # Future schema migrations go here (ALTER TABLE guarded by version check)
+            else:
+                # v1->v2: candle_cache table added.
+                # CREATE TABLE IF NOT EXISTS in the DDL above already created it;
+                # we just bump the recorded version number here.
+                db_ver = int(row["value"])
+                if db_ver < 2:
+                    self._conn.execute(
+                        "UPDATE meta SET value=? WHERE key='schema_version'",
+                        (str(_GRID_DB_SCHEMA_VERSION),),
+                    )
+                    self._conn.commit()
+                    logger.info(
+                        f"[GridStateStore] schema migrated v{db_ver} -> "
+                        f"v{_GRID_DB_SCHEMA_VERSION} (added candle_cache)"
+                    )
 
     # ── Fill recording ────────────────────────────────────────────────────────
 
@@ -3091,6 +3119,10 @@ class GridStateStore:
             self._conn.execute("DELETE FROM grid_fills")
             self._conn.execute("DELETE FROM daily_pnl")
             self._conn.execute("DELETE FROM meta")
+            # candle_cache is intentionally preserved across reset_state:
+            # it contains price history used for TrendSignal warm-up, which
+            # has nothing to do with fill accounting.  Clearing it would just
+            # force another 26h wait on the next startup for no benefit.
             self._conn.execute(
                 "INSERT INTO meta(key,value) VALUES('schema_version',?)",
                 (str(_GRID_DB_SCHEMA_VERSION),),
@@ -3109,6 +3141,111 @@ class GridStateStore:
         )
         return backup_path
 
+    # ── Candle cache persistence ─────────────────────────────────────────────
+
+    def save_candles(self, ticks: list) -> int:
+        """
+        Persist 1-minute candle OHLC data derived from PriceCache._history.
+
+        `ticks` is the raw list of (unix_ts_s, mid_price) tuples from the
+        deque.  We re-bucket them here (same logic as compute_atr) so the
+        caller only needs to hand us _history; no extra structures needed.
+
+        Strategy
+        --------
+        * Group ticks into 1-min buckets, compute O/H/L/C per bucket.
+        * Upsert every complete bucket (exclude the currently-open minute
+          because live ticks are still updating it).
+        * Prune rows older than 27 hours to bound table size.
+          (26h required + 1h margin; ~1620 rows max, trivial.)
+
+        Returns the number of rows written/updated.
+        """
+        if not ticks:
+            return 0
+
+        current_bucket = int(time.time() // 60)
+        cutoff_bucket  = current_bucket - 27 * 60   # 27 hours ago
+
+        buckets: dict = {}
+        for ts_s, mid in ticks:
+            k = int(ts_s // 60)
+            if k >= current_bucket:
+                continue   # skip the still-open minute
+            if k not in buckets:
+                buckets[k] = {"open": mid, "high": mid, "low": mid, "close": mid}
+            else:
+                c = buckets[k]
+                c["high"]  = max(c["high"], mid)
+                c["low"]   = min(c["low"],  mid)
+                c["close"] = mid   # last write wins
+
+        if not buckets:
+            return 0
+
+        rows = [
+            (k, v["open"], v["high"], v["low"], v["close"])
+            for k, v in buckets.items()
+        ]
+
+        with self._lock:
+            self._conn.executemany(
+                """INSERT INTO candle_cache(ts_bucket, open_px, high_px, low_px, close_px)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(ts_bucket) DO UPDATE SET
+                       open_px  = excluded.open_px,
+                       high_px  = excluded.high_px,
+                       low_px   = excluded.low_px,
+                       close_px = excluded.close_px""",
+                rows,
+            )
+            self._conn.execute(
+                "DELETE FROM candle_cache WHERE ts_bucket < ?",
+                (cutoff_bucket,),
+            )
+            self._conn.commit()
+
+        return len(rows)
+
+    def load_candles(self, max_age_hours: int = 27) -> list:
+        """
+        Return persisted candle rows as a list of (unix_ts_s, mid_price)
+        tick tuples compatible with PriceCache._history.
+
+        Each candle is reconstructed as 4 synthetic ticks using the same
+        OHLC injection strategy as _seed_atr_from_rest:
+          t+0s  -> open
+          t+15s -> high
+          t+45s -> low
+          t+59s -> close
+
+        Only rows within the last max_age_hours are returned; stale data
+        older than the PriceCache.HISTORY_WINDOW_S (24h) window would be
+        evicted by the deque anyway so there's no point loading it.
+
+        Returns an empty list if the table is empty (fresh DB).
+        """
+        cutoff_bucket = int(time.time() // 60) - max_age_hours * 60
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT ts_bucket, open_px, high_px, low_px, close_px
+                   FROM candle_cache
+                   WHERE ts_bucket >= ?
+                   ORDER BY ts_bucket ASC""",
+                (cutoff_bucket,),
+            ).fetchall()
+
+        ticks = []
+        for row in rows:
+            ts_s = float(row["ts_bucket"]) * 60.0
+            ticks.extend([
+                (ts_s +  0.0, row["open_px"]),
+                (ts_s + 15.0, row["high_px"]),
+                (ts_s + 45.0, row["low_px"]),
+                (ts_s + 59.0, row["close_px"]),
+            ])
+        return ticks
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -3122,6 +3259,7 @@ class GridStateStore:
 class GridBot:
     STATUS_INTERVAL_S     = 60.0
     RETUNE_CHECK_INTERVAL = 300.0
+    CANDLE_SAVE_INTERVAL_S = 300.0   # snapshot PriceCache history to DB every 5 min
 
     def __init__(self, config: dict, reset_state: bool = False):
         self._cfg         = config
@@ -3135,6 +3273,7 @@ class GridBot:
         self._last_tune:  float = 0.0
         self._last_status:float = 0.0
         self._last_retune_check: float = 0.0
+        self._last_candle_save:  float = 0.0
         self._halted:     bool  = False
         self._halt_time:  float = 0.0       # timestamp of the last halt
         self._halt_stop_price: float = 0.0  # stop_price that triggered the halt
@@ -3257,12 +3396,21 @@ class GridBot:
         mid = _price_cache.get_mid()
         logger.info(f"[GridBot] Phase 1 complete: mid={'%.2f' % mid if mid else 'N/A'}")
 
-        # ── Phase 2: seed ATR from REST historical candles ────────────────────
+        # ── Phase 2a: restore candles from SQLite ────────────────────────────
+        # On restarts (deploy, crash recovery) we load the candle history that
+        # was snapshotted to the DB during the previous run.  This gives
+        # TrendSignal its full 26h warm-up immediately, with zero REST calls.
+        atr_lookback = self._cfg.get("atr_lookback_minutes", 1440)
+        if self._store is not None:
+            self._load_candles_from_db()
+
+        # ── Phase 2b: seed ATR from REST historical candles ───────────────────
         # Fetch recent 1-min candles via public/get-candlestick so we don't
         # have to sit idle for ~30 minutes collecting live ticks.  On success
         # the Phase 2 poll loop below exits immediately.  On failure we fall
         # through to the original live-accumulation path with a warning.
-        atr_lookback = self._cfg.get("atr_lookback_minutes", 1440)
+        # If Phase 2a already provided enough candles this call becomes a cheap
+        # top-up (fetches only the gap since last shutdown, ~seconds of data).
         self._seed_atr_from_rest()
 
         # ── Phase 2: wait until ATR is computable ─────────────────────────────
@@ -3301,6 +3449,65 @@ class GridBot:
 
         self._rebuild_grid()
         self._run()
+
+    # ── Candle cache: DB load / save ─────────────────────────────────────────
+
+    def _load_candles_from_db(self) -> None:
+        """
+        Load persisted 1-min candle ticks from GridStateStore.candle_cache
+        into PriceCache._history.
+
+        This is called once at startup (Phase 2a), before _seed_atr_from_rest,
+        so that TrendSignal has its full 26h history from the very first tick
+        after a restart — no waiting, no extra REST calls beyond the small ATR
+        top-up that _seed_atr_from_rest performs.
+
+        Ticks are merged with any live ticks that Phase 1 already deposited,
+        sorted in chronological order, and capped to the deque's maxlen (30000).
+        Only ticks within PriceCache.HISTORY_WINDOW_S (24h) are loaded to
+        match the deque's eviction policy.
+        """
+        ticks = self._store.load_candles(
+            max_age_hours=min(27, _price_cache.HISTORY_WINDOW_S // 3600)
+        )
+        if not ticks:
+            logger.info("[GridBot] Phase 2a: no persisted candles in DB (first run?)")
+            return
+
+        with _price_cache._lock:
+            existing = list(_price_cache._history)
+            merged   = ticks + existing
+            merged.sort(key=lambda x: x[0])
+            _price_cache._history.clear()
+            for item in merged[-30000:]:
+                _price_cache._history.append(item)
+
+        n_buckets = _price_cache.atr_candle_count(
+            self._cfg.get("atr_lookback_minutes", 1440)
+        )
+        trend_h = len(ticks) // 4 // 60   # rough hourly candle count
+        logger.info(
+            f"[GridBot] Phase 2a: loaded {len(ticks)//4} candles from DB "
+            f"(~{trend_h}h of history) -> {n_buckets} ATR buckets in cache"
+        )
+
+    def _save_candles_to_db(self) -> None:
+        """
+        Snapshot PriceCache._history to GridStateStore.candle_cache.
+
+        Called periodically from _run() (every CANDLE_SAVE_INTERVAL_S seconds)
+        so that a restart always has recent history available.  Each call is
+        idempotent (upsert) and fast (~1-2 ms for ~1600 rows on SSD).
+        Old rows (> 27h) are pruned by save_candles() automatically.
+        """
+        if self._store is None:
+            return
+        with _price_cache._lock:
+            ticks = list(_price_cache._history)
+        if not ticks:
+            return
+        n = self._store.save_candles(ticks)
+        logger.debug(f"[GridBot] Candle snapshot: {n} buckets written to DB")
 
     # ── ATR seeding from REST historical candles ──────────────────────────────
 
@@ -3538,6 +3745,12 @@ class GridBot:
                 self._last_status = now
                 self._log_status(mid)
                 self._evaluate_trend()
+
+            # Periodic candle snapshot — persists PriceCache history to DB so
+            # TrendSignal warm-up survives service restarts.
+            if now - self._last_candle_save > self.CANDLE_SAVE_INTERVAL_S:
+                self._last_candle_save = now
+                self._save_candles_to_db()
 
             time.sleep(0.1)
 
