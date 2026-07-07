@@ -2286,6 +2286,30 @@ class GridEngine:
                 return self._levels[buy_idx].price
         return None
 
+    def get_cost_basis(self) -> Tuple[float, float]:
+        """
+        Weighted-average cost basis (total_qty, avg_price) of the currently
+        open long, derived from levels in SELL_OPEN state (bought and
+        awaiting their paired exit sell — see _get_paired_buy_price).
+
+        Used by GridBot to compute realized gross PnL when a position is
+        closed outside the normal per-level fill path: stop-loss
+        liquidation or a clean shutdown. Must be called before stop() tears
+        down level state, since stop() resets levels to IDLE.
+        """
+        with self._lock:
+            total_qty  = 0.0
+            total_cost = 0.0
+            for lv in self._levels:
+                if lv.state == LevelState.SELL_OPEN and lv.qty > 0:
+                    buy_idx   = lv.index - 1
+                    buy_price = (self._levels[buy_idx].price
+                                 if 0 <= buy_idx < len(self._levels) else lv.price)
+                    total_qty  += lv.qty
+                    total_cost += buy_price * lv.qty
+        avg_price = (total_cost / total_qty) if total_qty > 0 else 0.0
+        return total_qty, avg_price
+
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
@@ -3223,12 +3247,16 @@ class GridBot:
         # a clean SIGINT/SIGTERM also closes the position rather than leaving
         # it orphaned on the exchange.
         long_qty = 0.0
+        cost_basis_price = None
         if self._engine:
             long_qty = self._engine.get_stats().get("long_qty", 0.0)
+            if long_qty > 0:
+                _, cost_basis_price = self._engine.get_cost_basis()
             self._engine.stop()
             self._engine = None
         if long_qty > 0:
-            self._liquidate_position(long_qty, reason="GridBot stop")
+            self._liquidate_position(long_qty, reason="GridBot stop",
+                                      cost_basis_price=cost_basis_price)
 
         self._cmd_poller.stop()
         self._oms.stop()
@@ -3281,12 +3309,24 @@ class GridBot:
 
     # ── Grid management ───────────────────────────────────────────────────────
 
-    def _liquidate_position(self, qty: float, reason: str = ""):
+    def _liquidate_position(self, qty: float, reason: str = "",
+                             cost_basis_price: Optional[float] = None):
         """
         Submit a market SELL for `qty` BTC and wait for the fill (up to 15s).
         Used by stop(), start() reconcile, and _emergency_halt().
         In paper mode the fill is instant at the live mid price.
         Logs and alerts on both success and timeout.
+
+        cost_basis_price, if provided, is the weighted-average entry price
+        of the qty being closed (see GridEngine.get_cost_basis()). It's used
+        to compute and persist this fill's realized gross PnL, so daily and
+        accumulated PnL actually include stop-loss / shutdown losses instead
+        of only completed grid-cycle round trips.
+
+        If omitted (e.g. startup reconcile of a stale position left over
+        from a previous process, with no local record of its entry price),
+        gross_pnl is recorded as 0.0 — the fee is still captured, which is
+        strictly better than not persisting the fill at all.
         """
         tag = f"[{reason}]" if reason else ""
         logger.warning(f"[GridBot]{tag} Liquidating {qty:.4f} BTC long via market SELL")
@@ -3299,9 +3339,28 @@ class GridBot:
                 f"[GridBot]{tag} Liquidation filled: "
                 f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f}"
             )
+            gross_pnl = (
+                (fill.avg_price - cost_basis_price) * fill.filled_qty
+                if cost_basis_price else 0.0
+            )
+            if self._store is not None:
+                try:
+                    # level_idx=-1 / cycle_num=-1: sentinel marking this as a
+                    # liquidation fill rather than a normal numbered grid level/cycle.
+                    self._store.record_fill(
+                        ts_utc=time.time(), side="SELL", level_idx=-1,
+                        price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                        fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[GridBot]{tag} DB record_fill (liquidation) error: {e}",
+                        exc_info=True,
+                    )
+            pnl_note = f" | realized {gross_pnl:+.4f} USD" if cost_basis_price else ""
             self._alerter.send(
                 f"🔴 Position closed ({reason})\n"
-                f"Sold {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}"
+                f"Sold {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}{pnl_note}"
             )
         else:
             logger.error(
@@ -3429,8 +3488,11 @@ class GridBot:
                 self._restart_attempts = 0
 
         long_qty = 0.0
+        cost_basis_price = None
         if self._engine:
             long_qty = self._engine.get_stats().get("long_qty", 0.0)
+            if long_qty > 0:
+                _, cost_basis_price = self._engine.get_cost_basis()
             self._engine.stop()
             self._engine = None
 
@@ -3459,7 +3521,8 @@ class GridBot:
                 f"mid={mid:.2f} < stop={self._halt_stop_price:.2f}\n"
                 f"Liquidating {long_qty:.4f} BTC — Bot HALTED — {_restart_note}"
             )
-            self._liquidate_position(long_qty, reason="stop-loss")
+            self._liquidate_position(long_qty, reason="stop-loss",
+                                      cost_basis_price=cost_basis_price)
         else:
             self._alerter.send_sync(
                 f"🚨 STOP-LOSS TRIGGERED at mid={mid:.2f}\n"
