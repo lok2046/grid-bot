@@ -2854,7 +2854,7 @@ class TrendSignal:
 
 import sqlite3 as _sqlite3
 
-_GRID_DB_SCHEMA_VERSION = 2
+_GRID_DB_SCHEMA_VERSION = 3
 
 _GRID_DB_DDL = """
 -- Every grid fill: permanent, append-only audit log.
@@ -2883,7 +2883,9 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
     fees_usd      REAL NOT NULL DEFAULT 0.0,
     net_pnl_usd   REAL NOT NULL DEFAULT 0.0,
     fill_count    INTEGER NOT NULL DEFAULT 0,
-    cycle_count   INTEGER NOT NULL DEFAULT 0
+    cycle_count   INTEGER NOT NULL DEFAULT 0,
+    sl_gross_usd  REAL NOT NULL DEFAULT 0.0,  -- stop-loss gross PnL (always ≤ 0)
+    sl_count      INTEGER NOT NULL DEFAULT 0   -- number of stop-loss liquidation events
 );
 
 -- Key/value metadata store.
@@ -2959,33 +2961,43 @@ class GridStateStore:
                 )
                 self._conn.commit()
             else:
-                # v1->v2: candle_cache table added.
-                # CREATE TABLE IF NOT EXISTS in the DDL above already created it;
-                # we just bump the recorded version number here.
                 db_ver = int(row["value"])
+                # v1->v2: candle_cache table added (CREATE IF NOT EXISTS handles DDL).
                 if db_ver < 2:
+                    logger.info("[GridStateStore] schema migrating v1 -> v2 (candle_cache)")
+                # v2->v3: sl_gross_usd + sl_count columns added to daily_pnl.
+                if db_ver < 3:
+                    for col, typedef in [
+                        ("sl_gross_usd", "REAL NOT NULL DEFAULT 0.0"),
+                        ("sl_count",     "INTEGER NOT NULL DEFAULT 0"),
+                    ]:
+                        try:
+                            self._conn.execute(
+                                f"ALTER TABLE daily_pnl ADD COLUMN {col} {typedef}"
+                            )
+                        except Exception:
+                            pass  # column already exists (idempotent)
+                    logger.info("[GridStateStore] schema migrated -> v3 (daily_pnl sl columns)")
+                if db_ver < _GRID_DB_SCHEMA_VERSION:
                     self._conn.execute(
                         "UPDATE meta SET value=? WHERE key='schema_version'",
                         (str(_GRID_DB_SCHEMA_VERSION),),
                     )
                     self._conn.commit()
-                    logger.info(
-                        f"[GridStateStore] schema migrated v{db_ver} -> "
-                        f"v{_GRID_DB_SCHEMA_VERSION} (added candle_cache)"
-                    )
 
     # ── Fill recording ────────────────────────────────────────────────────────
 
     def record_fill(
         self,
-        ts_utc:    float,
-        side:      str,       # 'BUY' | 'SELL'
-        level_idx: int,
-        price_usd: float,
-        qty_btc:   float,
-        fee_usd:   float,     # positive = cost
-        gross_pnl: float,     # 0.0 for BUY fills
-        cycle_num: int,
+        ts_utc:         float,
+        side:           str,       # 'BUY' | 'SELL'
+        level_idx:      int,
+        price_usd:      float,
+        qty_btc:        float,
+        fee_usd:        float,     # positive = cost
+        gross_pnl:      float,     # 0.0 for BUY fills
+        cycle_num:      int,
+        is_liquidation: bool = False,  # True for stop-loss / shutdown liquidations
     ) -> None:
         """
         Append one fill row and update the daily_pnl bucket atomically.
@@ -3007,24 +3019,30 @@ class GridStateStore:
                  qty_btc, fee_usd, gross_pnl, cycle_num),
             )
             # Update daily bucket — fees stored as negative (cost subtracted from net)
+            sl_gross = gross_pnl if is_liquidation else 0.0
+            sl_delta = 1         if is_liquidation else 0
             self._conn.execute(
                 """INSERT INTO daily_pnl
-                   (hkt_date, gross_pnl_usd, fees_usd, net_pnl_usd, fill_count, cycle_count)
-                   VALUES (?, ?, ?, ?, 1, ?)
+                   (hkt_date, gross_pnl_usd, fees_usd, net_pnl_usd, fill_count, cycle_count,
+                    sl_gross_usd, sl_count)
+                   VALUES (?, ?, ?, ?, 1, ?, ?, ?)
                    ON CONFLICT(hkt_date) DO UPDATE SET
                        gross_pnl_usd = gross_pnl_usd + excluded.gross_pnl_usd,
                        fees_usd      = fees_usd      + excluded.fees_usd,
                        net_pnl_usd   = net_pnl_usd   + excluded.gross_pnl_usd + excluded.fees_usd,
                        fill_count    = fill_count    + 1,
-                       cycle_count   = cycle_count   + excluded.cycle_count""",
-                (hkt_date, gross_pnl, -fee_usd, gross_pnl - fee_usd, cycles_delta),
+                       cycle_count   = cycle_count   + excluded.cycle_count,
+                       sl_gross_usd  = sl_gross_usd  + excluded.sl_gross_usd,
+                       sl_count      = sl_count      + excluded.sl_count""",
+                (hkt_date, gross_pnl, -fee_usd, gross_pnl - fee_usd, cycles_delta,
+                 sl_gross, sl_delta),
             )
             self._conn.commit()
 
     # ── Accumulated totals ────────────────────────────────────────────────────
 
     def get_accumulated(self) -> dict:
-        """Sum all rows in daily_pnl → all-time totals."""
+        """Sum all rows in daily_pnl -> all-time totals."""
         with self._lock:
             row = self._conn.execute(
                 """SELECT
@@ -3032,12 +3050,15 @@ class GridStateStore:
                        COALESCE(SUM(fees_usd),      0.0) AS fees,
                        COALESCE(SUM(net_pnl_usd),   0.0) AS net_pnl,
                        COALESCE(SUM(fill_count),     0)   AS fill_count,
-                       COALESCE(SUM(cycle_count),    0)   AS cycle_count
+                       COALESCE(SUM(cycle_count),    0)   AS cycle_count,
+                       COALESCE(SUM(sl_gross_usd),  0.0) AS sl_gross,
+                       COALESCE(SUM(sl_count),       0)   AS sl_count
                    FROM daily_pnl"""
             ).fetchone()
         return dict(row) if row else {
             "gross_pnl": 0.0, "fees": 0.0, "net_pnl": 0.0,
             "fill_count": 0,  "cycle_count": 0,
+            "sl_gross": 0.0,  "sl_count": 0,
         }
 
     # ── Daily PnL ─────────────────────────────────────────────────────────────
@@ -3055,6 +3076,7 @@ class GridStateStore:
         return {
             "hkt_date": hkt_date, "gross_pnl_usd": 0.0, "fees_usd": 0.0,
             "net_pnl_usd": 0.0, "fill_count": 0, "cycle_count": 0,
+            "sl_gross_usd": 0.0, "sl_count": 0,
         }
 
     def get_recent_daily(self, days: int = 7) -> list:
@@ -3798,6 +3820,7 @@ class GridBot:
                         ts_utc=time.time(), side="SELL", level_idx=-1,
                         price_usd=fill.avg_price, qty_btc=fill.filled_qty,
                         fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
+                        is_liquidation=True,
                     )
                 except Exception as e:
                     logger.error(
@@ -4190,11 +4213,15 @@ class GridBot:
         acc     = self._store.get_accumulated()
         history = self._store.get_recent_daily(7)
 
-        daily_net = today["net_pnl_usd"]
-        acc_net   = acc["net_pnl"]
-        acc_gross = acc["gross_pnl"]
-        acc_fees  = acc["fees"]          # stored as negative in DB
-        acc_cycles= acc["cycle_count"]
+        daily_net   = today["net_pnl_usd"]
+        daily_sl    = today.get("sl_gross_usd", 0.0)
+        daily_sl_n  = today.get("sl_count", 0)
+        acc_net     = acc["net_pnl"]
+        acc_gross   = acc["gross_pnl"]
+        acc_fees    = acc["fees"]          # stored as negative in DB
+        acc_cycles  = acc["cycle_count"]
+        acc_sl      = acc.get("sl_gross", 0.0)
+        acc_sl_n    = acc.get("sl_count", 0)
 
         # ── Live price ────────────────────────────────────────────────────────
         mid = _price_cache.get_mid()
@@ -4243,10 +4270,12 @@ class GridBot:
         hist_lines = []
         for row in history:
             sign = "✅" if row["net_pnl_usd"] >= 0 else "❌"
+            sl_tag = f"  🚨SL={row.get('sl_gross_usd', 0.0):+.4f}" if row.get("sl_count", 0) > 0 else ""
             hist_lines.append(
                 f"  {sign} {row['hkt_date']}  "
                 f"net={row['net_pnl_usd']:+.4f}  "
                 f"cycles={row['cycle_count']}"
+                f"{sl_tag}"
             )
         hist_block = "\n".join(hist_lines) if hist_lines else "  (no data yet)"
 
@@ -4271,6 +4300,17 @@ class GridBot:
                 f"  • Based on `{tr['n_hourly']}` hourly candles _(read-only)_"
             )
 
+        # Stop-loss line for daily section (only shown if a stop-loss occurred today)
+        daily_sl_line = (
+            f"  🚨 Stop-loss: `{daily_sl:+.4f} USD` ({daily_sl_n}× today)"
+            if daily_sl_n > 0 else ""
+        )
+        # Stop-loss line for accumulated section (only shown if any stop-loss on record)
+        acc_sl_line = (
+            f"  • Stop-loss losses: `{acc_sl:+.4f} USD` ({acc_sl_n}× total)"
+            if acc_sl_n > 0 else ""
+        )
+
         lines = [
             f"📊 *Grid Bot Status* — {now_hkt}",
             f"_{state_line}_",
@@ -4290,6 +4330,7 @@ class GridBot:
             f"*2️⃣  Daily PnL* (today {today['hkt_date']} HKT)",
             f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD` (`{_pct(daily_net)}`)",
             f"  • Gross: `{today['gross_pnl_usd']:+.4f}`  Fees: `{today['fees_usd']:+.4f}`",
+            daily_sl_line,
             f"  • Cycles today: `{today['cycle_count']}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
@@ -4297,6 +4338,7 @@ class GridBot:
             f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD` (`{_pct(acc_net)}`)",
             f"  • Gross realised: `{acc_gross:+.4f} USD`",
             f"  • Total fees:     `{acc_fees:+.4f} USD`",
+            acc_sl_line,
             f"  • Total cycles:   `{acc_cycles}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
