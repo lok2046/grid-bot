@@ -192,6 +192,22 @@ GRID_CONFIG: dict = {
     "trailing_down_price_cap": 0.0,   # optional floor — grid will not trail below
                                        # this price (0.0 = no cap, stop_loss applies)
 
+    # ── Sell-fill-triggered range shift ───────────────────────────────────────
+    # When the top-level SELL order fills, price has risen above the grid — a
+    # sign of sustained upward drift.  Setting drift_shift_on_top_sell=True
+    # triggers an immediate one-level-up range shift (same as trail_up) without
+    # waiting for price to clear a full spacing above the upper bound.
+    #
+    # This keeps the grid centred on where price actually is, which reduces the
+    # risk of the entire grid being below mid (all-long, no sells to collect
+    # profit) and prevents the lower bound drifting dangerously close to the stop.
+    #
+    # Consecutive shifts are throttled by drift_shift_min_interval_s (default 60s)
+    # to prevent rapid-fire shifts during a volatile upswing.  The trailing_up_price_cap
+    # is also respected: drift shift is blocked if that cap would be breached.
+    "drift_shift_on_top_sell":    True,
+    "drift_shift_min_interval_s": 60,   # minimum seconds between consecutive shifts
+
     # ── Stop-loss ─────────────────────────────────────────────────────────────
     "stop_loss_enabled": True,
     # stop = lower − stop_buffer_atr × ATR
@@ -309,6 +325,9 @@ GRID_CONFIG: dict = {
     "stop_score_threshold":         0.6,    # suppress buy if score ≥ this
     "stop_score_resume_threshold":  0.35,   # release one suppressed level per tick when score ≤ this
     "stop_score_velocity_ticks":    30,     # number of recent ticks for velocity EMA (default ~3s at 10Hz)
+    "stop_score_proximity_atr_scale": 3.0, # headroom (in ATRs) at which proximity = 1.0 (full danger)
+                                            # e.g. 3.0 → score contribution ramps from 0→max over the
+                                            # last 3×ATR above the stop.  Lower = more sensitive.
     "stop_score_weight_proximity":  0.40,
     "stop_score_weight_velocity":   0.35,
     "stop_score_weight_volatility": 0.25,
@@ -1904,6 +1923,7 @@ class GridEngine:
         self._lock       = threading.Lock()
         self._levels: List[GridLevel] = []
         self._stop_event = threading.Event()
+        self._last_drift_shift: float = 0.0   # epoch time of last sell-triggered shift
 
         # Accounting — seeded from DB so a restart or re-tune doesn't zero out history.
         # In-memory values are the authoritative running total for this process;
@@ -2357,6 +2377,35 @@ class GridEngine:
             elif buy_lv is not None:
                 self._place_buy(buy_lv)
 
+            # ── Drift-shift: top-level sell → shift range up one spacing ──────
+            # If this fill was the top-level SELL, price has drifted above the
+            # grid.  Shift the whole range up immediately via _trail_up so the
+            # grid stays centred on price rather than accumulating all-long
+            # exposure as the lower bound creeps toward the stop.
+            if self._cfg.get("drift_shift_on_top_sell", True):
+                with self._lock:
+                    is_top        = len(self._levels) > 0 and idx == len(self._levels) - 1
+                    current_lower = self._levels[0].price  if self._levels else 0.0
+                    current_upper = self._levels[-1].price if self._levels else 0.0
+                    spacing       = self._params.spacing
+                if is_top:
+                    min_interval = self._cfg.get("drift_shift_min_interval_s", 60)
+                    now_t = time.time()
+                    if now_t - self._last_drift_shift >= min_interval:
+                        self._last_drift_shift = now_t
+                        logger.info(
+                            f"[GridEngine] Top-sell fill at [{idx}] → "
+                            f"drift-shift UP: [{current_lower:.2f},{current_upper:.2f}] "
+                            f"+{spacing:.2f}"
+                        )
+                        self._trail_up(current_lower, current_upper, spacing)
+                    else:
+                        logger.info(
+                            f"[GridEngine] Top-sell fill at [{idx}] — drift-shift "
+                            f"throttled ({now_t - self._last_drift_shift:.0f}s < "
+                            f"{min_interval}s interval)"
+                        )
+
     def release_one_suppressed_level(self) -> bool:
         """
         Release the highest-index SUPPRESSED level (closest to mid, least
@@ -2516,7 +2565,20 @@ class StopScoreCalculator:
             return 0.0
 
         # ── Proximity ────────────────────────────────────────────────────────
-        proximity = min(1.0, max(0.0, (stop_price - mid) / atr))
+        # Measures how close the current mid is to the stop, normalised by ATR.
+        #
+        # Formula: 1 - ((mid - stop) / (atr × proximity_atr_scale))
+        #   • When mid is far above stop: (mid-stop)/denom >> 1 → clamped to 0 (safe)
+        #   • When mid == stop:           (mid-stop)/denom = 0  → proximity = 1 (danger)
+        #   • proximity_atr_scale controls how many ATRs of headroom = "full danger"
+        #     default 3 → proximity reaches 1.0 when mid is within 3×ATR of stop
+        #
+        # The old formula (stop-mid)/atr was INVERTED: it returned values > 1
+        # when mid was safely above stop (clamped to 1.0 = max danger, always!),
+        # making the proximity component useless as a discriminator.
+        prox_scale = self._cfg.get("stop_score_proximity_atr_scale", 3.0)
+        headroom   = max(0.0, mid - stop_price)          # 0 if mid already at/below stop
+        proximity  = max(0.0, 1.0 - headroom / (atr * prox_scale))
 
         # ── Velocity (EMA of per-tick downward moves normalised by ATR) ──────
         if self._prev_mid is not None:
@@ -3560,7 +3622,21 @@ class GridBot:
         to the original live-accumulation path.
         """
         min_candles = _price_cache.MIN_ATR_CANDLES
-        fetch_count = min_candles + 2   # extra slack for open candle + edge cases
+        # How many candles do we already have from the DB cache?
+        # If we have enough for TrendSignal (26h × 60 = 1560) only fetch the
+        # small gap since the last snapshot.  Otherwise fetch the full 26h so
+        # TrendSignal can warm up on first run (or after a DB wipe).
+        existing_buckets = _price_cache.atr_candle_count(
+            self._cfg.get("atr_lookback_minutes", 1440)
+        )
+        trend_min_h   = self._cfg.get("trend_signal_min_history_h", 26)
+        trend_min_can = trend_min_h * 60          # 1560 candles for 26h
+        if existing_buckets < trend_min_can:
+            # First run or thin cache: fetch a full 26h + 2 slack
+            fetch_count = trend_min_can + 2
+        else:
+            # Cache is already warm: just top up the last ~2 candles
+            fetch_count = min_candles + 2
 
         rest_base = self._cfg.get("rest_base_url",
                                    "https://api.crypto.com/exchange/v1")
@@ -3880,10 +3956,33 @@ class GridBot:
                 delta = abs(new_width - old_width) / old_width
                 deadband = self._cfg.get("retune_deadband_pct", 0.10)
                 if delta < deadband:
-                    logger.info(
-                        f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
-                        f"dead-band {deadband:.1%}) — existing grid kept running"
-                    )
+                    # Range shift is too small to justify a full grid rebuild,
+                    # but the newly computed stop_price may be meaningfully
+                    # different from the current one (ATR expanded, mid drifted).
+                    # Update the StopLossGuard and params.stop_price in-place so
+                    # the live grid doesn't keep a stale/too-tight stop.
+                    if (self._sl_guard is not None
+                            and new_params.stop_price != self._params.stop_price):
+                        old_stop = self._params.stop_price
+                        self._params = GridParams(
+                            lower=self._params.lower,
+                            upper=self._params.upper,
+                            levels=self._params.levels,
+                            spacing=self._params.spacing,
+                            stop_price=new_params.stop_price,
+                            notional_per_level=self._params.notional_per_level,
+                        )
+                        self._sl_guard = StopLossGuard(new_params.stop_price, self._cfg)
+                        logger.info(
+                            f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
+                            f"dead-band {deadband:.1%}) — stop updated "
+                            f"{old_stop:.2f} → {new_params.stop_price:.2f}"
+                        )
+                    else:
+                        logger.info(
+                            f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
+                            f"dead-band {deadband:.1%}) — existing grid kept running"
+                        )
                     return
 
         # Dead-band passed (or first build) — safe to tear down now
@@ -3944,10 +4043,12 @@ class GridBot:
             score = _scorer.compute(mid_now, _stop_price_at_build)
             threshold = self._cfg.get("stop_score_threshold", 0.6)
             allow = score < threshold
-            if not allow:
-                logger.debug(
-                    f"[BuyGate] score={score:.4f} ≥ threshold={threshold} → suppress"
-                )
+            # Always log at INFO (not DEBUG) so gate decisions are visible in
+            # the daily log and can be used to calibrate the threshold.
+            logger.info(
+                f"[BuyGate] score={score:.4f} threshold={threshold} "
+                f"→ {'ALLOW' if allow else 'SUPPRESS'}"
+            )
             return allow
 
         self._engine = GridEngine(
