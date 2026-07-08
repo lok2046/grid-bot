@@ -322,8 +322,19 @@ GRID_CONFIG: dict = {
     #
     # Set stop_score_enabled=False to disable entirely (gate becomes a no-op).
     "stop_score_enabled":           True,
-    "stop_score_threshold":         0.6,    # suppress buy if score ≥ this
-    "stop_score_resume_threshold":  0.35,   # release one suppressed level per tick when score ≤ this
+    "stop_score_threshold":         0.25,   # suppress buy if score ≥ this
+                                            # 0.25 = suppress when mid is within ~2.25×ATR
+                                            # of stop (with proximity_atr_scale=3).
+                                            # Calibrated from 2026-07-08 log where peak
+                                            # score was 0.236 immediately before the SL.
+                                            # calibrated from 2026-07-08 log: score peaked
+                                            # at 0.236 in the 10 min before SL triggered;
+                                            # 0.25 would have suppressed the final buy.
+                                            # old default was 0.6 (too conservative — gate
+                                            # never fired in practice).
+    "stop_score_resume_threshold":  0.10,   # release one suppressed level per tick when ≤ this
+                                            # asymmetric gap (0.25 gate vs 0.10 resume) prevents
+                                            # rapid oscillation at the boundary.
     "stop_score_velocity_ticks":    30,     # number of recent ticks for velocity EMA (default ~3s at 10Hz)
     "stop_score_proximity_atr_scale": 3.0, # headroom (in ATRs) at which proximity = 1.0 (full danger)
                                             # e.g. 3.0 → score contribution ramps from 0→max over the
@@ -1924,6 +1935,7 @@ class GridEngine:
         self._levels: List[GridLevel] = []
         self._stop_event = threading.Event()
         self._last_drift_shift: float = 0.0   # epoch time of last sell-triggered shift
+        self._needs_rebuild:   bool  = False  # set by drift-shift when mid is far OOB
 
         # Accounting — seeded from DB so a restart or re-tune doesn't zero out history.
         # In-memory values are the authoritative running total for this process;
@@ -2392,13 +2404,31 @@ class GridEngine:
                     min_interval = self._cfg.get("drift_shift_min_interval_s", 60)
                     now_t = time.time()
                     if now_t - self._last_drift_shift >= min_interval:
-                        self._last_drift_shift = now_t
-                        logger.info(
-                            f"[GridEngine] Top-sell fill at [{idx}] → "
-                            f"drift-shift UP: [{current_lower:.2f},{current_upper:.2f}] "
-                            f"+{spacing:.2f}"
-                        )
-                        self._trail_up(current_lower, current_upper, spacing)
+                        # Guard: if mid is already above the price where the new
+                        # SELL level would be placed (current_upper + spacing),
+                        # the trail step would immediately fill the new level in
+                        # paper mode — and if mid is multiple spacings above, this
+                        # cascades into several instant fills and a phantom-negative
+                        # long_qty.  Request a full rebuild instead so the grid
+                        # re-centres cleanly on the current price.
+                        mid_now   = _price_cache.get_mid() or current_upper
+                        new_upper = current_upper + spacing
+                        far_oor   = mid_now > new_upper
+                        if far_oor:
+                            logger.info(
+                                f"[GridEngine] Top-sell fill at [{idx}] — "
+                                f"mid={mid_now:.2f} already above new-upper={new_upper:.2f} "
+                                f"→ requesting full rebuild instead of drift-shift"
+                            )
+                            self._needs_rebuild = True
+                        else:
+                            self._last_drift_shift = now_t
+                            logger.info(
+                                f"[GridEngine] Top-sell fill at [{idx}] → "
+                                f"drift-shift UP: [{current_lower:.2f},{current_upper:.2f}] "
+                                f"+{spacing:.2f}"
+                            )
+                            self._trail_up(current_lower, current_upper, spacing)
                     else:
                         logger.info(
                             f"[GridEngine] Top-sell fill at [{idx}] — drift-shift "
@@ -2440,6 +2470,21 @@ class GridEngine:
         """Return number of levels currently in SUPPRESSED state."""
         with self._lock:
             return sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
+
+    def pop_needs_rebuild(self) -> bool:
+        """
+        Return True (and clear the flag) if the engine has requested a full
+        grid rebuild.  Called once per _run() tick; GridBot calls _rebuild_grid()
+        if this returns True.
+
+        Currently set by drift-shift when mid has moved so far above the grid
+        that a single trail step would immediately fill the new SELL level and
+        leave the grid still misaligned — a cascade of instant paper fills that
+        produces a phantom-negative long_qty.
+        """
+        flag = self._needs_rebuild
+        self._needs_rebuild = False
+        return flag
 
     def _get_paired_buy_price(self, sell_idx: int) -> Optional[float]:
         with self._lock:
@@ -3829,6 +3874,12 @@ class GridBot:
             if self._engine:
                 self._engine.check_price_fills(mid)
 
+            # Engine-requested rebuild (e.g. drift-shift detected mid far OOR)
+            if self._engine and self._engine.pop_needs_rebuild():
+                logger.info("[GridBot] Engine requested full rebuild (drift far OOR)")
+                self._rebuild_grid(mid)
+                continue
+
             now = time.time()
 
             # Re-tune check
@@ -3959,24 +4010,38 @@ class GridBot:
                     # Range shift is too small to justify a full grid rebuild,
                     # but the newly computed stop_price may be meaningfully
                     # different from the current one (ATR expanded, mid drifted).
-                    # Update the StopLossGuard and params.stop_price in-place so
-                    # the live grid doesn't keep a stale/too-tight stop.
-                    if (self._sl_guard is not None
-                            and new_params.stop_price != self._params.stop_price):
-                        old_stop = self._params.stop_price
+                    # Update the StopLossGuard and params.stop_price in-place ONLY
+                    # if the new stop is HIGHER (tighter) than the current one.
+                    # Never move the stop downward: a lower stop during a falling
+                    # market just delays the halt and increases potential loss.
+                    new_stop = new_params.stop_price
+                    cur_stop = self._params.stop_price
+                    should_update = (
+                        self._sl_guard is not None
+                        and new_stop != cur_stop
+                        and new_stop > cur_stop          # only move stop UP
+                    )
+                    if should_update:
+                        old_stop = cur_stop
                         self._params = GridParams(
                             lower=self._params.lower,
                             upper=self._params.upper,
                             levels=self._params.levels,
                             spacing=self._params.spacing,
-                            stop_price=new_params.stop_price,
+                            stop_price=new_stop,
                             notional_per_level=self._params.notional_per_level,
                         )
-                        self._sl_guard = StopLossGuard(new_params.stop_price, self._cfg)
+                        self._sl_guard = StopLossGuard(new_stop, self._cfg)
                         logger.info(
                             f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
-                            f"dead-band {deadband:.1%}) — stop updated "
-                            f"{old_stop:.2f} → {new_params.stop_price:.2f}"
+                            f"dead-band {deadband:.1%}) — stop raised "
+                            f"{old_stop:.2f} → {new_stop:.2f}"
+                        )
+                    elif self._sl_guard is not None and new_stop < cur_stop:
+                        logger.info(
+                            f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
+                            f"dead-band {deadband:.1%}) — stop NOT lowered "
+                            f"(new={new_stop:.2f} < current={cur_stop:.2f})"
                         )
                     else:
                         logger.info(
@@ -4463,7 +4528,9 @@ class GridBot:
 
     def _log_status(self, mid: float):
         stats  = self._engine.get_stats() if self._engine else {}
-        params = self._params
+        # Prefer the engine's own params (stays current after trail_up/trail_down)
+        # over GridBot._params which is only updated on full rebuilds.
+        params = (self._engine.get_params() if self._engine else None) or self._params
         if params:
             suppressed = stats.get('suppressed', 0)
             score_str  = ""
