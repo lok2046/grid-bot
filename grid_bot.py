@@ -3007,7 +3007,8 @@ class GridStateStore:
         to ~1-2 ms on spinning rust; SSD is faster.
         """
         hkt_date = _db_hkt_date(ts_utc)
-        cycles_delta = 1 if side == "SELL" else 0
+        # Liquidation SELLs (stop-loss) are not completed grid cycles.
+        cycles_delta = 1 if side == "SELL" and not is_liquidation else 0
 
         with self._lock:
             self._conn.execute(
@@ -3779,7 +3780,8 @@ class GridBot:
     # ── Grid management ───────────────────────────────────────────────────────
 
     def _liquidate_position(self, qty: float, reason: str = "",
-                             cost_basis_price: Optional[float] = None):
+                             cost_basis_price: Optional[float] = None,
+                             is_liquidation: bool = False):
         """
         Submit a market SELL for `qty` BTC and wait for the fill (up to 15s).
         Used by stop(), start() reconcile, and _emergency_halt().
@@ -3796,6 +3798,11 @@ class GridBot:
         from a previous process, with no local record of its entry price),
         gross_pnl is recorded as 0.0 — the fee is still captured, which is
         strictly better than not persisting the fill at all.
+
+        is_liquidation=True only for actual stop-loss events (_emergency_halt).
+        Planned shutdown (stop()) and startup reconcile must leave this False
+        so sl_count / sl_gross_usd in daily_pnl are not polluted by non-SL
+        position closes.
         """
         tag = f"[{reason}]" if reason else ""
         logger.warning(f"[GridBot]{tag} Liquidating {qty:.4f} BTC long via market SELL")
@@ -3820,7 +3827,7 @@ class GridBot:
                         ts_utc=time.time(), side="SELL", level_idx=-1,
                         price_usd=fill.avg_price, qty_btc=fill.filled_qty,
                         fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
-                        is_liquidation=True,
+                        is_liquidation=is_liquidation,
                     )
                 except Exception as e:
                     logger.error(
@@ -4019,7 +4026,8 @@ class GridBot:
                 f"Liquidating {long_qty:.4f} BTC — Bot HALTED — {_restart_note}"
             )
             self._liquidate_position(long_qty, reason="stop-loss",
-                                      cost_basis_price=cost_basis_price)
+                                      cost_basis_price=cost_basis_price,
+                                      is_liquidation=True)
         else:
             self._alerter.send_sync(
                 f"🚨 STOP-LOSS TRIGGERED at mid={mid:.2f}\n"
@@ -4300,17 +4308,6 @@ class GridBot:
                 f"  • Based on `{tr['n_hourly']}` hourly candles _(read-only)_"
             )
 
-        # Stop-loss line for daily section (only shown if a stop-loss occurred today)
-        daily_sl_line = (
-            f"  🚨 Stop-loss: `{daily_sl:+.4f} USD` ({daily_sl_n}× today)"
-            if daily_sl_n > 0 else ""
-        )
-        # Stop-loss line for accumulated section (only shown if any stop-loss on record)
-        acc_sl_line = (
-            f"  • Stop-loss losses: `{acc_sl:+.4f} USD` ({acc_sl_n}× total)"
-            if acc_sl_n > 0 else ""
-        )
-
         lines = [
             f"📊 *Grid Bot Status* — {now_hkt}",
             f"_{state_line}_",
@@ -4330,7 +4327,11 @@ class GridBot:
             f"*2️⃣  Daily PnL* (today {today['hkt_date']} HKT)",
             f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD` (`{_pct(daily_net)}`)",
             f"  • Gross: `{today['gross_pnl_usd']:+.4f}`  Fees: `{today['fees_usd']:+.4f}`",
-            daily_sl_line,
+            # Only inserted when a stop-loss occurred today — no blank line otherwise.
+            *(
+                [f"  🚨 Stop-loss: `{daily_sl:+.4f} USD` ({daily_sl_n}× today, included in gross)"]
+                if daily_sl_n > 0 else []
+            ),
             f"  • Cycles today: `{today['cycle_count']}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
@@ -4338,7 +4339,11 @@ class GridBot:
             f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD` (`{_pct(acc_net)}`)",
             f"  • Gross realised: `{acc_gross:+.4f} USD`",
             f"  • Total fees:     `{acc_fees:+.4f} USD`",
-            acc_sl_line,
+            # Only inserted when at least one stop-loss is on record — no blank line otherwise.
+            *(
+                [f"  • Stop-loss losses: `{acc_sl:+.4f} USD` ({acc_sl_n}× total, included in gross)"]
+                if acc_sl_n > 0 else []
+            ),
             f"  • Total cycles:   `{acc_cycles}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
