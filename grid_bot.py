@@ -2536,6 +2536,16 @@ class GridEngine:
             "cycles":       self._cycle_count,
         }
 
+    def get_params(self) -> "GridParams":
+        """Return the engine's current GridParams.
+
+        _trail_up / _trail_down mutate self._params in place, so this always
+        reflects the live grid boundaries — unlike GridBot._params which is
+        only updated on full rebuilds.  Thread-safe: GridParams is a value
+        object and Python attribute reads are atomic; no lock needed.
+        """
+        return self._params
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stop-score calculator  (proactive buy-gate signal)
