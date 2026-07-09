@@ -4061,12 +4061,31 @@ class GridBot:
                     # if the new stop is HIGHER (tighter) than the current one.
                     # Never move the stop downward: a lower stop during a falling
                     # market just delays the halt and increases potential loss.
+                    #
+                    # CRITICAL: suppress the stop-raise for drift_shift_min_interval_s
+                    # after a drift-shift fires.  Root cause of 2026-07-08 SL:
+                    #   19:43 drift-shift fires -> stop was 61633
+                    #   19:43+25s dead-band retune fires -> stop raised to 62076 (+442pts)
+                    #   20:57 price retraces to 61970 -> stop triggers, -$0.5975 loss
+                    # The stop-raise during the cooldown window is unsafe because price
+                    # may be mid-retracement after the upswing that triggered the shift.
                     new_stop = new_params.stop_price
                     cur_stop = self._params.stop_price
+
+                    # Check drift-shift cooldown before allowing an upward stop move.
+                    drift_cooldown = self._cfg.get("drift_shift_min_interval_s", 60)
+                    last_drift = (
+                        self._engine._last_drift_shift
+                        if self._engine is not None else 0.0
+                    )
+                    since_drift = time.time() - last_drift
+                    in_drift_cooldown = last_drift > 0 and since_drift < drift_cooldown
+
                     should_update = (
                         self._sl_guard is not None
                         and new_stop != cur_stop
                         and new_stop > cur_stop          # only move stop UP
+                        and not in_drift_cooldown        # not within drift-shift window
                     )
                     if should_update:
                         old_stop = cur_stop
@@ -4083,6 +4102,12 @@ class GridBot:
                             f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
                             f"dead-band {deadband:.1%}) — stop raised "
                             f"{old_stop:.2f} → {new_stop:.2f}"
+                        )
+                    elif in_drift_cooldown and new_stop > cur_stop:
+                        logger.info(
+                            f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
+                            f"dead-band {deadband:.1%}) — stop raise suppressed "
+                            f"(drift-shift cooldown {since_drift:.0f}s < {drift_cooldown}s)"
                         )
                     elif self._sl_guard is not None and new_stop < cur_stop:
                         logger.info(
