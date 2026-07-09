@@ -132,6 +132,19 @@ GRID_CONFIG: dict = {
     "maker_fee_rate": 0.0001,          # 0.01% deriv maker
     "taker_fee_rate": 0.0003,          # 0.03% deriv taker
 
+    # ── Paper-mode fill realism ────────────────────────────────────────────────
+    # A real resting limit order needs at least one exchange round-trip before
+    # it can be crossed — it is never eligible to fill in the same instant it
+    # is placed. GridEngine._simulate_paper_fills() checks price-crossing on
+    # every tick with no such floor, so a freshly-placed level (from an initial
+    # build, a trail-up/down, or a same-tick counter-order after a fill) whose
+    # price is already crossed by a fast-moving mid can paper-fill on the very
+    # next tick — faster than a real exchange would ever ack + match it.
+    # This delay makes a level ineligible to paper-fill until it has rested
+    # for at least this many seconds after being placed. 0 = disabled (legacy
+    # instant-fill behaviour).
+    "paper_fill_min_resting_s": 1.5,
+
     # ── Grid geometry (auto-tuned at startup; these are fallback defaults) ────
     "grid_lower":         55000.0,
     "grid_upper":         65000.0,
@@ -1905,6 +1918,8 @@ class GridLevel:
     state:      LevelState = LevelState.IDLE
     client_oid: str        = ""
     qty:        float      = 0.0
+    placed_at:  float      = 0.0   # epoch time this order was (re)placed;
+                                    # used by paper_fill_min_resting_s guard
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2032,6 +2047,7 @@ class GridEngine:
             lv.state      = LevelState.BUY_OPEN
             lv.client_oid = req.client_oid
             lv.qty        = qty
+            lv.placed_at  = time.time()
         self._oms.submit(req)
         logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
 
@@ -2046,6 +2062,7 @@ class GridEngine:
             lv.state      = LevelState.SELL_OPEN
             lv.client_oid = req.client_oid
             lv.qty        = qty
+            lv.placed_at  = time.time()
         self._oms.submit(req)
         logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
 
@@ -2077,12 +2094,23 @@ class GridEngine:
         with self._lock:
             levels = list(self._levels)
 
+        min_resting_s = self._cfg.get("paper_fill_min_resting_s", 1.5)
+        now = time.time()
+
         for lv in levels:
             filled = False
             if lv.state == LevelState.BUY_OPEN  and mid <= lv.price:
                 filled = True
             elif lv.state == LevelState.SELL_OPEN and mid >= lv.price:
                 filled = True
+
+            if filled and min_resting_s > 0 and (now - lv.placed_at) < min_resting_s:
+                # Order hasn't rested long enough to be a realistic fill yet —
+                # a real exchange needs at least one round-trip before a resting
+                # limit order can be crossed. Defer to a later tick; re-checked
+                # every tick until either it fills (once aged past the floor)
+                # or price moves away and the crossing condition no longer holds.
+                filled = False
 
             if filled:
                 maker_fee = self._cfg.get("maker_fee_rate", 0.0001)
@@ -2582,6 +2610,29 @@ class GridEngine:
         object and Python attribute reads are atomic; no lock needed.
         """
         return self._params
+
+    def update_stop_price(self, new_stop: float):
+        """Update stop_price on the engine's own GridParams in place.
+
+        Needed because the dead-band stop-raise in GridBot._rebuild_grid()
+        only updates GridBot._params and the StopLossGuard — it never touches
+        the engine's copy of GridParams. Since _log_status() (and the
+        Telegram /status handler's engine-derived fields) read from
+        self._engine.get_params(), the stop shown there kept lagging behind
+        the real, active stop after every dead-band raise. Call this
+        immediately after updating GridBot._params.stop_price so both copies
+        stay in sync. Rebuilds a new GridParams (value object) under lock,
+        mirroring the _trail_up / _trail_down pattern above.
+        """
+        with self._lock:
+            self._params = GridParams(
+                lower=self._params.lower,
+                upper=self._params.upper,
+                levels=self._params.levels,
+                spacing=self._params.spacing,
+                stop_price=new_stop,
+                notional_per_level=self._params.notional_per_level,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4098,6 +4149,14 @@ class GridBot:
                             notional_per_level=self._params.notional_per_level,
                         )
                         self._sl_guard = StopLossGuard(new_stop, self._cfg)
+                        # Propagate into the engine's own GridParams copy too —
+                        # _log_status() and the Telegram /status handler read
+                        # self._engine.get_params(), which _trail_up/_trail_down
+                        # keep current but which this dead-band raise otherwise
+                        # never touches. Without this the status log/alert shows
+                        # the pre-raise stop until the next full grid rebuild.
+                        if self._engine is not None:
+                            self._engine.update_stop_price(new_stop)
                         logger.info(
                             f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
                             f"dead-band {deadband:.1%}) — stop raised "
@@ -4372,17 +4431,34 @@ class GridBot:
 
         # All conditions met — restart
         self._restart_attempts += 1
+        # NOTE: condition 2 above only requires mid > recovery_floor (halt_stop_price
+        # minus a configurable ATR buffer) — NOT mid > halt_stop_price itself. The
+        # previous log line here read "above stop={halt_stop_price}", which was
+        # misleading: it implied mid had recovered above the old halt stop when it
+        # may still be below it (by design, within recovery_buffer_mult × ATR).
+        # Make that explicit so log readers aren't misled about what was checked.
+        # (The subsequent _rebuild_grid() stop-proximity guard is what actually
+        # protects against arming a new stop too close to current mid.)
+        below_halt_stop = mid < self._halt_stop_price
+        recovery_note = (
+            f"mid={mid:.2f} < halt_stop={self._halt_stop_price:.2f} but > "
+            f"recovery_floor={recovery_floor:.2f} (buffered recovery)"
+            if below_halt_stop else
+            f"mid={mid:.2f} >= halt_stop={self._halt_stop_price:.2f}"
+        )
         logger.info(
             f"[AutoRestart] Stability confirmed: "
             f"hi-lo={hi_lo:.2f} < max={max_range:.2f}, "
             f"mid={mid:.2f} >= mean={mean:.2f}, "
-            f"above stop={self._halt_stop_price:.2f} "
+            f"{recovery_note} "
             f"(attempt {self._restart_attempts}/{max_attempts if max_attempts else '∞'})"
         )
         self._alerter.send(
             f"🔄 Auto-restart #{self._restart_attempts}: stability confirmed\n"
             f"mid={mid:.2f} | hi-lo={hi_lo:.0f} < {max_range:.0f} ({stab_min}m window)\n"
-            f"Rebuilding grid..."
+            + (f"⚠️ still below halt stop {self._halt_stop_price:.0f} (buffered recovery)\n"
+               if below_halt_stop else "")
+            + f"Rebuilding grid..."
         )
 
         self._halted = False
