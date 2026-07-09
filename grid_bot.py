@@ -4552,13 +4552,14 @@ class GridBot:
                 f"  • Based on `{tr['n_hourly']}` hourly candles _(read-only)_"
             )
 
+        _net_label = "long" if long_qty >= 0 else "short"
         lines = [
             f"📊 *Grid Bot Status* — {now_hkt}",
             f"_{state_line}_",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
             "*1️⃣  Current Position*",
-            f"  • Net {"long" if long_qty >= 0 else "short"}:    `{abs(long_qty):.4f} BTC`",
+            f"  • Net {_net_label}:    `{abs(long_qty):.4f} BTC`",
             f"  • Mid price:  `{mid_str}`",
             f"  • Open buys:  `{open_buys}` / Open sells: `{open_sells}`",
             score_line,
@@ -4617,13 +4618,13 @@ class GridBot:
                 score_str = f" score={score:.3f}"
             _out = mid > params.upper or mid < params.lower
             _out_tag = " OUTSIDE_RANGE" if _out else ""
+            _pos_label = "long" if stats.get('long_qty', 0) >= 0 else "short"
             logger.info(
                 f"[Status] mid={mid:.2f} "
                 f"range=[{params.lower:.2f},{params.upper:.2f}] stop={params.stop_price:.2f}{_out_tag} | "
                 f"buys={stats.get('open_buys',0)} sells={stats.get('open_sells',0)} "
                 f"suppressed={suppressed}{score_str} "
-                f"{"long" if stats.get('long_qty',0) >= 0 else "short"}="
-                f"{abs(stats.get('long_qty',0)):.4f} BTC | "
+                f"{_pos_label}={abs(stats.get('long_qty',0)):.4f} BTC | "
                 f"cycles={stats.get('cycles',0)} "
                 f"net_pnl={stats.get('net_pnl',0):+.4f} USD"
             )
