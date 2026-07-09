@@ -219,6 +219,18 @@ GRID_CONFIG: dict = {
     #                   "might still be mid-retracement" assumption the
     #                   cooldown was built around).
     "stop_raise_urgent_trend_risk": 0.80,
+    #  Debounce noise tolerance — the candidate must weaken by more than this
+    #  (in units of ATR) to reset the confirmation timer, so ordinary
+    #  sample-to-sample float/EMA jitter doesn't perpetually restart it. Fixed
+    #  a 2026-07-10 regression where debounce tracked the CAPPED candidate,
+    #  whose ceiling drifts with ATR independent of any real reversal.
+    #  0.3xATR chosen from replaying the actual logged sequence: the
+    #  EMA-damped candidate (alpha=0.15) still swings 10-20 points call-to-call
+    #  from ordinary mid/ATR noise even post-damping (raw_new_stop tracks mid
+    #  closely) — a tolerance of 0.05xATR (~2.5pts) still reset almost every
+    #  time; 0.3xATR (~15pts) absorbed the noise while still resetting on a
+    #  genuinely large single-step decline.
+    "stop_raise_confirm_noise_atr": 0.3,
 
     # trend_risk component weights (normalised to sum to 1.0)
     "trend_risk_weight_velocity":        0.40,  # tick-level EMA of down-moves
@@ -4199,30 +4211,43 @@ class GridBot:
                 f"MANUAL INTERVENTION REQUIRED"
             )
 
-    def _update_pending_raise(self, candidate_stop: float) -> bool:
+    def _update_pending_raise(self, candidate_stop: float, noise_tolerance: float = 0.0) -> bool:
         """
         Track a candidate dead-band stop-raise across separate invocations of
         _rebuild_grid()'s dead-band check, for the stop_raise_confirm_*
         debounce (see that block below).
 
-        If the candidate weakens (drops below the value we're already
-        tracking) the confirmation timer resets — SL1's root cause was a
-        raise that committed instantly on a single strong sample and the
-        market was already retracing by the time it triggered, so any
-        weakening of the candidate is treated as a possible sign the
-        retrace has begun. If it holds or strengthens, the original
-        since-timestamp is kept (so genuine sustained moves aren't
-        penalised) and the tracked value is updated upward.
+        If the candidate weakens by more than noise_tolerance (drops below
+        the value we're already tracking) the confirmation timer resets —
+        SL1's root cause was a raise that committed instantly on a single
+        strong sample and the market was already retracing by the time it
+        triggered, so a genuine weakening of the candidate is treated as a
+        possible sign the retrace has begun. If it holds (within tolerance)
+        or strengthens, the original since-timestamp is kept (so genuine
+        sustained moves aren't penalised) and the tracked value is updated
+        upward.
+
+        IMPORTANT: callers must pass the pre-cap EMA-damped candidate here,
+        not the capped one. The cap's ceiling (cur_stop + cap_atr × ATR)
+        recomputes every call from the current ATR, which drifts on its own
+        (e.g. slowly declining as volatility normalises) independent of
+        whether the underlying raise signal is holding — tracking the capped
+        value caused exactly that drift to look like "weakening" on every
+        call, permanently resetting the timer to 0 with zero chance to ever
+        confirm. The cap should only limit the size of the jump actually
+        committed, applied once, at commit time — never enter the
+        persistence tracking that decides IF a raise is warranted at all.
 
         Returns True if this call (re)started the tracking window.
         """
         if (self._pending_raise_candidate is None
-                or candidate_stop < self._pending_raise_candidate - 1e-9):
+                or candidate_stop < self._pending_raise_candidate - noise_tolerance):
             self._pending_raise_candidate = candidate_stop
             self._pending_raise_since     = time.time()
             return True
         self._pending_raise_candidate = max(self._pending_raise_candidate, candidate_stop)
         return False
+
 
     def _rebuild_grid(self):
         mid = _price_cache.get_mid()
@@ -4250,7 +4275,28 @@ class GridBot:
         if self._params is not None and self._engine is not None:
             old_width = self._params.upper - self._params.lower
             new_width = new_params.upper - new_params.lower
-            if old_width > 0:
+
+            # CRITICAL: the width-delta check below is blind to POSITION shifts.
+            # Root cause of the 2026-07-09 21:32 stop-loss: mid drifted below the
+            # entire current range ("Price 62594.35 outside range -> retune"),
+            # so the auto-tuner correctly computed a repositioned range/stop
+            # ([62464.32,62724.38], stop=62334.29) — but its WIDTH (260.06) was
+            # only 0.4% different from the current range's width (258.98), so
+            # the dead-band check below treated it as "too small to rebuild" and
+            # took the in-place-only path. That path can only RAISE the stop,
+            # never lower it — so the grid was left sitting at its old position
+            # (range=[62624.06,62883.04], stop=62494.57) while price kept
+            # falling, with no mechanism able to either reposition it down or
+            # correctly hold it — until price fell through the stale stop
+            # 27 minutes later. A same-width RANGE TRANSLATION is exactly the
+            # case a width-only delta check cannot see. Whenever mid is outside
+            # the current live range, a full reposition is mandatory regardless
+            # of width similarity — bypass the dead-band entirely in that case.
+            mid_outside_current_range = (
+                mid < self._params.lower or mid > self._params.upper
+            )
+
+            if old_width > 0 and not mid_outside_current_range:
                 delta = abs(new_width - old_width) / old_width
                 deadband = self._cfg.get("retune_deadband_pct", 0.10)
                 if delta < deadband:
@@ -4285,6 +4331,20 @@ class GridBot:
                     #                 drift-shift cooldown veto (strong, real
                     #                 evidence outweighs the "might still be
                     #                 mid-retracement" assumption behind it)
+                    #
+                    # Order matters: EMA damp -> Debounce (on the UNCAPPED
+                    # damped value) -> cooldown veto -> Cap (applied once, at
+                    # commit). The cap must NOT be part of what debounce
+                    # tracks — its ceiling (cur_stop + cap_atr×ATR) recomputes
+                    # from current ATR every call, which drifts on its own
+                    # (e.g. ATR quietly declining as volatility normalises)
+                    # independent of whether the raise signal is holding.
+                    # Bug found in the 2026-07-10 logs: with the cap value
+                    # debounce-tracked, that ATR drift alone reset the
+                    # confirmation timer to 0 on every single 5-min retune,
+                    # forever — the candidate sat at "0s/90s held" for 50+
+                    # minutes while the real target climbed to 63000+ and the
+                    # live stop stayed stuck 500+ points below price.
                     raw_new_stop = new_params.stop_price
                     cur_stop     = self._params.stop_price
 
@@ -4312,6 +4372,9 @@ class GridBot:
                             )
                         return
 
+                    atr_now = _price_cache.compute_atr(
+                        self._cfg.get("atr_lookback_minutes", 1440))
+
                     # ── 3. EMA damping ────────────────────────────────────────
                     ema_alpha = _risk_interp(
                         trend_risk,
@@ -4328,6 +4391,11 @@ class GridBot:
                     damped_stop = self._stop_raise_ema
 
                     if damped_stop <= cur_stop:
+                        # Clear pending state too — the damped signal itself
+                        # (not just the capped derivative) has weakened back
+                        # to/below current stop, a genuine reason to reset.
+                        self._pending_raise_candidate = None
+                        self._pending_raise_since     = 0.0
                         logger.info(
                             f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
                             f"dead-band {deadband:.1%}) — raw candidate "
@@ -4337,29 +4405,34 @@ class GridBot:
                         )
                         return
 
-                    # ── 1. Cap ────────────────────────────────────────────────
-                    atr_now = _price_cache.compute_atr(
-                        self._cfg.get("atr_lookback_minutes", 1440))
-                    cap_atr = _risk_interp(
-                        trend_risk,
-                        self._cfg.get("stop_raise_cap_base_atr", 0.5),
-                        self._cfg.get("stop_raise_cap_max_atr",  2.5),
+                    # ── 2. Debounce (on the uncapped damped_stop) ────────────
+                    noise_tol = (
+                        self._cfg.get("stop_raise_confirm_noise_atr", 0.05) * atr_now
+                        if atr_now and atr_now > 0 else 0.0
                     )
-                    if atr_now and atr_now > 0:
-                        capped_stop = min(damped_stop, cur_stop + cap_atr * atr_now)
-                    else:
-                        capped_stop = damped_stop  # ATR unavailable — cap disabled this round
+                    self._update_pending_raise(damped_stop, noise_tol)
+                    confirm_s = _risk_interp(
+                        trend_risk,
+                        self._cfg.get("stop_raise_confirm_base_s", 90),
+                        self._cfg.get("stop_raise_confirm_min_s",  10),
+                    )
+                    elapsed = time.time() - self._pending_raise_since
 
-                    if capped_stop <= cur_stop:
+                    if elapsed < confirm_s:
                         logger.info(
                             f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
-                            f"dead-band {deadband:.1%}) — raise capped to "
-                            f"{cap_atr:.2f}×ATR, no headroom above current "
-                            f"stop={cur_stop:.2f} yet (trend_risk={trend_risk:.2f})"
+                            f"dead-band {deadband:.1%}) — stop raise pending "
+                            f"confirm (candidate={self._pending_raise_candidate:.2f}, "
+                            f"{elapsed:.0f}s/{confirm_s:.0f}s held, "
+                            f"trend_risk={trend_risk:.2f})"
                         )
                         return
 
                     # ── 4. Drift-shift cooldown veto (with urgent bypass) ────
+                    # Checked only after confirmation, so cooldown time isn't
+                    # wasted counting toward the debounce window — but also
+                    # doesn't block the debounce timer from running while
+                    # waiting for cooldown to clear (next call re-enters here).
                     drift_cooldown = self._cfg.get("drift_shift_min_interval_s", 60)
                     last_drift = (
                         self._engine._last_drift_shift
@@ -4378,32 +4451,32 @@ class GridBot:
                             f"{drift_cooldown}s, trend_risk={trend_risk:.2f} < "
                             f"urgent {urgent_threshold})"
                         )
-                        # Keep the debounce timer running so a raise can commit
-                        # the instant cooldown clears, if it's held long enough.
-                        self._update_pending_raise(capped_stop)
                         return
 
-                    # ── 2. Debounce ───────────────────────────────────────────
-                    self._update_pending_raise(capped_stop)
-                    confirm_s = _risk_interp(
+                    # ── 1. Cap — applied once, here, at commit time ──────────
+                    cap_atr = _risk_interp(
                         trend_risk,
-                        self._cfg.get("stop_raise_confirm_base_s", 90),
-                        self._cfg.get("stop_raise_confirm_min_s",  10),
+                        self._cfg.get("stop_raise_cap_base_atr", 0.5),
+                        self._cfg.get("stop_raise_cap_max_atr",  2.5),
                     )
-                    elapsed = time.time() - self._pending_raise_since
+                    if atr_now and atr_now > 0:
+                        capped_stop = min(damped_stop, cur_stop + cap_atr * atr_now)
+                    else:
+                        capped_stop = damped_stop  # ATR unavailable — cap disabled this round
 
-                    if elapsed < confirm_s:
+                    if capped_stop <= cur_stop:
+                        # Shouldn't normally happen (damped_stop > cur_stop was
+                        # already established above), but guard anyway.
                         logger.info(
                             f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
-                            f"dead-band {deadband:.1%}) — stop raise pending "
-                            f"confirm (candidate={self._pending_raise_candidate:.2f}, "
-                            f"{elapsed:.0f}s/{confirm_s:.0f}s held, "
-                            f"trend_risk={trend_risk:.2f})"
+                            f"dead-band {deadband:.1%}) — raise capped to "
+                            f"{cap_atr:.2f}×ATR, no headroom above current "
+                            f"stop={cur_stop:.2f} yet (trend_risk={trend_risk:.2f})"
                         )
                         return
 
                     # ── All gates passed — commit the raise ──────────────────
-                    new_stop = self._pending_raise_candidate
+                    new_stop = capped_stop
                     old_stop = cur_stop
                     self._params = GridParams(
                         lower=self._params.lower,
@@ -4428,7 +4501,8 @@ class GridBot:
                         f"[GridBot] Re-tune skipped (range shift {delta:.1%} < "
                         f"dead-band {deadband:.1%}) — stop raised "
                         f"{old_stop:.2f} → {new_stop:.2f} "
-                        f"(trend_risk={trend_risk:.2f}"
+                        f"(raw candidate={damped_stop:.2f}, "
+                        f"trend_risk={trend_risk:.2f}"
                         f"{' URGENT-BYPASS' if urgent_bypass else ''}, "
                         f"cap={cap_atr:.2f}×ATR, confirm={confirm_s:.0f}s)"
                     )
