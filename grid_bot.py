@@ -1347,11 +1347,14 @@ class _ReconnectingWS:
     Generation-tagged WS with DOA detection + stale-data watchdog.
     Copied from funding_arb/ws_manager.py.
     """
-    _DOA_THRESHOLD_S  = 10
-    _DOA_BACKOFF_STEP = 60
-    _DOA_MAX_BACKOFF  = 300
-    _DOA_LONG_STREAK  = 5
-    _DOA_LONG_PAUSE   = 1800
+    _DOA_THRESHOLD_S        = 10
+    _DOA_BACKOFF_STEP       = 60
+    _DOA_MAX_BACKOFF        = 300
+    _DOA_LONG_STREAK        = 5
+    _DOA_LONG_PAUSE         = 1800
+    # A disconnect after this many seconds of uptime resets the backoff
+    # counter, so a brief glitch after hours of stability starts from init.
+    _BACKOFF_RESET_STABLE_S = 60
 
     def __init__(self, name: str, url: str,
                  subscribe_msg_fn: Callable[[], List[dict]],
@@ -1484,6 +1487,12 @@ class _ReconnectingWS:
             else:
                 with self._doa_lock:
                     self._consecutive_doa = 0
+                # Reset backoff if the connection was stable long enough,
+                # so a brief glitch after hours of uptime starts from init.
+                with self._connect_time_lock:
+                    stable_s = time.time() - self._connect_time
+                if stable_s >= self._BACKOFF_RESET_STABLE_S:
+                    backoff = self._backoff_init
                 sleep_s = backoff
                 backoff  = min(backoff * 2, self._backoff_max)
                 logger.info(f"[{self._name}] disconnected — reconnecting in {sleep_s}s")
@@ -2313,10 +2322,12 @@ class GridEngine:
 
         if is_buy:
             self._long_qty += fill.filled_qty
+            net = self._long_qty
+            net_label = f"long={net:.4f}" if net >= 0 else f"short={-net:.4f}"
             logger.info(
                 f"[GridEngine] FILL BUY  [{idx}] @ {fill.avg_price:.2f} "
                 f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} "
-                f"long={self._long_qty:.4f} BTC"
+                f"{net_label} BTC"
             )
             # Persist to DB (gross_pnl=0 for BUY fills — profit only realised on SELL)
             if self._store is not None:
@@ -2495,25 +2506,51 @@ class GridEngine:
 
     def get_cost_basis(self) -> Tuple[float, float]:
         """
-        Weighted-average cost basis (total_qty, avg_price) of the currently
-        open long, derived from levels in SELL_OPEN state (bought and
-        awaiting their paired exit sell — see _get_paired_buy_price).
+        Weighted-average cost basis of the net long position, expressed as
+        (qty, avg_price), where qty matches _long_qty (the running counter
+        of filled BUYs minus filled SELLs) rather than the raw count of
+        SELL_OPEN levels.
 
-        Used by GridBot to compute realized gross PnL when a position is
-        closed outside the normal per-level fill path: stop-loss
-        liquidation or a clean shutdown. Must be called before stop() tears
-        down level state, since stop() resets levels to IDLE.
+        Why the two can diverge: _long_qty can go negative during a rapid
+        price rally (SELL fills outpace BUY counter-fills).  When it later
+        recovers through zero back into positive territory the BUY fills
+        that covered the short are absorbed first; only the remaining qty
+        represents a genuine long entry.  Summing ALL SELL_OPEN levels in
+        that state would overcount and inflate the cost basis.
+
+        Algorithm: collect SELL_OPEN levels sorted lowest-index first
+        (i.e. lowest buy price first, matching the most recent entries),
+        accumulate until total_qty == _long_qty, then stop.  If _long_qty
+        <= 0 there is no net long and we return (0.0, 0.0).
+
+        Must be called before stop() tears down level state.
         """
         with self._lock:
-            total_qty  = 0.0
-            total_cost = 0.0
+            net_long = self._long_qty
+            if net_long <= 0.0:
+                return 0.0, 0.0
+
+            # Collect SELL_OPEN levels in ascending index order (lowest buy
+            # price first = most recently entered positions when price fell).
+            candidates = []
             for lv in self._levels:
                 if lv.state == LevelState.SELL_OPEN and lv.qty > 0:
                     buy_idx   = lv.index - 1
                     buy_price = (self._levels[buy_idx].price
                                  if 0 <= buy_idx < len(self._levels) else lv.price)
-                    total_qty  += lv.qty
-                    total_cost += buy_price * lv.qty
+                    candidates.append((lv.index, buy_price, lv.qty))
+            candidates.sort(key=lambda x: x[0])
+
+            # Accumulate only enough levels to match net_long.
+            total_qty  = 0.0
+            total_cost = 0.0
+            for _, buy_price, qty in candidates:
+                take = min(qty, net_long - total_qty)
+                total_cost += buy_price * take
+                total_qty  += take
+                if total_qty >= net_long - 1e-9:
+                    break
+
         avg_price = (total_cost / total_qty) if total_qty > 0 else 0.0
         return total_qty, avg_price
 
@@ -4414,7 +4451,13 @@ class GridBot:
         # ── Grid range ────────────────────────────────────────────────────────
         params = self._params
         if params:
-            range_str   = f"[{params.lower:,.0f} – {params.upper:,.0f}]  stop={params.stop_price:,.0f}"
+            _outside = (
+                mid is not None
+                and (mid > params.upper or mid < params.lower)
+            )
+            _outside_tag = " ⚠️ price outside range" if _outside else ""
+            range_str   = (f"[{params.lower:,.0f} – {params.upper:,.0f}]"
+                           f"  stop={params.stop_price:,.0f}{_outside_tag}")
             spacing_str = f"{params.spacing:.2f}"
         else:
             range_str   = "N/A (grid not built)"
@@ -4490,7 +4533,7 @@ class GridBot:
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
             "*1️⃣  Current Position*",
-            f"  • Net long:   `{long_qty:.4f} BTC`",
+            f"  • Net {"long" if long_qty >= 0 else "short"}:    `{abs(long_qty):.4f} BTC`",
             f"  • Mid price:  `{mid_str}`",
             f"  • Open buys:  `{open_buys}` / Open sells: `{open_sells}`",
             score_line,
@@ -4547,12 +4590,15 @@ class GridBot:
             if self._stop_scorer is not None:
                 score = self._stop_scorer.compute(mid, params.stop_price)
                 score_str = f" score={score:.3f}"
+            _out = mid > params.upper or mid < params.lower
+            _out_tag = " OUTSIDE_RANGE" if _out else ""
             logger.info(
                 f"[Status] mid={mid:.2f} "
-                f"range=[{params.lower:.2f},{params.upper:.2f}] stop={params.stop_price:.2f} | "
+                f"range=[{params.lower:.2f},{params.upper:.2f}] stop={params.stop_price:.2f}{_out_tag} | "
                 f"buys={stats.get('open_buys',0)} sells={stats.get('open_sells',0)} "
                 f"suppressed={suppressed}{score_str} "
-                f"long={stats.get('long_qty',0):.4f} BTC | "
+                f"{"long" if stats.get('long_qty',0) >= 0 else "short"}="
+                f"{abs(stats.get('long_qty',0)):.4f} BTC | "
                 f"cycles={stats.get('cycles',0)} "
                 f"net_pnl={stats.get('net_pnl',0):+.4f} USD"
             )
