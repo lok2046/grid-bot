@@ -342,8 +342,26 @@ GRID_CONFIG: dict = {
     # restart" behaviour.
     "auto_restart_enabled":           True,
     "auto_restart_cooldown_minutes":  30,    # minimum wait after halt
-    "auto_restart_stability_minutes": 60,    # look-back window for stability check
+    "auto_restart_stability_minutes": 60,    # look-back window for the RANGE (hi-lo) check
     "auto_restart_stability_atr_mult": 7.75, # hi-lo < N × ATR; 7.75 = sqrt(60) scales 1-min ATR to 60-min window
+    "auto_restart_range_percentile":  0.05,  # hi/lo taken as this/its-complement percentile of the
+                                             # 60-min window instead of raw min/max (0.0 = raw min/max).
+                                             # 2026-07-09/10 log: hi-lo sat pinned at a single old extreme
+                                             # tick's value for long stretches, only dropping once that one
+                                             # tick fully aged out of the 60-min window rather than decaying
+                                             # smoothly. 0.05 (5th/95th pctile) trims a handful of isolated
+                                             # outlier ticks/wicks while still requiring genuinely broad calm
+                                             # if the chop is real and sustained across most of the window.
+    "auto_restart_trend_minutes":     15,    # SEPARATE, shorter look-back for the mean used by the
+                                             # flat/rising-trend check (condition 4 below). 2026-07-10 log:
+                                             # after an earlier bounce peak, price was already flat for
+                                             # ~25 minutes, but the 60-min mean (shared with the range
+                                             # check) kept chasing down toward it, so already-stable price
+                                             # kept testing as "below mean" (a fake downtrend) until the
+                                             # full 60-min window finally rolled past the old peak. A
+                                             # shorter, separate window lets this check track *recent*
+                                             # price action instead of an hour-old bounce. Falls back to
+                                             # auto_restart_stability_minutes if too sparse.
     "auto_restart_recovery_atr_buffer": 0.5, # price gate: allow restart when mid > halt_stop - N×ATR
                                              # 0.5×ATR ≈ half a minute's typical move — genuine noise, not a
                                              # resumed downtrend.  The _rebuild_grid stop-proximity guard
@@ -1751,32 +1769,78 @@ class PriceCache:
         buckets = set(int(ts // 60) for ts, _ in recent)
         return len(buckets)
 
-    def compute_stability(self, window_minutes: int) -> dict:
+    def compute_stability(self, window_minutes: int,
+                           trend_window_minutes: Optional[int] = None,
+                           range_percentile: float = 0.0) -> dict:
         """
-        Compute price stability metrics over the last window_minutes.
+        Compute price stability metrics used by the auto-restart check.
+
+        Two DIFFERENT questions are being asked here, and one fixed 60-minute
+        equal-weighted window answers both badly:
+
+          "Have the big swings genuinely stopped?" — this benefits from a
+          long, conservative look-back (window_minutes, default 60): we want
+          confidence that wide swings have stopped for a good stretch, not
+          just paused for a minute. But a single wide window's raw min/max is
+          pinned by whatever the single most extreme tick was, for the WHOLE
+          window duration, however calm everything since has been — it only
+          drops the instant that one tick ages out, rather than decaying
+          smoothly. range_percentile (e.g. 0.05 = 5th/95th percentile instead
+          of raw min/max) makes hi/lo robust to one or two isolated outlier
+          ticks/wicks while still requiring genuinely broad calm across the
+          bulk of the window if the chop is real and sustained.
+
+          "Is price flat-or-rising right now?" — this is inherently a
+          SHORTER-horizon question, and reusing the same 60-minute window for
+          it causes a real, observed problem: if price spikes/bounces once
+          within the window and then goes flat, the 60-min mean keeps
+          chasing down toward the new flat level for up to the full 60
+          minutes, so already-stable price keeps testing as "below mean" —
+          i.e. a fake "downtrend" — until the window finally rolls past the
+          old peak. trend_window_minutes (default much shorter, e.g. 15) lets
+          this check respond to recent price action instead of an hour-old
+          bounce. Falls back to the full window if trend_window_minutes
+          isn't given, or if the shorter window is too sparse.
 
         Returns a dict with:
-          "hi"        — highest mid price in window
-          "lo"        — lowest mid price in window
+          "hi"        — highest (or range_percentile-th percentile) mid price
+                        over window_minutes
+          "lo"        — lowest (or (1-range_percentile)-th percentile) mid
+                        price over window_minutes
           "hi_lo"     — hi - lo (range)
-          "mean"      — arithmetic mean of mid prices in window
+          "mean"      — arithmetic mean of mid prices over trend_window_minutes
+                        (or window_minutes if not given)
           "current"   — most recent mid price
-          "n_ticks"   — number of ticks in window (quality indicator)
+          "n_ticks"   — number of ticks in the range window (quality indicator)
           "ok"        — False if insufficient data (< 10 ticks)
         """
         with self._lock:
             history = list(self._history)
 
-        cutoff = time.time() - window_minutes * 60
+        now    = time.time()
+        cutoff = now - window_minutes * 60
         window = [mid for ts, mid in history if ts >= cutoff]
 
         if len(window) < 10:
             return {"ok": False, "hi": 0.0, "lo": 0.0, "hi_lo": 0.0,
                     "mean": 0.0, "current": 0.0, "n_ticks": len(window)}
 
-        hi      = max(window)
-        lo      = min(window)
-        mean    = sum(window) / len(window)
+        trend_min     = trend_window_minutes if trend_window_minutes else window_minutes
+        trend_cutoff  = now - trend_min * 60
+        trend_window  = [mid for ts, mid in history if ts >= trend_cutoff]
+        if len(trend_window) < 10:
+            trend_window = window   # too sparse — fall back to the full window
+
+        if range_percentile and range_percentile > 0:
+            ordered = sorted(window)
+            lo_idx  = int(len(ordered) * range_percentile)
+            hi_idx  = min(int(len(ordered) * (1 - range_percentile)), len(ordered) - 1)
+            lo, hi  = ordered[lo_idx], ordered[hi_idx]
+        else:
+            hi = max(window)
+            lo = min(window)
+
+        mean    = sum(trend_window) / len(trend_window)
         current = window[-1]
         return {
             "ok":      True,
@@ -4730,8 +4794,14 @@ class GridBot:
             return
 
         # Condition 3 + 4: stability window
-        stab_min = self._cfg.get("auto_restart_stability_minutes", 60)
-        stab     = _price_cache.compute_stability(stab_min)
+        # Range (hi-lo) uses the long, conservative window (confidence big
+        # swings have genuinely stopped). Trend (mean) uses a separate,
+        # shorter window — see config comments for why sharing one window
+        # between these two different questions caused a real, observed delay.
+        stab_min   = self._cfg.get("auto_restart_stability_minutes", 60)
+        trend_min  = self._cfg.get("auto_restart_trend_minutes", 15)
+        range_pct  = self._cfg.get("auto_restart_range_percentile", 0.05)
+        stab       = _price_cache.compute_stability(stab_min, trend_min, range_pct)
 
         if not stab["ok"]:
             logger.info(
@@ -4752,9 +4822,10 @@ class GridBot:
 
         # Condition 3: range must be tight
         if hi_lo > max_range:
+            pct_note = f" ({range_pct:.0%}ile" if range_pct > 0 else " (raw min/max"
             logger.info(
-                f"[AutoRestart] Still volatile: hi-lo={hi_lo:.2f} > "
-                f"{atr_mult}×ATR={max_range:.2f} — waiting"
+                f"[AutoRestart] Still volatile: hi-lo={hi_lo:.2f}{pct_note}, "
+                f"{stab_min}m window) > {atr_mult}×ATR={max_range:.2f} — waiting"
             )
             return
 
@@ -4765,7 +4836,8 @@ class GridBot:
         if mid < trend_floor:
             logger.info(
                 f"[AutoRestart] Downtrend in window: mid={mid:.2f} < "
-                f"trend_floor={trend_floor:.2f} (mean={mean:.2f} - 0.1×ATR) — waiting"
+                f"trend_floor={trend_floor:.2f} (mean={mean:.2f} over "
+                f"{trend_min}m - 0.1×ATR) — waiting"
             )
             return
 
