@@ -300,6 +300,27 @@ GRID_CONFIG: dict = {
     "stop_buffer_atr_expansion_threshold": 1.5,  # ATR/mean_ATR ratio that triggers widening
     "stop_buffer_atr_max_mult":            2.0,  # cap: buffer never exceeds base × this
 
+    # ── ATR floor + recent-range guard ───────────────────────────────────────
+    # During rapid directional moves (e.g. a fast 200-pt BTC spike) the 1-min
+    # candles are all narrow and directional, which collapses the rolling ATR.
+    # A low ATR produces a dangerously tight stop: on 2026-07-10 SL1 the ATR
+    # compressed to 28.67 (normal: 35-45), placing the stop only 87 pts below
+    # mid, which a 174-pt retracement immediately hit.
+    #
+    # Two complementary guards prevent this:
+    #   1. min_atr_floor_pts — hard floor in price points.  The effective ATR
+    #      used for stop/range computation is never allowed below this value,
+    #      regardless of what the rolling computation returns.
+    #      Set to ~80% of expected quiet-market ATR (e.g. 30 for BTCUSD-PERP).
+    #
+    #   2. recent_range_atr_factor — the effective ATR also can't drop below
+    #      (5-min hi-lo × this factor).  This catches ATR-compression-during-
+    #      surge: even if the rolling ATR is low, if price moved 100 pts in the
+    #      last 5 minutes the stop must account for that range.  Default 0.5
+    #      means the effective ATR is at least half the recent 5-min swing.
+    "min_atr_floor_pts":       30.0,  # hard floor for effective ATR (price points)
+    "recent_range_atr_factor": 0.5,   # effective ATR >= recent_5min_range × this
+
     # Minimum headroom between current mid and the newly-computed stop price,
     # expressed as a multiple of ATR.  If mid < stop + N×ATR at the moment the
     # grid is (re)built, the build is aborted: price is already too close to the
@@ -362,13 +383,28 @@ GRID_CONFIG: dict = {
                                              # shorter, separate window lets this check track *recent*
                                              # price action instead of an hour-old bounce. Falls back to
                                              # auto_restart_stability_minutes if too sparse.
-    "auto_restart_recovery_atr_buffer": 0.5, # price gate: allow restart when mid > halt_stop - N×ATR
-                                             # 0.5×ATR ≈ half a minute's typical move — genuine noise, not a
-                                             # resumed downtrend.  The _rebuild_grid stop-proximity guard
-                                             # (headroom > 0.5×ATR) is the second line of defence: if price
-                                             # is truly too close to the new stop, the rebuild aborts and the
-                                             # bot reverts to halted state.  Set to 0.0 to keep the old
-                                             # strict behaviour (mid must exceed halt_stop exactly).
+    "auto_restart_recovery_atr_buffer": 0.5, # price gate: initial buffer at halt time:
+                                             # floor = halt_stop - buffer×ATR.  Decays over time
+                                             # (see recovery_floor_decay_atr_per_hour below).
+                                             # The _rebuild_grid stop-proximity guard is the second
+                                             # line of defence: if price is truly too close to the
+                                             # new stop after restart, the rebuild aborts.
+                                             # Set to 0.0 for strict (mid must exceed halt_stop).
+    "auto_restart_recovery_floor_decay_atr_per_hour": 3.0,
+                                             # The recovery floor drops by this many ATRs per hour
+                                             # of halted time.  After 2h at ATR=35 the floor has
+                                             # dropped 210 pts below halt_stop, letting the bot
+                                             # restart even if price never fully recovered.
+                                             # 2026-07-10 SL2: halt_stop=64415, ATR=34.85, floor
+                                             # at t=0: 64398.  BTC dropped to 63990 (-425 pts).
+                                             # With decay=3.0: after 4h floor = 64415 - (0.5+12)×35
+                                             # = 63977 — bot restarts into stable overnight market.
+                                             # Set to 0.0 to disable decay (fixed floor).
+    "auto_restart_recovery_floor_min_atr": 15.0,
+                                             # The decayed floor is never allowed to drop more than
+                                             # this many ATRs below halt_stop (absolute lower bound).
+                                             # Default 15 → floor never goes more than 15×ATR below
+                                             # halt_stop regardless of how long the bot has been halted.
     "auto_restart_max_attempts":      3,     # give up after N failed attempts; 0 = unlimited
     "auto_restart_attempt_reset_hours": 24,  # if the grid has been running healthily (no halt)
                                              # for this long since the last auto-restart, the
@@ -431,6 +467,19 @@ GRID_CONFIG: dict = {
     "stop_score_weight_proximity":  0.40,
     "stop_score_weight_velocity":   0.35,
     "stop_score_weight_volatility": 0.25,
+    # ── BuyGate auto-calibration ──────────────────────────────────────────────
+    # After each stop-loss event, _calibrate_threshold() records the peak
+    # score observed in the N seconds before the halt and uses it to nudge
+    # the threshold downward toward (peak × safety_margin).  An EMA damps
+    # updates so one extreme event does not over-steer.
+    # The threshold is persisted in the meta DB table (key='bugate_threshold')
+    # so calibration survives restarts.  It is never lowered below
+    # stop_score_threshold_floor or raised above the configured default.
+    "stop_score_calib_enabled":       True,
+    "stop_score_calib_lookback_s":    120,   # seconds before halt to scan for peak score
+    "stop_score_calib_safety_margin": 0.90,  # target = peak_score × margin (< 1 leaves headroom)
+    "stop_score_calib_ema_alpha":     0.40,  # EMA weight for new calibration signal (0=ignore, 1=replace)
+    "stop_score_threshold_floor":     0.12,  # never auto-lower below this (safety floor)
 
     # ── Endpoints (auto-selected by TRADING_MODE — do not edit) ───────────────
     "rest_base_url": {
@@ -1940,33 +1989,70 @@ class GridAutoTuner:
         max_levels = self._cfg.get("max_grid_levels", 50)
         min_levels = self._cfg.get("min_grid_levels", 5)
 
+        # ── Effective ATR: floor + recent-range guard ─────────────────────────
+        # During fast directional moves (surges/crashes) the rolling 1-min ATR
+        # compresses: all candles are narrow and same-direction, so their true-
+        # range is tiny.  A compressed ATR produces a dangerously tight stop.
+        # 2026-07-10 SL1: ATR compressed to 28.67, stop placed only 87 pts
+        # below mid; a 174-pt retracement immediately triggered it.
+        #
+        # Guard 1 — hard floor in price points:
+        #   effective_atr >= min_atr_floor_pts
+        # Guard 2 — recent 5-min range scaling:
+        #   effective_atr >= hi-lo over last 5 min * recent_range_atr_factor
+        # The two guards are independent maximums; either can raise the ATR.
+        atr_floor   = self._cfg.get("min_atr_floor_pts", 30.0)
+        range_factor = self._cfg.get("recent_range_atr_factor", 0.5)
+        effective_atr = atr
+        if atr < atr_floor:
+            logger.info(
+                f"[AutoTuner] ATR {atr:.2f} below floor {atr_floor:.2f} "
+                f"— clamping effective ATR to floor"
+            )
+            effective_atr = atr_floor
+        recent_stab = self._cache.compute_stability(5)
+        if recent_stab["ok"]:
+            range_atr_min = recent_stab["hi_lo"] * range_factor
+            if range_atr_min > effective_atr:
+                logger.info(
+                    f"[AutoTuner] Recent 5-min range {recent_stab['hi_lo']:.2f} "
+                    f"× {range_factor} = {range_atr_min:.2f} > effective ATR "
+                    f"{effective_atr:.2f} — raising effective ATR to {range_atr_min:.2f}"
+                )
+                effective_atr = range_atr_min
+        if effective_atr != atr:
+            logger.info(
+                f"[AutoTuner] effective_atr={effective_atr:.2f} "
+                f"(raw ATR={atr:.2f})"
+            )
+
         # ── Adaptive stop buffer ──────────────────────────────────────────────
         # If ATR has expanded sharply vs its own recent mean, widen the buffer
         # proportionally to protect against sudden volatility regime shifts.
         expansion_threshold = self._cfg.get("stop_buffer_atr_expansion_threshold", 1.5)
         max_mult            = self._cfg.get("stop_buffer_atr_max_mult", 2.0)
         recent_atrs = self._recent_atrs
-        recent_atrs.append(atr)
+        recent_atrs.append(effective_atr)
         if len(recent_atrs) > 20:          # keep last 20 builds (~20 retune events)
             recent_atrs.pop(0)
         if len(recent_atrs) >= 3:
             mean_atr = sum(recent_atrs[:-1]) / len(recent_atrs[:-1])
             if mean_atr > 0:
-                expansion_ratio = atr / mean_atr
+                expansion_ratio = effective_atr / mean_atr
                 if expansion_ratio > expansion_threshold:
                     adaptive_mult = min(expansion_ratio / expansion_threshold, max_mult)
                     old_buf = stop_buf
                     stop_buf = round(stop_buf * adaptive_mult, 2)
                     logger.info(
                         f"[AutoTuner] ATR expansion detected: "
-                        f"ATR={atr:.2f} vs mean={mean_atr:.2f} "
-                        f"(ratio={expansion_ratio:.2f}×) → "
-                        f"stop_buffer {old_buf}×ATR → {stop_buf}×ATR"
+                        f"effective_atr={effective_atr:.2f} vs mean={mean_atr:.2f} "
+                        f"(ratio={expansion_ratio:.2f}x) -> "
+                        f"stop_buffer {old_buf}xATR -> {stop_buf}xATR"
                     )
 
-        lower = round(mid - atr_mult * atr, 2)
-        upper = round(mid + atr_mult * atr, 2)
-        stop  = round(lower - stop_buf * atr, 2)
+        lower = round(mid - atr_mult * effective_atr, 2)
+        upper = round(mid + atr_mult * effective_atr, 2)
+        stop  = round(lower - stop_buf * effective_atr, 2)
 
         min_spacing = max(min_sp_pct * mid, 2.0 * maker_fee * mid * 1.5)
         raw_levels  = int((upper - lower) / min_spacing)
@@ -1976,6 +2062,7 @@ class GridAutoTuner:
         notional = self._resolve_notional(levels, mid)
         logger.info(
             f"[AutoTuner] mid={mid:.2f} ATR={atr:.2f} "
+            f"effective_atr={effective_atr:.2f} "
             f"range=[{lower:.2f},{upper:.2f}] levels={levels} "
             f"spacing={spacing:.2f} stop={stop:.2f}"
         )
@@ -3699,6 +3786,14 @@ class GridBot:
         self._last_restart_time: float = 0.0  # timestamp of the last successful auto-restart
                                                # (0.0 = no auto-restart has happened yet)
 
+        # ── BuyGate auto-calibration state ────────────────────────────────────
+        # Rolling buffer of (timestamp, score) for the last N seconds of ticks.
+        # Scanned at each SL event to find the peak pre-halt score, which is
+        # used to nudge the threshold downward via EMA.
+        self._score_history: list = []          # list of (float_ts, float_score)
+        self._calib_threshold: Optional[float] = None  # persisted calibrated threshold
+                                                        # loaded from DB on first use
+
         # ── Dead-band stop-raise: EMA damping + debounce state ────────────────
         # See _rebuild_grid()'s dead-band block. Persisted across calls since
         # the debounce timer must accumulate real wall-clock time across
@@ -4627,6 +4722,8 @@ class GridBot:
         _stop_price_at_build = new_params.stop_price
         _scorer = self._stop_scorer
 
+        _bot_ref = self   # capture for score history recording in closure
+
         def _buy_gate() -> bool:
             """Return True (allow buy) or False (suppress buy)."""
             if _scorer is None:
@@ -4635,12 +4732,22 @@ class GridBot:
             if mid_now is None:
                 return True
             score = _scorer.compute(mid_now, _stop_price_at_build)
-            threshold = self._cfg.get("stop_score_threshold", 0.6)
+            # Record score in rolling history for auto-calibration at the
+            # next SL event.  Prune entries older than lookback+60s slack so
+            # the list stays bounded without a separate housekeeping task.
+            lookback_s = _bot_ref._cfg.get("stop_score_calib_lookback_s", 120)
+            now_ts = time.time()
+            _bot_ref._score_history.append((now_ts, score))
+            cutoff = now_ts - lookback_s - 60.0
+            _bot_ref._score_history = [
+                (t, s) for t, s in _bot_ref._score_history if t >= cutoff
+            ]
+            threshold = _bot_ref._get_threshold()
             allow = score < threshold
-            # Always log at INFO (not DEBUG) so gate decisions are visible in
-            # the daily log and can be used to calibrate the threshold.
+            # Always log at INFO so gate decisions are visible in the daily
+            # log and calibration history is auditable.
             logger.info(
-                f"[BuyGate] score={score:.4f} threshold={threshold} "
+                f"[BuyGate] score={score:.4f} threshold={threshold:.4f} "
                 f"→ {'ALLOW' if allow else 'SUPPRESS'}"
             )
             return allow
@@ -4662,6 +4769,91 @@ class GridBot:
             f"{new_params.levels} levels spacing={new_params.spacing:.0f} "
             f"stop={new_params.stop_price:.0f}"
         )
+
+    # ── BuyGate auto-calibration ──────────────────────────────────────────────
+
+    def _get_threshold(self) -> float:
+        """
+        Return the active stop_score_threshold, preferring the calibrated
+        value persisted in the DB over the config default.  Loads from DB on
+        first call; subsequent calls use the in-memory cache.
+        """
+        if self._calib_threshold is not None:
+            return self._calib_threshold
+        # First call: try to load from DB
+        try:
+            raw = self._store.get_meta("bugate_threshold")
+            if raw is not None:
+                val = float(raw)
+                floor = self._cfg.get("stop_score_threshold_floor", 0.12)
+                default = self._cfg.get("stop_score_threshold", 0.25)
+                self._calib_threshold = max(floor, min(default, val))
+                logger.info(
+                    f"[BuyGate] Loaded calibrated threshold "
+                    f"{self._calib_threshold:.4f} from DB"
+                )
+                return self._calib_threshold
+        except Exception as e:
+            logger.warning(f"[BuyGate] Failed to load threshold from DB: {e}")
+        # No persisted value — use config default
+        self._calib_threshold = self._cfg.get("stop_score_threshold", 0.25)
+        return self._calib_threshold
+
+    def _calibrate_threshold(self, halt_time: float) -> None:
+        """
+        Called immediately after a stop-loss halt.  Scans _score_history for
+        the peak score observed in the lookback window before halt_time, then
+        nudges the threshold downward using an EMA update:
+            target    = peak_score * safety_margin
+            new_thr   = old_thr + alpha * (target - old_thr)
+            new_thr   = clamp(new_thr, floor, config_default)
+        Persists the result to DB so it survives restarts.
+        Logs the update at INFO so every calibration step is auditable.
+        """
+        if not self._cfg.get("stop_score_calib_enabled", True):
+            return
+        lookback_s     = self._cfg.get("stop_score_calib_lookback_s", 120)
+        safety_margin  = self._cfg.get("stop_score_calib_safety_margin", 0.90)
+        alpha          = self._cfg.get("stop_score_calib_ema_alpha", 0.40)
+        floor_thr      = self._cfg.get("stop_score_threshold_floor", 0.12)
+        default_thr    = self._cfg.get("stop_score_threshold", 0.25)
+
+        cutoff = halt_time - lookback_s
+        recent = [(ts, sc) for ts, sc in self._score_history if ts >= cutoff]
+        if not recent:
+            logger.info(
+                f"[BuyGate] Calibration skipped: no score history in last "
+                f"{lookback_s}s before halt"
+            )
+            return
+
+        peak_score = max(sc for _, sc in recent)
+        target     = peak_score * safety_margin
+        old_thr    = self._get_threshold()
+        # EMA nudge: only lower the threshold, never raise it via calibration.
+        # (Manual config edits can raise it; calibration is one-directional.)
+        if target >= old_thr:
+            logger.info(
+                f"[BuyGate] Calibration: peak_score={peak_score:.4f} "
+                f"target={target:.4f} >= current threshold={old_thr:.4f} "
+                f"— no downward adjustment needed"
+            )
+            return
+
+        new_thr = old_thr + alpha * (target - old_thr)
+        new_thr = round(max(floor_thr, min(default_thr, new_thr)), 4)
+
+        logger.info(
+            f"[BuyGate] Auto-calibration: peak_score={peak_score:.4f} "
+            f"target={target:.4f} (peak*{safety_margin}) "
+            f"threshold {old_thr:.4f} -> {new_thr:.4f} "
+            f"(alpha={alpha}, floor={floor_thr})"
+        )
+        self._calib_threshold = new_thr
+        try:
+            self._store.set_meta("bugate_threshold", str(new_thr))
+        except Exception as e:
+            logger.warning(f"[BuyGate] Failed to persist threshold: {e}")
 
     def _emergency_halt(self, mid: float):
         logger.warning(f"[GridBot] EMERGENCY HALT at mid={mid:.2f}")
@@ -4775,21 +4967,43 @@ class GridBot:
             )
             return
 
-        # Condition 2: price must be above (or within ATR noise of) the stop that
-        # triggered the halt.  We fetch ATR now so we can apply the buffer; if ATR
-        # is unavailable we fall back to the strict exact comparison.
+        # Condition 2: price must be above the (time-decayed) recovery floor.
+        # The floor starts at halt_stop - base_buffer×ATR and decays downward
+        # by decay_atr_per_hour × ATR for every hour the bot has been halted.
+        # This prevents the bot from staying halted all night when price drops
+        # below halt_stop and then stabilises at a new, lower level.
+        #
+        # 2026-07-10 SL2: halt_stop=64415, ATR=34.85, BTC dropped to 63990.
+        # Fixed floor (64398) was 408 pts above overnight price — bot never
+        # restarted.  With decay=3.0×ATR/h after 4h the floor is
+        # 64415 - (0.5 + 12) × 35 = 63977, allowing restart into the stable
+        # overnight market.
+        #
+        # The floor is also bounded below by halt_stop - max_drop_atr×ATR so
+        # it can't decay to an absurd level during very long halts.
         atr_for_buffer = _price_cache.compute_atr(self._cfg.get("atr_lookback_minutes", 1440))
-        recovery_buffer_mult = self._cfg.get("auto_restart_recovery_atr_buffer", 0.5)
+        base_buffer    = self._cfg.get("auto_restart_recovery_atr_buffer", 0.5)
+        decay_per_hour = self._cfg.get("auto_restart_recovery_floor_decay_atr_per_hour", 3.0)
+        max_drop_atr   = self._cfg.get("auto_restart_recovery_floor_min_atr", 15.0)
+        hours_halted   = elapsed / 3600.0
+
         if atr_for_buffer and atr_for_buffer > 0:
-            recovery_floor = self._halt_stop_price - recovery_buffer_mult * atr_for_buffer
+            total_buffer   = base_buffer + decay_per_hour * hours_halted
+            total_buffer   = min(total_buffer, max_drop_atr)   # cap the decay
+            recovery_floor = self._halt_stop_price - total_buffer * atr_for_buffer
         else:
             recovery_floor = self._halt_stop_price   # strict fallback
 
         if mid <= recovery_floor:
+            if atr_for_buffer and atr_for_buffer > 0:
+                buf_note = (f"buffer={base_buffer:.1f}+{decay_per_hour:.1f}"
+                            f"x{hours_halted:.1f}h={total_buffer:.2f}xATR={atr_for_buffer:.2f}")
+            else:
+                buf_note = "ATR unavailable"
             logger.info(
-                f"[AutoRestart] Price {mid:.2f} still at/below recovery floor "
-                f"{recovery_floor:.2f} (halt stop={self._halt_stop_price:.2f} "
-                f"buffer={recovery_buffer_mult}×ATR={(atr_for_buffer or 0):.2f}) — waiting"
+                f"[AutoRestart] Price {mid:.2f} still below recovery floor "
+                f"{recovery_floor:.2f} (halt_stop={self._halt_stop_price:.2f} "
+                f"halted={hours_halted:.1f}h {buf_note}) — waiting"
             )
             return
 
@@ -4854,7 +5068,8 @@ class GridBot:
         below_halt_stop = mid < self._halt_stop_price
         recovery_note = (
             f"mid={mid:.2f} < halt_stop={self._halt_stop_price:.2f} but > "
-            f"recovery_floor={recovery_floor:.2f} (buffered recovery)"
+            f"recovery_floor={recovery_floor:.2f} "
+            f"(halted {hours_halted:.1f}h, decayed floor)"
             if below_halt_stop else
             f"mid={mid:.2f} >= halt_stop={self._halt_stop_price:.2f}"
         )
@@ -4928,8 +5143,8 @@ class GridBot:
         if self._stop_scorer is not None and self._params is not None:
             mid_now = _price_cache.get_mid() or 0.0
             score   = self._stop_scorer.compute(mid_now, self._params.stop_price)
-            thr     = self._cfg.get("stop_score_threshold",        0.6)
-            res_thr = self._cfg.get("stop_score_resume_threshold", 0.35)
+            thr     = self._get_threshold()
+            res_thr = self._cfg.get("stop_score_resume_threshold", 0.10)
             if score >= thr:
                 score_icon = "🔴"
             elif score >= res_thr:
