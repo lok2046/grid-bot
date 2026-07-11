@@ -1672,7 +1672,7 @@ class _ReconnectingWS:
 
 class PriceCache:
     """Thread-safe L1 cache + rolling tick history for ATR computation."""
-    HISTORY_WINDOW_S = 86400   # keep 24h
+    HISTORY_WINDOW_S = 97200   # keep 27h — must exceed trend_signal_min_history_h (26h)
 
     def __init__(self):
         self._lock    = threading.Lock()
@@ -3637,9 +3637,9 @@ class GridStateStore:
           t+45s -> low
           t+59s -> close
 
-        Only rows within the last max_age_hours are returned; stale data
-        older than the PriceCache.HISTORY_WINDOW_S (24h) window would be
-        evicted by the deque anyway so there's no point loading it.
+        Only rows within the last max_age_hours are returned.
+        max_age_hours is capped to HISTORY_WINDOW_S // 3600 (27h) so we
+        never load more than the deque can hold.
 
         Returns an empty list if the table is empty (fresh DB).
         """
@@ -3892,8 +3892,8 @@ class GridBot:
 
         Ticks are merged with any live ticks that Phase 1 already deposited,
         sorted in chronological order, and capped to the deque's maxlen (30000).
-        Only ticks within PriceCache.HISTORY_WINDOW_S (24h) are loaded to
-        match the deque's eviction policy.
+        Only ticks within PriceCache.HISTORY_WINDOW_S (27h) are loaded to
+        match the deque's retention window.
         """
         ticks = self._store.load_candles(
             max_age_hours=min(27, _price_cache.HISTORY_WINDOW_S // 3600)
