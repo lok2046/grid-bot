@@ -499,6 +499,12 @@ GRID_CONFIG: dict = {
     }[TRADING_MODE],
 
     # ── WebSocket tuning ──────────────────────────────────────────────────────
+    # Reconnect flood alert: send a Telegram alert when the WS reconnects
+    # more than ws_reconnect_alert_count times within ws_reconnect_alert_window_s
+    # seconds.  Helps catch persistent upstream feed instability before it
+    # causes missed fills or stale price decisions.
+    "ws_reconnect_alert_count":    3,     # alert threshold (reconnects in window)
+    "ws_reconnect_alert_window_s": 300,   # rolling window in seconds (default 5 min)
     "ws_stale_threshold_s":   20,
     "ws_reconnect_backoff_s":  2,
     "ws_max_backoff_s":       60,
@@ -1498,7 +1504,8 @@ class _ReconnectingWS:
                  subscribe_msg_fn: Callable[[], List[dict]],
                  on_message_fn: Callable[[dict], None],
                  stale_s: float, backoff_init: float, backoff_max: float,
-                 stop_event: threading.Event) -> None:
+                 stop_event: threading.Event,
+                 on_reconnect_fn: Optional[Callable[[], None]] = None) -> None:
         self._name             = name
         self._url              = url
         self._subscribe_msg_fn = subscribe_msg_fn
@@ -1507,6 +1514,11 @@ class _ReconnectingWS:
         self._backoff_init     = backoff_init
         self._backoff_max      = backoff_max
         self._stop             = stop_event
+        # Optional callback fired on every successful reconnect (after the
+        # first connect).  Used by GridBot to detect reconnect floods and
+        # send a Telegram alert when the rate exceeds configured thresholds.
+        self._on_reconnect_fn: Optional[Callable[[], None]] = on_reconnect_fn
+        self._first_connect_done = False
 
         self._gen_lock  = threading.Lock()
         self._gen       = 0
@@ -1651,6 +1663,13 @@ class _ReconnectingWS:
             self._connect_time = time.time()
         with self._last_msg_lock:
             self._last_msg_time = time.time()
+        # Fire reconnect callback for gen > 1 (skip the very first connect).
+        if self._first_connect_done and self._on_reconnect_fn is not None:
+            try:
+                self._on_reconnect_fn()
+            except Exception as e:
+                logger.warning(f"[{self._name}] on_reconnect_fn error: {e}")
+        self._first_connect_done = True
         time.sleep(1.0)
         for msg in self._subscribe_msg_fn():
             ws.send(json.dumps(msg))
@@ -2192,6 +2211,16 @@ class GridEngine:
         # so the accumulated long starts at 0 and grows as BUY fills come in.
         self._long_qty: float = 0.0
 
+        # Track client_oids of SELL orders placed at grid startup (_place_initial_orders).
+        # These SELLs have no corresponding BUY fill in this session — they are the
+        # initial resting asks placed above mid, not exits from a real long position.
+        # When they fill, _long_qty must NOT be decremented (there is nothing to close).
+        # Without this guard, startup SELLs filling before their counter-BUYs makes
+        # _long_qty go negative, which shows "short=" in the Status line even though
+        # no actual short exists.
+        self._initial_sell_oids: set = set()
+        self._placing_initial:   bool = False   # True only during _place_initial_orders
+
         # Fill queue for _fill_thread
         self._fill_queue: collections.deque = collections.deque()
         self._fill_event  = threading.Event()
@@ -2230,14 +2259,18 @@ class GridEngine:
     def _place_initial_orders(self, mid: float):
         with self._lock:
             levels = list(self._levels)
-        for lv in levels:
-            if self._stop_event.is_set():
-                break
-            if lv.price < mid:
-                self._place_buy(lv)
-            elif lv.price > mid:
-                self._place_sell(lv)
-            time.sleep(0.05)
+        self._placing_initial = True
+        try:
+            for lv in levels:
+                if self._stop_event.is_set():
+                    break
+                if lv.price < mid:
+                    self._place_buy(lv)
+                elif lv.price > mid:
+                    self._place_sell(lv)
+                time.sleep(0.05)
+        finally:
+            self._placing_initial = False
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -2272,6 +2305,9 @@ class GridEngine:
             lv.client_oid = req.client_oid
             lv.qty        = qty
             lv.placed_at  = time.time()
+            # Mark as an initial sell so _on_fill skips the long_qty decrement.
+            if self._placing_initial:
+                self._initial_sell_oids.add(req.client_oid)
         self._oms.submit(req)
         logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
 
@@ -2588,7 +2624,19 @@ class GridEngine:
             if sell_lv is not None:
                 self._place_sell(sell_lv)
         else:
-            self._long_qty -= fill.filled_qty
+            # Skip long_qty decrement for SELLs placed at grid startup.
+            # Those orders were placed above mid before any BUY fill existed in
+            # this session — decrementing would drive long_qty negative ("short=")
+            # even though no real short position exists.
+            is_initial_sell = fill.client_oid in self._initial_sell_oids
+            if is_initial_sell:
+                self._initial_sell_oids.discard(fill.client_oid)
+                logger.debug(
+                    f"[GridEngine] SELL [{idx}] @ {fill.avg_price:.2f} is an initial"
+                    f" sell — skipping long_qty decrement (was {self._long_qty:.4f})"
+                )
+            else:
+                self._long_qty -= fill.filled_qty
             buy_price = self._get_paired_buy_price(idx)
             gross_pnl = (fill.avg_price - buy_price) * fill.filled_qty if buy_price else 0.0
             self._realized_pnl += gross_pnl
@@ -3850,6 +3898,10 @@ class GridBot:
 
         # WS market feed
         self._ws_stop = threading.Event()
+        # Rolling deque of reconnect timestamps for flood detection.
+        # Kept on GridBot (not _ReconnectingWS) so alerting and config live in one place.
+        self._ws_reconnect_times: collections.deque = collections.deque()
+
         self._market_ws = _ReconnectingWS(
             name             = "MarketWS",
             url              = config.get("ws_market_url", "wss://stream.crypto.com/exchange/v1/market"),
@@ -3859,6 +3911,7 @@ class GridBot:
             backoff_init     = config.get("ws_reconnect_backoff_s", 2),
             backoff_max      = config.get("ws_max_backoff_s", 60),
             stop_event       = self._ws_stop,
+            on_reconnect_fn  = self._on_ws_reconnect,
         )
 
     # ── WS subscriptions ──────────────────────────────────────────────────────
@@ -3882,6 +3935,55 @@ class GridBot:
             ask = t.get("k")
             if bid and ask:
                 _price_cache.update_l1(float(bid), float(ask))
+
+    # ── WS reconnect flood detection ─────────────────────────────────────────
+
+    def _on_ws_reconnect(self) -> None:
+        """
+        Called by _ReconnectingWS._on_open() on every reconnect after the first.
+        Maintains a rolling deque of reconnect timestamps and fires a Telegram
+        alert when the reconnect rate exceeds ws_reconnect_alert_count events
+        within ws_reconnect_alert_window_s seconds.
+
+        The alert fires ONCE when the threshold is first crossed, then rearms
+        after the window rolls clear, preventing alert spam during a sustained
+        outage while still notifying on the next flood if it recurs.
+        """
+        now      = time.time()
+        window_s = self._cfg.get("ws_reconnect_alert_window_s", 300)
+        threshold = self._cfg.get("ws_reconnect_alert_count", 3)
+
+        self._ws_reconnect_times.append(now)
+        # Prune events outside the rolling window
+        cutoff = now - window_s
+        while self._ws_reconnect_times and self._ws_reconnect_times[0] < cutoff:
+            self._ws_reconnect_times.popleft()
+
+        count = len(self._ws_reconnect_times)
+        logger.info(
+            f"[MarketWS] Reconnect #{count} in last {window_s:.0f}s "
+            f"(threshold={threshold})"
+        )
+
+        if count >= threshold:
+            # Only alert on the exact threshold crossing, not every subsequent
+            # reconnect within the same flood, to avoid repeated Telegram messages.
+            if count == threshold:
+                logger.warning(
+                    f"[MarketWS] Reconnect flood: {count} reconnects in "
+                    f"{window_s:.0f}s — sending alert"
+                )
+                window_min = int(window_s / 60)
+                self._alerter.send(
+                    f"⚠️ MarketWS reconnect flood: {count} reconnects in "
+                    f"{window_min}min\n"
+                    f"Check upstream CDC WebSocket feed stability."
+                )
+            else:
+                logger.warning(
+                    f"[MarketWS] Reconnect flood continuing: {count} in "
+                    f"{window_s:.0f}s (alert already sent)"
+                )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
