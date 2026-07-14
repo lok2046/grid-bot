@@ -697,6 +697,25 @@ logger = _init_logging(GRID_CONFIG)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Security: Telegram bot tokens live in the URL path itself (api.telegram.org/
+# bot<TOKEN>/method), so any exception or response string that echoes the URL
+# (connection errors, timeouts, HTTP error bodies) leaks the token straight
+# into logs. Every Telegram call site below scrubs its own known token out of
+# whatever it logs, via this helper, before the message reaches `logger`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _redact_secret(text: str, *secrets: str) -> str:
+    """Replace any occurrence of a known secret substring with a placeholder
+    before it is logged. Plain substring replacement (not regex) since the
+    exact secret value is known at the call site — no risk of over/under
+    matching unrelated content."""
+    for s in secrets:
+        if s:
+            text = text.replace(s, "***REDACTED***")
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Telegram AlertManager  (copied from funding_arb/alerting.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -760,7 +779,8 @@ class AlertManager:
                     time.sleep(ra)
                     continue
             except Exception as e:
-                logger.warning(f"[AlertManager] attempt {attempt} error: {e}")
+                logger.warning(f"[AlertManager] attempt {attempt} error: "
+                                f"{_redact_secret(str(e), self._token)}")
             if attempt < self._MAX_RETRIES:
                 time.sleep(self._RETRY_DELAY)
         logger.error("[AlertManager] failed to deliver after retries")
@@ -834,7 +854,8 @@ class TelegramCommandPoller:
                 for update in updates:
                     self._dispatch(update)
             except Exception as e:
-                logger.error(f"[TgPoller] Unexpected error in poll loop: {e}", exc_info=True)
+                logger.error(f"[TgPoller] Unexpected error in poll loop: "
+                             f"{_redact_secret(str(e), self._token)}", exc_info=True)
                 time.sleep(self._RETRY_DELAY)
 
     def _get_updates(self) -> Optional[list]:
@@ -854,7 +875,8 @@ class TelegramCommandPoller:
                 self._offset = updates[-1]["update_id"] + 1
             return updates
         except requests.RequestException as e:
-            logger.warning(f"[TgPoller] getUpdates request error: {e}")
+            logger.warning(f"[TgPoller] getUpdates request error: "
+                            f"{_redact_secret(str(e), self._token)}")
             return None
 
     def _dispatch(self, update: dict) -> None:
@@ -899,9 +921,11 @@ class TelegramCommandPoller:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code != 200:
-                logger.warning(f"[TgPoller] sendMessage failed: {resp.text[:200]}")
+                logger.warning(f"[TgPoller] sendMessage failed: "
+                                f"{_redact_secret(resp.text[:200], self._token)}")
         except requests.RequestException as e:
-            logger.warning(f"[TgPoller] sendMessage error: {e}")
+            logger.warning(f"[TgPoller] sendMessage error: "
+                            f"{_redact_secret(str(e), self._token)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1742,12 +1766,35 @@ class PriceCache:
     """Thread-safe L1 cache + rolling tick history for ATR computation."""
     HISTORY_WINDOW_S = 97200   # keep 27h — must exceed trend_signal_min_history_h (26h)
 
+    # BUGFIX (2026-07-14): _history previously used maxlen=30000 as a hard
+    # count-based cap alongside the HISTORY_WINDOW_S time-based cutoff below.
+    # update_l1() is called on every raw WS tick (not once/minute), so on an
+    # active feed the 30000-item cap was reached in well under 27h — e.g. at
+    # ~1 tick/sec, 30000 ticks only covers ~8.3h. Once the cap bound, deque's
+    # automatic maxlen eviction silently dropped the OLDEST entries (the very
+    # DB/REST-seeded history that gave TrendSignal its 26h+ warmup) regardless
+    # of whether they were actually older than HISTORY_WINDOW_S. This is what
+    # caused TrendSignal to fall back into INSUFFICIENT_DATA hours after a
+    # successful warmup, and to get progressively worse during high-volatility
+    # periods (more WS ticks/min -> the fixed tick budget covers even less
+    # wall-clock time).
+    #
+    # Fix: size the cap for a realistic worst-case sustained tick rate so the
+    # time-based cutoff (popleft loop below) is what actually governs
+    # retention, and the count cap only exists as a memory safety ceiling.
+    # ~10 ticks/sec sustained for the full 27h window = 27*3600*10 = 972,000.
+    # Round up with headroom. At ~50 bytes/tuple this is well under 100MB.
+    # If [PriceCache] "_history near maxlen cap" warnings ever appear in the
+    # logs, raise this further and/or investigate an unexpectedly high tick
+    # rate from the WS feed.
+    MAX_TICKS = 1_200_000
+
     def __init__(self):
         self._lock    = threading.Lock()
         self._bid: Optional[float] = None
         self._ask: Optional[float] = None
         self._mid: Optional[float] = None
-        self._history: collections.deque = collections.deque(maxlen=30000)
+        self._history: collections.deque = collections.deque(maxlen=self.MAX_TICKS)
 
     def update_l1(self, bid: float, ask: float):
         with self._lock:
@@ -1759,6 +1806,19 @@ class PriceCache:
             cutoff = now - self.HISTORY_WINDOW_S
             while self._history and self._history[0][0] < cutoff:
                 self._history.popleft()
+            # Safety-net visibility: if we're anywhere near the count cap,
+            # the time-based cutoff above is no longer the binding constraint
+            # and we're at risk of silently losing history again. This should
+            # never fire under MAX_TICKS's sizing assumptions; if it does,
+            # the WS feed's tick rate is higher than provisioned for.
+            if len(self._history) >= self._history.maxlen - 1000:
+                oldest_age_h = (now - self._history[0][0]) / 3600.0
+                logger.warning(
+                    f"[PriceCache] _history near maxlen cap "
+                    f"({len(self._history)}/{self._history.maxlen}) — "
+                    f"oldest tick age={oldest_age_h:.2f}h "
+                    f"(expected ~27h; count cap may be evicting before time cutoff)"
+                )
 
     def get_mid(self) -> Optional[float]:
         with self._lock:
@@ -4132,7 +4192,11 @@ class GridBot:
         if not ticks:
             return
         n = self._store.save_candles(ticks)
-        logger.debug(f"[GridBot] Candle snapshot: {n} buckets written to DB")
+        span_h = (ticks[-1][0] - ticks[0][0]) / 3600.0 if len(ticks) > 1 else 0.0
+        logger.debug(
+            f"[GridBot] Candle snapshot: {n} buckets written to DB "
+            f"(in-memory span={span_h:.1f}h)"
+        )
 
     # ── ATR seeding from REST historical candles ──────────────────────────────
 
