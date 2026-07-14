@@ -5440,24 +5440,21 @@ class GridBot:
             "━━━━━━━━━━━━━━━━━━━━━",
             f"*2️⃣  Daily PnL* (today {today['hkt_date']} HKT)",
             f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD` (`{_pct(daily_net)}`)",
-            f"  • Gross: `{today['gross_pnl_usd']:+.4f}`  Fees: `{today['fees_usd']:+.4f}`",
-            # Only inserted when a stop-loss occurred today — no blank line otherwise.
-            *(
-                [f"  🚨 Stop-loss: `{daily_sl:+.4f} USD` ({daily_sl_n}× today, included in gross)"]
-                if daily_sl_n > 0 else []
-            ),
+            f"  • Gross: `{today['gross_pnl_usd']:+.4f}`"
+            + (f" _(incl. 🚨SL `{daily_sl:+.4f}` ×{daily_sl_n})_" if daily_sl_n > 0 else "")
+            + f"  Fees: `{today['fees_usd']:+.4f}`"
+            + (f" _({abs(today['fees_usd']) / today['gross_pnl_usd'] * 100:.1f}% of gross)_"
+               if today['gross_pnl_usd'] != 0 else ""),
             f"  • Cycles today: `{today['cycle_count']}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
             "*3️⃣  Accumulated PnL* (all-time from DB)",
             f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD` (`{_pct(acc_net)}`)",
-            f"  • Gross realised: `{acc_gross:+.4f} USD`",
-            f"  • Total fees:     `{acc_fees:+.4f} USD`",
-            # Only inserted when at least one stop-loss is on record — no blank line otherwise.
-            *(
-                [f"  • Stop-loss losses: `{acc_sl:+.4f} USD` ({acc_sl_n}× total, included in gross)"]
-                if acc_sl_n > 0 else []
-            ),
+            f"  • Gross realised: `{acc_gross:+.4f} USD`"
+            + (f" _(incl. 🚨SL `{acc_sl:+.4f}` ×{acc_sl_n})_" if acc_sl_n > 0 else ""),
+            f"  • Total fees:     `{acc_fees:+.4f} USD`"
+            + (f" _({abs(acc_fees) / acc_gross * 100:.1f}% of gross)_"
+               if acc_gross != 0 else ""),
             f"  • Total cycles:   `{acc_cycles}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
