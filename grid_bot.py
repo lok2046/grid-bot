@@ -175,10 +175,30 @@ GRID_CONFIG: dict = {
     "atr_lookback_minutes": 1440,      # 1-day lookback for ATR
     "atr_multiplier":       3.0,       # range = mid ± N×ATR
     "min_grid_pct":         0.0008,    # min grid spacing as fraction of price
+                                       # (overridden at runtime by SpacingAutoTuner
+                                       # if spacing_autotune_enabled and a persisted
+                                       # value exists — see load_persisted())
     "max_grid_levels":      50,
     "min_grid_levels":      5,
     "retune_interval_hours": 24,
     "retune_deadband_pct":  0.10,      # skip re-tune if range shifts < 10%
+
+    # ── Spacing auto-tuner ────────────────────────────────────────────────────
+    # Periodically widens/narrows min_grid_pct to hold the fee/gross ratio near
+    # a target, without letting cycle frequency collapse. See SpacingAutoTuner.
+    # 2026-07-15: introduced after observing fee/gross stuck at ~25% because
+    # min_grid_pct (0.0008) was the binding floor on spacing: with a fixed
+    # maker_fee_rate, fee/gross ≈ 2 × maker_fee_rate / min_grid_pct, so widening
+    # spacing is the only lever available to reduce the ratio.
+    "spacing_autotune_enabled":            False,  # opt-in; enable once comfortable
+    "spacing_autotune_target_fee_pct":     0.15,   # target fee/gross ratio
+    "spacing_autotune_band":               0.05,   # +/- hysteresis band around target
+    "spacing_autotune_step":               0.0002, # min_grid_pct adjustment per eval
+    "spacing_autotune_min_pct":            0.0008, # never tighten below the original default
+    "spacing_autotune_max_pct":            0.0025, # safety ceiling (~10% fee/gross at max)
+    "spacing_autotune_eval_days":          3,      # trailing complete days used per evaluation
+    "spacing_autotune_interval_h":         24,     # how often to re-evaluate
+    "spacing_autotune_min_cycles_per_day": 30,     # floor — below this after a widen, back off
 
     # ── Dead-band stop-raise: risk-adaptive gating ────────────────────────────
     # When a dead-band retune wants to raise the in-place stop (see
@@ -2189,6 +2209,193 @@ class GridAutoTuner:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Spacing auto-tuner
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SpacingAutoTuner:
+    """
+    Periodically adjusts GRID_CONFIG['min_grid_pct'] to hold the fee/gross
+    ratio near a target, without letting cycle frequency collapse.
+
+    Background (2026-07-15): with maker_fee_rate fixed by the exchange,
+    fee/gross ratio ≈ 2 × maker_fee_rate / spacing_pct, and GridAutoTuner packs
+    in levels up to the min_grid_pct floor — so actual spacing tracks
+    min_grid_pct almost exactly. Widening min_grid_pct is the only lever that
+    reduces the fee/gross ratio; there is no independent knob for fee drag.
+    The tradeoff: too-wide spacing means quiet/choppy periods where price
+    oscillates within one spacing band produce *zero* cycles instead of just
+    fewer, so cycle frequency is tracked as a guard rail, not just a side
+    metric.
+
+    Evaluation (once per spacing_autotune_interval_h, default 24h):
+      - Looks at the trailing spacing_autotune_eval_days of *complete* HKT
+        days from daily_pnl (today's partial day is always excluded).
+      - fee/gross above target+band, and no prior widening has just tanked
+        cycle frequency  -> step min_grid_pct UP by spacing_autotune_step
+        (wider spacing, fewer/fatter cycles).
+      - cycles/day has fallen below spacing_autotune_min_cycles_per_day since
+        the last UP step  -> step back DOWN — spacing likely overshot the
+        point where typical intraday chop still spans a full grid step.
+      - fee/gross below target-band  -> step DOWN (recover trade frequency
+        if fees are already comfortably low).
+      - otherwise within the target band  -> hold.
+
+    All steps are bounded to [spacing_autotune_min_pct, spacing_autotune_max_pct].
+    The tuned value is persisted via GridStateStore.set_meta() so it survives
+    restarts instead of resetting to the hardcoded config default.
+    """
+    META_KEY = "auto_tuned_min_grid_pct"
+
+    def __init__(self, config: dict, store: "GridStateStore", alerter: "AlertManager"):
+        self._cfg     = config
+        self._store   = store
+        self._alerter = alerter
+        self._last_eval_ts: float = 0.0
+        # cycles/day observed at the time of the most recent UP step, so the
+        # NEXT evaluation can tell whether that step caused a collapse.
+        self._cycles_after_last_widen: Optional[float] = None
+        # Set to True when _evaluate changes min_grid_pct; cleared by
+        # GridBot._run() via pop_rebuild_requested() so the new spacing takes
+        # effect immediately rather than waiting for the next natural retune.
+        self._rebuild_requested: bool = False
+
+    def load_persisted(self) -> None:
+        """Restore a previously auto-tuned min_grid_pct on startup, if any.
+        Call this once, before the first _rebuild_grid(), so the very first
+        grid build already uses the tuned value instead of the raw config
+        default."""
+        if self._store is None:
+            return
+        val = self._store.get_meta(self.META_KEY)
+        if val is None:
+            return
+        try:
+            pct = float(val)
+        except (TypeError, ValueError):
+            logger.warning(f"[SpacingAutoTuner] Ignoring unparseable persisted "
+                            f"value: {val!r}")
+            return
+        floor = self._cfg.get("spacing_autotune_min_pct", 0.0008)
+        ceil  = self._cfg.get("spacing_autotune_max_pct", 0.0025)
+        clamped = max(floor, min(ceil, pct))
+        self._cfg["min_grid_pct"] = clamped
+        logger.info(
+            f"[SpacingAutoTuner] Restored persisted min_grid_pct="
+            f"{clamped:.5f} ({clamped*100:.3f}%) from previous auto-tune"
+            + ("" if clamped == pct else f" (clamped from {pct:.5f})")
+        )
+
+    def pop_rebuild_requested(self) -> bool:
+        """Return True (and clear the flag) if _evaluate changed min_grid_pct
+        since the last call.  Called by GridBot._run() immediately after
+        maybe_evaluate() so the new spacing takes effect on the next grid build
+        rather than waiting for the next natural retune."""
+        v, self._rebuild_requested = self._rebuild_requested, False
+        return v
+
+    def maybe_evaluate(self) -> None:
+        """Called from GridBot._run()'s periodic-task section. No-ops unless
+        spacing_autotune_enabled and the interval has elapsed."""
+        if not self._cfg.get("spacing_autotune_enabled", False):
+            return
+        if self._store is None:
+            return
+        interval_s = self._cfg.get("spacing_autotune_interval_h", 24) * 3600
+        now = time.time()
+        if now - self._last_eval_ts < interval_s:
+            return
+        self._last_eval_ts = now
+        try:
+            self._evaluate(now)
+        except Exception:
+            logger.exception("[SpacingAutoTuner] Evaluation failed — leaving "
+                              "min_grid_pct unchanged")
+
+    def _evaluate(self, now: float) -> None:
+        eval_days = self._cfg.get("spacing_autotune_eval_days", 3)
+        rows = self._store.get_recent_daily(days=eval_days + 1)  # +1: today may be in the slice
+        today = _db_hkt_date(now)
+        rows = [r for r in rows if r["hkt_date"] != today]        # exclude partial day
+        rows = rows[:eval_days]
+        if len(rows) < eval_days:
+            logger.info(
+                f"[SpacingAutoTuner] Only {len(rows)}/{eval_days} complete "
+                f"days of history available — skipping this evaluation"
+            )
+            return
+
+        total_gross    = sum(r["gross_pnl_usd"] for r in rows)
+        total_fees     = sum(abs(r["fees_usd"])  for r in rows)
+        total_cycles   = sum(r["cycle_count"]     for r in rows)
+        cycles_per_day = total_cycles / len(rows)
+
+        if total_gross <= 0:
+            logger.info(
+                f"[SpacingAutoTuner] Non-positive gross over trailing "
+                f"{len(rows)}d (${total_gross:.2f}) — skipping evaluation "
+                f"(ratio undefined)"
+            )
+            return
+
+        fee_ratio  = total_fees / total_gross
+        target     = self._cfg.get("spacing_autotune_target_fee_pct", 0.15)
+        band       = self._cfg.get("spacing_autotune_band", 0.05)
+        step       = self._cfg.get("spacing_autotune_step", 0.0002)
+        floor      = self._cfg.get("spacing_autotune_min_pct", 0.0008)
+        ceil       = self._cfg.get("spacing_autotune_max_pct", 0.0025)
+        min_cycles = self._cfg.get("spacing_autotune_min_cycles_per_day", 30)
+        current    = self._cfg.get("min_grid_pct", floor)
+
+        logger.info(
+            f"[SpacingAutoTuner] Eval over {len(rows)}d "
+            f"({rows[-1]['hkt_date']}..{rows[0]['hkt_date']}): "
+            f"fee/gross={fee_ratio:.1%} (target={target:.0%}±{band:.0%}) "
+            f"cycles/day={cycles_per_day:.1f} "
+            f"current min_grid_pct={current:.5f} ({current*100:.3f}%)"
+        )
+
+        new_pct, reason = current, None
+
+        # Back-off check takes priority: did the last widening step visibly
+        # tank cycle frequency? If so, undo part of it before considering
+        # whether fee_ratio still looks "too high" (it will, transiently).
+        if (self._cycles_after_last_widen is not None
+                and cycles_per_day < min_cycles
+                and current > floor):
+            new_pct = max(floor, round(current - step, 6))
+            reason = (f"cycles/day={cycles_per_day:.1f} < floor {min_cycles} "
+                       f"after prior widening — backing off")
+            self._cycles_after_last_widen = None
+        elif fee_ratio > target + band and current < ceil:
+            new_pct = min(ceil, round(current + step, 6))
+            reason = f"fee/gross {fee_ratio:.1%} above target+band — widening spacing"
+        elif fee_ratio < target - band and current > floor:
+            new_pct = max(floor, round(current - step, 6))
+            reason = f"fee/gross {fee_ratio:.1%} below target-band — tightening spacing"
+
+        if new_pct == current:
+            logger.info(f"[SpacingAutoTuner] No change ({reason or 'within target band'})")
+            return
+
+        self._cfg["min_grid_pct"] = new_pct
+        self._store.set_meta(self.META_KEY, str(new_pct))
+        self._rebuild_requested = True
+        if new_pct > current:
+            self._cycles_after_last_widen = cycles_per_day
+        logger.info(
+            f"[SpacingAutoTuner] ADJUST min_grid_pct {current:.5f} -> "
+            f"{new_pct:.5f} ({reason})"
+        )
+        if self._alerter is not None:
+            self._alerter.send(
+                f"⚙️ Spacing auto-tune: min_grid_pct "
+                f"{current*100:.3f}% → {new_pct*100:.3f}%\n{reason}\n"
+                f"(fee/gross={fee_ratio:.1%}, cycles/day={cycles_per_day:.1f}, "
+                f"over trailing {len(rows)}d)"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Grid level state
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3931,6 +4138,7 @@ class GridBot:
         # Opened once here and shared with every GridEngine instance so that
         # fills survive restarts, re-tunes, and stop-loss rebuilds.
         self._store = GridStateStore(config.get("db_path", "grid_bot.db"))
+        self._spacing_tuner = SpacingAutoTuner(config, self._store, self._alerter)
 
         if reset_state:
             # Fresh-start requested via --reset-state: wipe fill history, daily
@@ -4132,6 +4340,7 @@ class GridBot:
         logger.info("[GridBot] Warmup complete")
         self._alerter.send(f"🟢 GridBot started — {TRADING_MODE.upper()} | {INSTRUMENT}")
 
+        self._spacing_tuner.load_persisted()
         self._rebuild_grid()
         self._run()
 
@@ -4148,9 +4357,9 @@ class GridBot:
         top-up that _seed_atr_from_rest performs.
 
         Ticks are merged with any live ticks that Phase 1 already deposited,
-        sorted in chronological order, and capped to the deque's maxlen (30000).
-        Only ticks within PriceCache.HISTORY_WINDOW_S (27h) are loaded to
-        match the deque's retention window.
+        sorted in chronological order, and capped to the deque's maxlen
+        (PriceCache.MAX_TICKS). Only ticks within PriceCache.HISTORY_WINDOW_S
+        (27h) are loaded to match the deque's retention window.
         """
         ticks = self._store.load_candles(
             max_age_hours=min(27, _price_cache.HISTORY_WINDOW_S // 3600)
@@ -4164,7 +4373,12 @@ class GridBot:
             merged   = ticks + existing
             merged.sort(key=lambda x: x[0])
             _price_cache._history.clear()
-            for item in merged[-30000:]:
+            # BUGFIX (2026-07-14): this used to hardcode [-30000:], silently
+            # re-imposing the old undersized cap on every restart even after
+            # PriceCache.MAX_TICKS was raised. Use the deque's actual maxlen
+            # so the two stay in sync by construction.
+            cap = _price_cache._history.maxlen or len(merged)
+            for item in merged[-cap:]:
                 _price_cache._history.append(item)
 
         n_buckets = _price_cache.atr_candle_count(
@@ -4460,6 +4674,13 @@ class GridBot:
             if now - self._last_candle_save > self.CANDLE_SAVE_INTERVAL_S:
                 self._last_candle_save = now
                 self._save_candles_to_db()
+
+            # Periodic spacing auto-tune — no-ops internally unless
+            # spacing_autotune_enabled and its own interval has elapsed.
+            self._spacing_tuner.maybe_evaluate()
+            if self._spacing_tuner.pop_rebuild_requested():
+                logger.info("[GridBot] Spacing auto-tune changed min_grid_pct — rebuilding grid")
+                self._rebuild_grid()
 
             time.sleep(0.1)
 
