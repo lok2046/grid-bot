@@ -528,6 +528,11 @@ GRID_CONFIG: dict = {
     "ws_stale_threshold_s":   20,
     "ws_reconnect_backoff_s":  2,
     "ws_max_backoff_s":       60,
+    # Blue-green deployment: how long green waits for blue to export its snapshot
+    # before falling back to a cold start.  Should be well above the time blue
+    # needs to freeze + write JSON (typically < 1s), but short enough that a
+    # dead blue process doesn't stall green's startup.
+    "bg_handoff_timeout_s":   10,
     # Minimum seconds to wait for the first live price tick (Phase 1 warmup).
     # Phase 2 waits separately inside start() until compute_atr() returns a
     # valid value (MIN_ATR_CANDLES=30 one-minute candles, ~30 min wall time).
@@ -665,7 +670,14 @@ _listener:    Optional[_SafeQueueListener] = None
 _file_handler: Optional[_HKTDailyRotatingHandler] = None
 
 
-def _init_logging(config: dict) -> logging.Logger:
+def _init_logging(config: dict, role: str = "") -> logging.Logger:
+    """
+    Initialise async queue-based logging.
+
+    role: if non-empty ("blue" or "green"), log files are named
+          grid_bot_{role}_YYYY-MM-DD.log instead of grid_bot_YYYY-MM-DD.log
+          so that blue and green processes write to separate files.
+    """
     global _listener, _file_handler
     log_dir      = config.get("log_dir", "logs_grid")
     backup_count = config.get("log_backup_count", 30)
@@ -673,7 +685,9 @@ def _init_logging(config: dict) -> logging.Logger:
     fmt          = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                                      datefmt="%Y-%m-%d %H:%M:%S")
 
-    _file_handler = _HKTDailyRotatingHandler(log_dir, backup_count=backup_count)
+    base_name = f"grid_bot_{role}" if role else "grid_bot"
+    _file_handler = _HKTDailyRotatingHandler(log_dir, base_name=base_name,
+                                              backup_count=backup_count)
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(fmt)
 
@@ -1198,6 +1212,61 @@ class OMS:
 
         if req.exec_inst:
             self._maker_timeout_handler(req.client_oid, exchange_id, req)
+
+    def get_exchange_id(self, client_oid: str) -> str:
+        """Return the exchange order-id for a given client_oid, or '' if not known."""
+        with self._orders_lock:
+            order = self._orders.get(client_oid)
+            return order.exchange_id if order else ""
+
+    def restore_order(self, client_oid: str, exchange_id: str, req: "OrderRequest") -> None:
+        """
+        Re-register a live order that was placed by a previous process (blue)
+        into this OMS instance (green) so that incoming WS fill events are
+        routed correctly to the right GridLevel.
+
+        IMPORTANT: this must set up the same bookkeeping submit() does — both
+        the _orders/_exid_to_coid mapping AND the _fill_queues entry. Without
+        the fill queue, wait_fill() (polled by GridEngine._poll_live_fills())
+        and _deliver_fill() (called from the WS handler) both silently no-op
+        for this client_oid forever, since they treat a missing queue as
+        "nothing to deliver" rather than "not yet initialised". A restored
+        order without a fill queue can still fill for real on the exchange,
+        but this process would never notice.
+
+        Called as soon as the handoff snapshot is read — before the grid is
+        rebuilt or any GridLevel exists for it — specifically to close the
+        window between the OMS WS coming up and this process knowing about
+        the inherited orders. See GridBot._preregister_handoff_orders().
+        """
+        from copy import deepcopy
+        live_order = _LiveOrder(req=deepcopy(req), exchange_id=exchange_id,
+                                status=OrderStatus.PENDING)
+        with self._orders_lock:
+            self._orders[client_oid]         = live_order
+            self._exid_to_coid[exchange_id]  = client_oid
+        with self._fill_queues_lock:
+            self._fill_queues[client_oid] = queue.Queue(maxsize=1)
+        logger.debug(
+            f"[OMS] Restored order: {req.side} @ {req.price} "
+            f"exid={exchange_id} [{client_oid[:8]}]"
+        )
+
+    def forget_order(self, client_oid: str) -> None:
+        """
+        Remove all OMS-side bookkeeping for a client_oid. Used when a
+        restored handoff order turns out to be orphaned (its price no longer
+        matches any level in the newly-rebuilt grid) and gets cancelled
+        before any GridLevel ever references it — otherwise its fill_queue
+        entry would leak for the life of the process, since nothing would
+        ever call wait_fill() on it to clean it up naturally.
+        """
+        with self._orders_lock:
+            order = self._orders.pop(client_oid, None)
+            if order and order.exchange_id:
+                self._exid_to_coid.pop(order.exchange_id, None)
+        with self._fill_queues_lock:
+            self._fill_queues.pop(client_oid, None)
 
     def _maker_timeout_handler(self, client_oid: str, exchange_id: str, req: OrderRequest):
         deadline = time.time() + _MAKER_FILL_TIMEOUT
@@ -2408,12 +2477,13 @@ class LevelState(Enum):
 
 @dataclass
 class GridLevel:
-    index:      int
-    price:      float
-    state:      LevelState = LevelState.IDLE
-    client_oid: str        = ""
-    qty:        float      = 0.0
-    placed_at:  float      = 0.0   # epoch time this order was (re)placed;
+    index:       int
+    price:       float
+    state:       LevelState = LevelState.IDLE
+    client_oid:  str        = ""
+    exchange_id: str        = ""   # exchange order-id; populated after REST confirm
+    qty:         float      = 0.0
+    placed_at:   float      = 0.0  # epoch time this order was (re)placed;
                                     # used by paper_fill_min_resting_s guard
 
 
@@ -2455,6 +2525,7 @@ class GridEngine:
         self._stop_event = threading.Event()
         self._last_drift_shift: float = 0.0   # epoch time of last sell-triggered shift
         self._needs_rebuild:   bool  = False  # set by drift-shift when mid is far OOB
+        self._handoff_freeze:  bool  = False  # set by GridBot during blue-green handoff
 
         # Accounting — seeded from DB so a restart or re-tune doesn't zero out history.
         # In-memory values are the authoritative running total for this process;
@@ -2504,11 +2575,11 @@ class GridEngine:
             f"{self._levels[0].price:.2f} … {self._levels[-1].price:.2f}"
         )
 
-    def start(self, mid: float):
+    def start(self, mid: float, skip_indices: Optional[set] = None):
         self._fill_thread = threading.Thread(
             target=self._fill_loop, name="Grid-fills", daemon=True)
         self._fill_thread.start()
-        self._place_initial_orders(mid)
+        self._place_initial_orders(mid, skip_indices=skip_indices or set())
         logger.info("[GridEngine] Started")
 
     def stop(self):
@@ -2523,7 +2594,19 @@ class GridEngine:
 
     # ── Initial placement ─────────────────────────────────────────────────────
 
-    def _place_initial_orders(self, mid: float):
+    def _place_initial_orders(self, mid: float, skip_indices: Optional[set] = None):
+        """
+        Place a BUY or SELL for every level, except those in skip_indices.
+
+        skip_indices is used during a blue-green handoff: those indices
+        already have a live order inherited from the predecessor process
+        (applied afterward by GridBot._apply_handoff_restore), so placing a
+        fresh order here would create a duplicate resting order at that
+        price — the exchange would end up holding both, while this engine's
+        only in-memory reference would point at whichever one gets applied
+        last, silently orphaning the other.
+        """
+        skip_indices = skip_indices or set()
         with self._lock:
             levels = list(self._levels)
         self._placing_initial = True
@@ -2531,6 +2614,8 @@ class GridEngine:
             for lv in levels:
                 if self._stop_event.is_set():
                     break
+                if lv.index in skip_indices:
+                    continue
                 if lv.price < mid:
                     self._place_buy(lv)
                 elif lv.price > mid:
@@ -2546,6 +2631,9 @@ class GridEngine:
         return round(math.floor(raw * 10000) / 10000, 4)
 
     def _place_buy(self, lv: GridLevel):
+        if self._handoff_freeze:
+            logger.debug(f"[GridEngine] BUY  [{lv.index}] suppressed — handoff freeze active")
+            return
         qty = self._qty(lv.price)
         if qty <= 0:
             return
@@ -2561,6 +2649,9 @@ class GridEngine:
         logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
 
     def _place_sell(self, lv: GridLevel):
+        if self._handoff_freeze:
+            logger.debug(f"[GridEngine] SELL [{lv.index}] suppressed — handoff freeze active")
+            return
         qty = self._qty(lv.price)
         if qty <= 0:
             return
@@ -3651,7 +3742,7 @@ class TrendSignal:
 
 import sqlite3 as _sqlite3
 
-_GRID_DB_SCHEMA_VERSION = 3
+_GRID_DB_SCHEMA_VERSION = 6
 
 _GRID_DB_DDL = """
 -- Every grid fill: permanent, append-only audit log.
@@ -3703,6 +3794,19 @@ CREATE TABLE IF NOT EXISTS candle_cache (
     high_px   REAL NOT NULL,
     low_px    REAL NOT NULL,
     close_px  REAL NOT NULL
+);
+
+-- Single-instance lock: enforces that at most one grid_bot.py process is ever
+-- the active trading instance for this DB at a time (standalone, blue, or
+-- green — role doesn't matter). A single row (id=1). holder_pid/updated_at
+-- form a heartbeat lease: the holder must refresh updated_at more often than
+-- GridStateStore._BG_LOCK_STALE_AFTER_S or a later process is entitled to
+-- treat the lock as abandoned and take it over via the same atomic
+-- compare-and-swap used to originally acquire it. See GridStateStore.bg_lock_*.
+CREATE TABLE IF NOT EXISTS bg_lock (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    holder_pid INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
 );
 """
 
@@ -3756,6 +3860,10 @@ class GridStateStore:
                     "INSERT INTO meta(key,value) VALUES('schema_version',?)",
                     (str(_GRID_DB_SCHEMA_VERSION),),
                 )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO bg_lock(id, holder_pid, updated_at) "
+                    "VALUES (1, NULL, 0)"
+                )
                 self._conn.commit()
             else:
                 db_ver = int(row["value"])
@@ -3775,6 +3883,46 @@ class GridStateStore:
                         except Exception:
                             pass  # column already exists (idempotent)
                     logger.info("[GridStateStore] schema migrated -> v3 (daily_pnl sl columns)")
+                # v3->v4: blue-green deployment keys stored in existing meta table.
+                # No DDL change required; version bump marks compatibility.
+                if db_ver < 4:
+                    logger.info("[GridStateStore] schema migrated -> v4 (blue-green deployment)")
+                # v4->v5: collapsed the separate bg_blue_pid / bg_green_pid keys into
+                # a single bg_live_pid key. Drop any stale v4 keys left over from a
+                # process that didn't clear them.
+                if db_ver < 5:
+                    for stale_key in ("bg_blue_pid", "bg_green_pid"):
+                        try:
+                            self._conn.execute("DELETE FROM meta WHERE key=?", (stale_key,))
+                        except Exception:
+                            pass
+                    logger.info(
+                        "[GridStateStore] schema migrated -> v5 "
+                        "(bg_blue_pid/bg_green_pid collapsed into bg_live_pid)"
+                    )
+                # v5->v6: replaced the plain bg_live_pid meta key (no staleness
+                # detection — a hung or crashed holder looked identical to a
+                # healthy one) and the short-lived bg_handoff_claimant_pid
+                # experiment (PID-liveness checks are unreliable across
+                # platforms — PIDs get reused) with a single CAS + heartbeat
+                # lease in the dedicated bg_lock table (created by the DDL
+                # above; CREATE TABLE IF NOT EXISTS handles existing DBs).
+                # Drop the now-unused meta keys and seed the lock row.
+                if db_ver < 6:
+                    for stale_key in ("bg_live_pid", "bg_handoff_claimant_pid"):
+                        try:
+                            self._conn.execute("DELETE FROM meta WHERE key=?", (stale_key,))
+                        except Exception:
+                            pass
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO bg_lock(id, holder_pid, updated_at) "
+                        "VALUES (1, NULL, 0)"
+                    )
+                    logger.info(
+                        "[GridStateStore] schema migrated -> v6 "
+                        "(bg_live_pid/bg_handoff_claimant_pid replaced by bg_lock "
+                        "CAS + heartbeat lease)"
+                    )
                 if db_ver < _GRID_DB_SCHEMA_VERSION:
                     self._conn.execute(
                         "UPDATE meta SET value=? WHERE key='schema_version'",
@@ -3902,6 +4050,149 @@ class GridStateStore:
                 (key, value),
             )
             self._conn.commit()
+
+    def delete_meta(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM meta WHERE key=?", (key,))
+            self._conn.commit()
+
+    # ── Blue-green deployment helpers ─────────────────────────────────────────
+    # Keys/tables used:
+    #   bg_lock (table)      → the single-instance lock. See bg_lock_* below —
+    #                          this is what enforces "only one grid_bot.py
+    #                          process is ever the active trading instance for
+    #                          this DB at a time", and doubles as "who do I ask
+    #                          for a handoff" (whoever currently holds it).
+    #   "bg_handoff_request" → str(int)   written by the incoming process to trigger
+    #                                     the live process's freeze+export
+    #   "bg_handoff_json"    → JSON str   written by the live process after freeze;
+    #                                     read (but NOT deleted yet — see
+    #                                     GridBot._preregister_handoff_orders) by the
+    #                                     incoming process; only deleted once
+    #                                     GridBot._apply_handoff_restore() finishes
+    #                                     applying it to a fully-built grid. Kept
+    #                                     around that long so a process that crashes
+    #                                     between reading it and finishing the restore
+    #                                     can resume from where it left off on
+    #                                     restart, instead of losing the snapshot and
+    #                                     falling back to a destructive cold start
+    #                                     (cancel-all-orders + liquidate).
+    #
+    # NOTE: there is deliberately no separate "blue" vs "green" PID slot. Whichever
+    # process currently holds bg_lock — regardless of which --role it was launched
+    # with — is the one a deploy hands off from. This means every deploy after the
+    # very first one can use the exact same `--role green` invocation; no manual
+    # "become blue" relabeling step is ever required.
+
+    _BG_HANDOFF_REQUEST = "bg_handoff_request"
+    _BG_HANDOFF_JSON    = "bg_handoff_json"
+
+    # Heartbeat interval the lock holder refreshes on (GridBot._start_lock_heartbeat)
+    # and how long a missed heartbeat is tolerated before a later process may treat
+    # the lock as abandoned. Kept at roughly a 4x margin (rather than e.g. a single
+    # heartbeat period) so one slow SQLite write, GC pause, or WAL checkpoint stall
+    # doesn't look like a crash and trigger a false-positive takeover while the
+    # actual holder is still very much alive — that failure mode (two processes
+    # both believing they own the same orders) is worse than waiting a few extra
+    # seconds to reclaim a genuinely-dead holder's lock.
+    BG_LOCK_HEARTBEAT_S   = 5.0
+    BG_LOCK_STALE_AFTER_S = 20.0
+
+    def bg_lock_try_acquire(self, pid: int) -> bool:
+        """
+        Atomic compare-and-swap: acquires the single-instance lock iff it is
+        currently unheld OR held-but-stale (its holder hasn't heartbeated
+        within BG_LOCK_STALE_AFTER_S seconds — almost certainly crashed or
+        hung, rather than just being a legitimately slow warmup, which
+        refreshes the heartbeat throughout). This single UPDATE...WHERE is
+        what actually enforces mutual exclusion: SQLite serialises writers
+        against the same DB file across processes, so two processes racing
+        to acquire at the same instant can never both succeed — exactly one
+        UPDATE's WHERE clause matches, the other's rowcount is 0.
+        Returns True iff THIS call acquired the lock.
+        """
+        now = time.time()
+        stale_cutoff = now - self.BG_LOCK_STALE_AFTER_S
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE bg_lock SET holder_pid=?, updated_at=? "
+                "WHERE id=1 AND (holder_pid IS NULL OR updated_at < ?)",
+                (pid, now, stale_cutoff),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def bg_lock_heartbeat(self, pid: int) -> bool:
+        """
+        Refresh the lock's lease. Called periodically by the current holder
+        (GridBot._start_lock_heartbeat) for as long as it's running. Only
+        succeeds if we're still the recorded holder — should always be true
+        given bg_lock_try_acquire's CAS is the only way to become the holder,
+        but cheap to verify rather than assume.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE bg_lock SET updated_at=? WHERE id=1 AND holder_pid=?",
+                (time.time(), pid),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def bg_lock_release(self, pid: int) -> None:
+        """
+        Clean release — called on a normal stop() and as part of
+        export_handoff_snapshot() (that's the actual hand-off moment: the
+        successor's pending bg_lock_try_acquire() only succeeds once this
+        runs). Only clears the lock if we're still the recorded holder, so a
+        delayed/duplicate release from a dying process can't clobber a lock
+        a newer holder has since legitimately acquired.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE bg_lock SET holder_pid=NULL, updated_at=0 "
+                "WHERE id=1 AND holder_pid=?",
+                (pid,),
+            )
+            self._conn.commit()
+
+    def bg_lock_current_holder(self) -> Optional[int]:
+        """
+        Returns the current holder's PID if the lock is held AND fresh
+        (heartbeated within BG_LOCK_STALE_AFTER_S), else None. A stale
+        holder is treated identically to "unheld" — there's no live peer to
+        request a handoff from — even though the row technically still
+        names a PID; bg_lock_try_acquire applies the same staleness rule so
+        the two stay consistent with each other.
+        """
+        stale_cutoff = time.time() - self.BG_LOCK_STALE_AFTER_S
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT holder_pid, updated_at FROM bg_lock WHERE id=1"
+            ).fetchone()
+        if row and row["holder_pid"] is not None and row["updated_at"] >= stale_cutoff:
+            return row["holder_pid"]
+        return None
+
+    def bg_request_handoff(self, green_pid: int) -> None:
+        """Green writes this to ask blue to freeze and export."""
+        self.set_meta(self._BG_HANDOFF_REQUEST, str(green_pid))
+
+    def bg_poll_handoff_request(self) -> Optional[int]:
+        """Blue polls this; returns green_pid if a request is pending, else None."""
+        val = self.get_meta(self._BG_HANDOFF_REQUEST)
+        return int(val) if val else None
+
+    def bg_clear_handoff_request(self) -> None:
+        self.delete_meta(self._BG_HANDOFF_REQUEST)
+
+    def bg_write_handoff_json(self, payload: str) -> None:
+        self.set_meta(self._BG_HANDOFF_JSON, payload)
+
+    def bg_read_handoff_json(self) -> Optional[str]:
+        return self.get_meta(self._BG_HANDOFF_JSON)
+
+    def bg_clear_handoff_json(self) -> None:
+        self.delete_meta(self._BG_HANDOFF_JSON)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -4081,8 +4372,9 @@ class GridBot:
     RETUNE_CHECK_INTERVAL = 300.0
     CANDLE_SAVE_INTERVAL_S = 300.0   # snapshot PriceCache history to DB every 5 min
 
-    def __init__(self, config: dict, reset_state: bool = False):
+    def __init__(self, config: dict, reset_state: bool = False, role: str = ""):
         self._cfg         = config
+        self._role        = role             # "blue", "green", or "" (standalone)
         self._stop_event  = threading.Event()
         self._engine:     Optional[GridEngine]    = None
         self._params:     Optional[GridParams]    = None
@@ -4096,6 +4388,20 @@ class GridBot:
         self._last_candle_save:  float = 0.0
         self._halted:     bool  = False
         self._halt_time:  float = 0.0       # timestamp of the last halt
+        # Blue-green deployment state
+        # _handoff_freeze lives on GridEngine (set there by export_handoff_snapshot)
+        self._handoff_stop:   bool = False   # True → stop() skips position liquidation
+        # Set by _start_handoff_watcher()'s background thread when a peer requests a
+        # handoff; observed and acted on by _run() (main thread) — see that thread's
+        # docstring for why the watcher itself never calls self.stop() directly.
+        self._handoff_shutdown_requested = threading.Event()
+        # Parsed handoff snapshot (dict) once a peer has handed off to us and its
+        # orders have been pre-registered with the OMS, cleared once
+        # _apply_handoff_restore() has applied it to the freshly built grid.
+        self._pending_handoff_snapshot: Optional[dict] = None
+        # Signals the bg_lock heartbeat thread (_start_lock_heartbeat) to stop;
+        # set in stop().
+        self._lock_heartbeat_stop_event = threading.Event()
         self._halt_stop_price: float = 0.0  # stop_price that triggered the halt
         self._restart_attempts: int = 0     # number of auto-restart attempts made
         self._last_restart_time: float = 0.0  # timestamp of the last successful auto-restart
@@ -4253,24 +4559,376 @@ class GridBot:
                     f"{window_s:.0f}s (alert already sent)"
                 )
 
+    # ── Blue-green: green-side handoff orchestration ──────────────────────────
+
+    def _request_and_await_handoff(self) -> bool:
+        """
+        Called by green during start(), before reconcile_on_startup().
+
+        Step 0 (crash recovery): check for a handoff snapshot already sitting
+        in SQLite before looking for a live peer at all. Under normal
+        operation there shouldn't be one — export_handoff_snapshot() and
+        _preregister_handoff_orders() leave a snapshot present in exactly one
+        situation: a previous process read it and started registering orders
+        with its OMS, but crashed before _apply_handoff_restore() finished
+        applying it to a built grid (see GridStateStore's bg_handoff_json
+        docs for why the clear is deferred that long). If we find one, try
+        to acquire the single-instance lock (bg_lock — see GridStateStore):
+          - Acquired → whoever last touched this snapshot is gone (the lock
+            was unheld, or held but stale past BG_LOCK_STALE_AFTER_S) — safe
+            to resume. Register it directly via _preregister_handoff_orders,
+            no peer needed, there isn't one.
+          - Not acquired → another process holds a FRESH lock, i.e. is
+            genuinely still working (most likely on this very snapshot,
+            just deep in a slow warmup — not dead). reconcile_on_startup()
+            cancels every open order for the instrument directly on the
+            exchange, account-wide, so barging in here would rip out orders
+            that still-live process owns. Refuse to start instead.
+
+        Normal path (no snapshot already present):
+        1. Find the current lock holder (bg_lock_current_holder — returns
+           None if unheld or stale, treated the same as "no live peer").
+           If None → no live peer, proceed with normal cold start (return False).
+        2. Write bg_handoff_request to ask that peer to freeze + export.
+        3. Poll bg_handoff_json every 1s until it appears or timeout fires.
+        4. As soon as the snapshot appears, ATOMICALLY acquire bg_lock — this
+           IS the hand-off moment (export_handoff_snapshot() released it
+           right after writing the JSON, so this is a race exactly one
+           incoming process can win; see the retry note below for why it
+           isn't a hair-trigger single attempt). If we lose that race,
+           another process already claimed it first — refuse to start
+           rather than falling back to a cold start, which would cancel the
+           winner's inherited orders out from under it.
+        5. Register the snapshot's open orders with this process's OMS
+           (_preregister_handoff_orders) — done here, not deferred to after
+           grid rebuild/warmup, specifically to close the window during
+           which this process's WS is live but doesn't yet know about
+           inherited orders. See that method's docstring for why this matters.
+
+        Returns True if a snapshot was found, the lock acquired, and orders
+        registered (the grid rebuild step will later match it against this
+        process's own grid via _match_handoff_levels()/_apply_handoff_restore()).
+        Returns False if no peer/snapshot ever showed up at all (fall back to
+        cold start) — as opposed to losing a race for one that did, which
+        exits the process outright rather than returning False.
+        """
+        existing_payload = self._store.bg_read_handoff_json()
+        if existing_payload:
+            if not self._try_acquire_bg_lock():
+                logger.error(
+                    f"[GridBot] An un-applied handoff snapshot is present, "
+                    f"but the instance lock is already held by another "
+                    f"still-live process — refusing to start alongside it. "
+                    f"Starting here would cancel every open order for "
+                    f"{INSTRUMENT} on the exchange out from under it."
+                )
+                sys.exit(1)
+            logger.warning(
+                "[GridBot] Found an un-applied handoff snapshot left behind "
+                "by a previous process (its lock had expired) — resuming it "
+                "instead of starting a fresh handoff request."
+            )
+            return self._preregister_handoff_orders()
+
+        live_pid = self._store.bg_lock_current_holder()
+        if live_pid is None:
+            logger.info("[GridBot] No live peer found — cold start")
+            return False
+
+        logger.info(f"[GridBot] Found live peer pid={live_pid} — requesting handoff")
+        self._store.bg_request_handoff(os.getpid())
+
+        timeout_s = self._cfg.get("bg_handoff_timeout_s", 10)
+        deadline  = time.time() + timeout_s
+        while time.time() < deadline:
+            payload = self._store.bg_read_handoff_json()
+            if payload:
+                logger.info(f"[GridBot] Handoff JSON received ({len(payload)} bytes)")
+                if not self._try_acquire_bg_lock():
+                    holder = self._store.bg_lock_current_holder()
+                    logger.error(
+                        f"[GridBot] Handoff snapshot received, but pid={holder} "
+                        f"already claimed the instance lock first — refusing "
+                        f"to start (lost the race for this hand-off)."
+                    )
+                    sys.exit(1)
+                return self._preregister_handoff_orders()
+            time.sleep(1.0)
+
+        logger.warning(
+            f"[GridBot] Handoff timeout after {timeout_s}s "
+            f"(peer pid={live_pid} may have already exited) — falling back to cold start"
+        )
+        self._store.bg_clear_handoff_request()
+        return False
+
+    def _try_acquire_bg_lock(self) -> bool:
+        """
+        Attempt to acquire the single-instance lock, with a short bounded
+        retry (a few attempts a fraction of a second apart) rather than a
+        single hair-trigger try. This isn't the primary correctness
+        mechanism — bg_lock_try_acquire's CAS is — it just smooths over two
+        benign sources of transient contention: (a) export_handoff_snapshot()
+        writes the JSON and releases the lock as two separate SQLite writes
+        a few microseconds apart, so a poll landing in that gap would
+        otherwise see the JSON but find the lock still (momentarily) held by
+        the process that's exiting; (b) ordinary SQLite write contention
+        under WAL mode when multiple processes touch the DB at nearly the
+        same instant. A real "someone else is genuinely running" case fails
+        every attempt, since that holder's lease keeps refreshing.
+        """
+        for attempt in range(5):
+            if self._store.bg_lock_try_acquire(os.getpid()):
+                return True
+            if attempt < 4:
+                time.sleep(0.1)
+        return False
+
+    def _preregister_handoff_orders(self) -> bool:
+        """
+        Read the handoff JSON from SQLite and immediately register every open
+        order it contains with this process's OMS — BEFORE the grid is
+        rebuilt or warmup even begins.
+
+        By the time this runs, the instance lock has already been acquired
+        by the caller (_request_and_await_handoff) — that's the actual
+        hand-off/takeover moment; this method only handles OMS bookkeeping.
+
+        This runs as early as possible (right after _request_and_await_handoff
+        finds the snapshot, itself right after self._oms.start() brought the
+        live order-update WS up) specifically to minimise the window during
+        which this process's WS is listening for fills but doesn't yet know
+        which exchange_ids belong to inherited orders. Before this fix, that
+        registration only happened after full Phase 1/2 warmup + grid
+        rebuild — a gap that's normally ~10-15s but can be tens of minutes if
+        the ATR REST seed fails and Phase 2 falls back to live candle
+        accumulation. Any fill on an inherited order during that gap was
+        silently dropped. Registering here instead bounds the gap to the
+        handoff round-trip itself (typically low single-digit seconds) — that
+        residual window can't be eliminated entirely, since this process
+        cannot know a peer's order IDs before the peer hands them off, but it
+        is now bounded by handoff latency rather than by warmup duration. Any
+        WS order-update that still slips through this smaller window is at
+        least logged now (see OMS._handle_order_update) instead of being
+        dropped silently.
+
+        IMPORTANT: this does NOT clear bg_handoff_json — that's deferred to
+        GridBot._apply_handoff_restore(), once the snapshot has actually been
+        applied to a fully-built grid, not merely read. If this process
+        crashes anywhere between here and then, the snapshot is still sitting
+        in SQLite (and the lock will go stale) for _request_and_await_handoff()'s
+        Step 0 to resume on restart, rather than being gone for good and
+        forcing a destructive cold start.
+
+        The actual GridLevel state (matching index/price against whatever
+        grid this process ends up computing) is applied later, from
+        _rebuild_grid(), via _match_handoff_levels()/_apply_handoff_restore()
+        — that part necessarily has to wait until this process's own grid
+        parameters exist.
+
+        Returns True if a valid snapshot was found and registered, False
+        otherwise (fall back to a normal cold start).
+        """
+        import json as _json
+
+        payload = self._store.bg_read_handoff_json()
+        if not payload:
+            return False
+
+        try:
+            snap = _json.loads(payload)
+        except Exception as e:
+            logger.error(f"[GridBot] handoff snapshot: JSON parse error: {e}")
+            # Corrupt beyond recovery — clear it (and release the lock we
+            # just took to look at it) so it doesn't linger forever
+            # re-failing this same check on every future restart.
+            self._store.bg_clear_handoff_json()
+            self._store.bg_lock_release(os.getpid())
+            return False
+
+        if snap.get("schema") != 2:
+            logger.warning(
+                f"[GridBot] handoff snapshot: unknown schema {snap.get('schema')}"
+            )
+            self._store.bg_clear_handoff_json()
+            self._store.bg_lock_release(os.getpid())
+            return False
+
+        n_registered = 0
+        for snap_lv in snap.get("levels", []):
+            state_str = snap_lv.get("state", "IDLE")
+            if state_str not in ("BUY_OPEN", "SELL_OPEN"):
+                continue
+            exchange_id = snap_lv.get("exchange_id", "")
+            client_oid  = snap_lv.get("client_oid", "")
+            if not (exchange_id and client_oid):
+                continue
+            req = OrderRequest.limit_maker(
+                side       = "BUY" if state_str == "BUY_OPEN" else "SELL",
+                qty        = snap_lv["qty"],
+                price      = snap_lv["price"],
+                instrument = INSTRUMENT,
+                purpose    = ("grid_buy" if state_str == "BUY_OPEN" else "grid_sell"),
+            )
+            req.client_oid = client_oid
+            self._oms.restore_order(client_oid, exchange_id, req)
+            n_registered += 1
+
+        self._pending_handoff_snapshot = snap
+
+        logger.info(
+            f"[GridBot] Handoff snapshot registered: long_qty="
+            f"{snap.get('long_qty', 0.0):.4f} open_orders_registered={n_registered} "
+            f"(will be matched against this process's own grid once rebuilt; "
+            f"snapshot stays in SQLite until then in case of a crash)"
+        )
+        return True
+
+    # ── Blue-green: instance lock heartbeat ──────────────────────────────────
+
+    def _start_lock_heartbeat(self) -> None:
+        """
+        Launched once this process holds bg_lock (either via a successful
+        handoff hand-off in _request_and_await_handoff, or a fresh
+        acquisition for a cold start in start()). Refreshes the lease every
+        GridStateStore.BG_LOCK_HEARTBEAT_S seconds for as long as this
+        process runs, so a later process's staleness check
+        (bg_lock_try_acquire / bg_lock_current_holder) never mistakes a
+        merely-slow-but-alive process for a crashed one.
+        """
+        interval = self._store.BG_LOCK_HEARTBEAT_S
+        pid = os.getpid()
+
+        def _heartbeat():
+            while not self._lock_heartbeat_stop_event.wait(interval):
+                if not self._store.bg_lock_heartbeat(pid):
+                    # We're no longer the recorded holder — shouldn't happen
+                    # given bg_lock_try_acquire's CAS is the only way to
+                    # become holder, but if it ever does, another process
+                    # may now believe it owns the same orders. Surface this
+                    # loudly rather than silently continuing to trade.
+                    logger.critical(
+                        "[GridBot] Lost the instance lock while still "
+                        "running — another process may now be handling the "
+                        "same account. Stopping immediately."
+                    )
+                    self._handoff_shutdown_requested.set()
+                    return
+
+        t = threading.Thread(target=_heartbeat, name="BG-LockHeartbeat", daemon=True)
+        t.start()
+
+    # ── Blue-green: live-side handoff watcher ────────────────────────────────
+
+    def _start_handoff_watcher(self) -> None:
+        """
+        Launched as a daemon thread once this process finishes startup
+        (whether it was launched with --role blue or --role green — see
+        GridStateStore's bg_lock docs for why both participate the same
+        way). Polls SQLite every 1s for a handoff request from a successor.
+        When found, calls export_handoff_snapshot() then asks the MAIN thread
+        to perform the actual stop.
+
+        IMPORTANT: this thread does NOT call self.stop() directly. GridBot.stop()
+        mutates self._engine/self._oms state with no top-level lock, and the
+        main thread's _run() loop could be mid-iteration touching that same
+        state — calling stop() from a second OS thread concurrently would be
+        a genuine race (unlike the SIGINT/SIGTERM path, which pre-empts the
+        main thread itself rather than running on a separate thread). Instead
+        this just sets a flag; _run() observes it on the main thread and
+        calls self.stop() itself once it's safe to do so.
+        """
+        def _watch():
+            while not self._stop_event.is_set():
+                if self._handoff_shutdown_requested.is_set():
+                    return  # already requested by an earlier iteration
+                peer_pid = self._store.bg_poll_handoff_request()
+                if peer_pid is not None:
+                    logger.info(
+                        f"[GridBot] Handoff request from pid={peer_pid} "
+                        f"— exporting snapshot"
+                    )
+                    try:
+                        ok = self.export_handoff_snapshot()
+                    except Exception as e:
+                        logger.error(f"[GridBot] Handoff export failed: {e}")
+                        ok = False
+                    if ok:
+                        logger.info(
+                            "[GridBot] Snapshot written — requesting main-thread shutdown"
+                        )
+                    else:
+                        logger.warning(
+                            "[GridBot] Snapshot failed — requesting main-thread shutdown anyway"
+                        )
+                    # _handoff_stop is already True if ok (set inside
+                    # export_handoff_snapshot); _run() will see this flag,
+                    # call self.stop() itself, and stop() will skip
+                    # liquidation because _handoff_stop is True.
+                    self._handoff_shutdown_requested.set()
+                    return
+                time.sleep(1.0)
+
+        t = threading.Thread(target=_watch, name="BG-HandoffWatcher", daemon=True)
+        t.start()
+        logger.info("[GridBot] Handoff watcher started")
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
-        logger.info("[GridBot] Starting")
+        logger.info(f"[GridBot] Starting (role={self._role or 'standalone'})")
         self._oms.start()
         self._cmd_poller.start()   # start Telegram command polling early so /status works during warmup
 
-        # ── Startup reconciliation ────────────────────────────────────────────
-        # Detect and close any position left over from a previous run (crash,
-        # hard-kill, or clean stop).  Also cancels all orphaned open orders so
-        # the new grid starts from a clean slate.  No-op in paper mode.
-        stale_qty = self._oms.reconcile_on_startup()
-        if stale_qty > 0:
-            self._alerter.send(
-                f"⚠️ Startup: found stale long {stale_qty:.4f} BTC from previous run\n"
-                f"Closing before building new grid..."
-            )
-            self._liquidate_position(stale_qty, reason="startup reconcile")
+        # ── Blue-green: register PID ──────────────────────────────────────────
+        # Green (or any --role process): request handoff from whoever is
+        # currently registered as the live process, and wait for its snapshot.
+        # Note this deliberately runs immediately after self._oms.start() (i.e.
+        # as soon as our own order-update WS is live), and pre-registers the
+        # snapshot's orders with the OMS the moment it arrives — see
+        # _request_and_await_handoff()/_preregister_handoff_orders() for why
+        # that timing matters.
+        _handoff_loaded = False
+        if self._role == "green":
+            _handoff_loaded = self._request_and_await_handoff()
+
+        # ── Startup reconciliation (skipped if handoff loaded) ────────────────
+        # Normal path: cancel all open orders, then fetch position.
+        # Handoff path: skip cancel-all — green inherits the peer's orders directly.
+        if not _handoff_loaded:
+            # Acquire the single-instance lock before doing anything that
+            # touches the exchange. This is the same bg_lock a handoff
+            # hand-off acquires — see _request_and_await_handoff — just
+            # taken here instead because there's no peer to hand off from
+            # (first-ever launch, or no live peer responded in time). Covers
+            # the case of two cold starts racing against the same DB (e.g.
+            # a mistaken double-launch), not just the blue-green path.
+            if not self._try_acquire_bg_lock():
+                holder = self._store.bg_lock_current_holder()
+                logger.error(
+                    f"[GridBot] Could not acquire the instance lock "
+                    f"(already held by pid={holder}) — refusing to start. "
+                    f"Another grid_bot.py process is already running "
+                    f"against this DB."
+                )
+                sys.exit(1)
+
+            # Detect and close any position left over from a previous run (crash,
+            # hard-kill, or clean stop).  Also cancels all orphaned open orders so
+            # the new grid starts from a clean slate.  No-op in paper mode.
+            stale_qty = self._oms.reconcile_on_startup()
+            if stale_qty > 0:
+                self._alerter.send(
+                    f"⚠️ Startup: found stale long {stale_qty:.4f} BTC from previous run\n"
+                    f"Closing before building new grid..."
+                )
+                self._liquidate_position(stale_qty, reason="startup reconcile")
+
+        # From here on, regardless of path, this process holds bg_lock —
+        # start heartbeating it so a legitimately slow warmup (e.g. the ATR
+        # REST-seed-failure fallback, which can take tens of minutes) doesn't
+        # get mistaken for a crash by some future process's staleness check.
+        self._start_lock_heartbeat()
 
         self._market_ws.start()
 
@@ -4342,6 +5000,19 @@ class GridBot:
 
         self._spacing_tuner.load_persisted()
         self._rebuild_grid()
+
+        # ── Any --role process: watch for the next handoff request ───────────
+        # Whether we started as --role blue, or as --role green and just took
+        # over via handoff (or fell back to a cold start), we already hold
+        # bg_lock (acquired either in _request_and_await_handoff's hand-off
+        # or just above for a cold start) and are heartbeating it — so we're
+        # already the process a FUTURE `--role green` deploy will find and
+        # hand off from. All that's left is to actually watch for that
+        # request. Standalone (no --role) processes still take the lock for
+        # safety but don't participate in handoff orchestration.
+        if self._role:
+            self._start_handoff_watcher()
+
         self._run()
 
     # ── Candle cache: DB load / save ─────────────────────────────────────────
@@ -4588,6 +5259,11 @@ class GridBot:
         # This mirrors what _emergency_halt does for stop-loss events so that
         # a clean SIGINT/SIGTERM also closes the position rather than leaving
         # it orphaned on the exchange.
+        #
+        # Exception: handoff-stop mode (set during a blue-green handoff export).
+        # In this mode the successor process has already pre-registered and
+        # will inherit the position via _apply_handoff_restore(), so this
+        # process must NOT liquidate.
         long_qty = 0.0
         cost_basis_price = None
         if self._engine:
@@ -4596,22 +5272,286 @@ class GridBot:
                 _, cost_basis_price = self._engine.get_cost_basis()
             self._engine.stop()
             self._engine = None
-        if long_qty > 0:
+        if self._handoff_stop:
+            logger.warning(
+                f"[GridBot] Handoff-stop: leaving {long_qty:.4f} BTC position "
+                f"for successor process — NOT liquidating"
+            )
+        elif long_qty > 0:
             self._liquidate_position(long_qty, reason="GridBot stop",
                                       cost_basis_price=cost_basis_price)
 
         self._cmd_poller.stop()
         self._oms.stop()
+        # Release unconditionally — every role (including standalone) now
+        # acquires bg_lock before it's allowed to start trading (see
+        # start()), so every role must release it here too. A no-op if we
+        # never actually held it (e.g. SIGINT arrived before we got that
+        # far) or already handed it off via export_handoff_snapshot(), since
+        # bg_lock_release only clears the row if we're still the recorded
+        # holder.
+        self._lock_heartbeat_stop_event.set()
+        self._store.bg_lock_release(os.getpid())
         self._store.close()
         self._alerter.send_sync(f"🔴 GridBot stopped")
         self._alerter.stop()
         logger.info("[GridBot] Stopped")
+
+    # ── Blue-green: handoff snapshot export (called by blue) ─────────────────
+
+    def export_handoff_snapshot(self) -> bool:
+        """
+        Freeze order activity, atomically snapshot GridEngine state, write the
+        JSON to SQLite, then arm _handoff_stop so stop() skips liquidation.
+
+        Sequence (designed to be race-safe):
+          1. Set _handoff_freeze — GridEngine checks this before placing any
+             new orders, so no new REST calls fire after this point.
+          2. Wait 300ms for any in-flight OMS worker submissions to drain.
+          3. Acquire GridEngine lock and read long_qty + level states atomically.
+          4. Build JSON, write to SQLite meta['bg_handoff_json'].
+          5. Clear bg_handoff_request, then release bg_lock — this is the
+             actual hand-off moment a waiting successor's acquire attempt is
+             racing to catch.
+          6. Arm _handoff_stop so stop() won't liquidate.
+
+        Returns True on success, False if no engine is running (nothing to hand off).
+        """
+        if self._engine is None:
+            logger.warning("[GridBot] export_handoff_snapshot: no engine running")
+            return False
+
+        logger.info("[GridBot] Handoff export: freezing order activity")
+        self._engine._handoff_freeze = True
+
+        # Let any in-flight REST submissions complete before we snapshot.
+        time.sleep(0.3)
+
+        with self._engine._lock:
+            long_qty = self._engine._long_qty
+            params   = self._engine._params
+            levels_data = []
+            for lv in self._engine._levels:
+                exchange_id = (self._oms.get_exchange_id(lv.client_oid)
+                               if lv.client_oid else "")
+                levels_data.append({
+                    "index":            lv.index,
+                    "price":            lv.price,
+                    "state":            lv.state.value,
+                    "client_oid":       lv.client_oid,
+                    "exchange_id":      exchange_id,
+                    "qty":              lv.qty,
+                    "placed_at":        lv.placed_at,
+                    # Needed so a restored SELL_OPEN level's counter-fill
+                    # accounting matches what this process would have done —
+                    # see GridEngine._on_fill's is_initial_sell handling and
+                    # GridBot._apply_handoff_restore.
+                    "is_initial_sell":  lv.client_oid in self._engine._initial_sell_oids,
+                })
+
+        snapshot = {
+            "schema":      2,
+            "exported_at": time.time(),
+            "role":        self._role,
+            "long_qty":    long_qty,
+            "params": {
+                "lower":              params.lower,
+                "upper":              params.upper,
+                "levels":             params.levels,
+                "spacing":            params.spacing,
+                "stop_price":         params.stop_price,
+                "notional_per_level": params.notional_per_level,
+                "computed_at":        params.computed_at,
+            },
+            "levels": levels_data,
+        }
+
+        import json as _json
+        payload = _json.dumps(snapshot)
+        self._store.bg_write_handoff_json(payload)
+        self._store.bg_clear_handoff_request()
+        # This is the actual hand-off moment: releasing the lock here is what
+        # a waiting successor's bg_lock_try_acquire (polling since it saw the
+        # JSON appear) is racing to catch. See GridStateStore.bg_lock_release
+        # and GridBot._try_acquire_bg_lock's retry note for why a poll that
+        # lands in the few-microsecond gap between the JSON write above and
+        # this release doesn't cause a spurious refusal.
+        self._store.bg_lock_release(os.getpid())
+
+        self._handoff_stop = True
+
+        n_open = sum(1 for lv in levels_data
+                     if lv["state"] in ("BUY_OPEN", "SELL_OPEN"))
+        logger.info(
+            f"[GridBot] Handoff export complete: long_qty={long_qty:.4f} "
+            f"open_orders={n_open} levels={len(levels_data)}"
+        )
+        self._alerter.send_sync(
+            f"🔄 Handoff exported: {long_qty:.4f} BTC, {n_open} open orders "
+            f"→ successor process"
+        )
+        return True
+
+    # ── Blue-green: handoff snapshot matching/restore (called by the incoming
+    # process during _rebuild_grid, using data pre-registered by
+    # _preregister_handoff_orders) ────────────────────────────────────────────
+
+    def _match_handoff_levels(
+        self, new_params: "GridParams"
+    ) -> Tuple[Dict[int, dict], List[dict]]:
+        """
+        Decide which of a pending handoff snapshot's open orders can be kept
+        in place on the grid we're about to build, vs which no longer
+        correspond to any level in it and must be treated as orphans
+        (cancelled, replaced by a fresh order instead).
+
+        Matching is done by PRICE, not by index. If the auto-tuner's freshly
+        computed lower/upper/spacing shift the level count at either edge
+        (e.g. one extra level because the range widened slightly), index-based
+        matching would misalign every single level even though most of the
+        actual price points are unchanged. Matching by price keeps as much of
+        the previous grid — and as many of the peer's still-live orders — as
+        possible; only levels whose price genuinely no longer exists in the
+        newly computed grid get cancelled and recreated fresh. This directly
+        implements "keep the previous grid as much as possible, but rebuild
+        whatever the new params actually changed."
+
+        Called from _rebuild_grid() BEFORE the new GridEngine/its orders are
+        created, so the result can tell GridEngine.start() which indices to
+        skip placing a fresh order for.
+        """
+        snap = self._pending_handoff_snapshot
+        assert snap is not None
+
+        new_prices = new_params.level_prices  # index-aligned
+        price_to_new_idx: Dict[str, int] = {
+            f"{p:.2f}": i for i, p in enumerate(new_prices)
+        }
+
+        restore_plan: Dict[int, dict] = {}
+        orphans:      List[dict]      = []
+        claimed: set = set()
+
+        for snap_lv in snap.get("levels", []):
+            state_str = snap_lv.get("state", "IDLE")
+            if state_str not in ("BUY_OPEN", "SELL_OPEN"):
+                continue  # nothing to restore or orphan for an idle snapshot level
+
+            new_idx = price_to_new_idx.get(f"{snap_lv['price']:.2f}")
+            if new_idx is None or new_idx in claimed:
+                orphans.append(snap_lv)
+                continue
+
+            claimed.add(new_idx)
+            restore_plan[new_idx] = snap_lv
+
+        return restore_plan, orphans
+
+    def _apply_handoff_restore(
+        self, restore_plan: Dict[int, dict], orphans: List[dict]
+    ) -> None:
+        """
+        Apply a previously-computed restore plan onto the just-built engine.
+
+        OMS-side registration (exchange_id/client_oid mapping + fill queue)
+        already happened in _preregister_handoff_orders(), as early in
+        startup as possible — see that method's docstring for why. This step
+        only has to: set the matched GridLevel objects' state/client_oid/qty/
+        placed_at (and initial-sell flag, so a restored SELL_OPEN level that
+        was one of the peer's initial sells doesn't wrongly decrement
+        long_qty when it fills — see GridEngine._on_fill), seed long_qty, and
+        cancel + forget any orphaned orders that no longer correspond to any
+        level in the grid we just built (GridEngine.start() already placed a
+        fresh order at whatever new level took that price's place, if any).
+        """
+        snap = self._pending_handoff_snapshot
+        assert snap is not None and self._engine is not None
+
+        with self._engine._lock:
+            level_by_index = {lv.index: lv for lv in self._engine._levels}
+            for new_idx, snap_lv in restore_plan.items():
+                lv = level_by_index.get(new_idx)
+                if lv is None:
+                    continue  # shouldn't happen — restore_plan keys came from this same grid
+                state_str = snap_lv["state"]
+                lv.state      = LevelState(state_str)
+                lv.client_oid = snap_lv["client_oid"]
+                lv.qty        = snap_lv["qty"]
+                lv.placed_at  = snap_lv.get("placed_at", time.time())
+                if state_str == "SELL_OPEN" and snap_lv.get("is_initial_sell", False):
+                    self._engine._initial_sell_oids.add(snap_lv["client_oid"])
+
+            self._engine._long_qty = float(snap.get("long_qty", 0.0))
+
+        for olv in orphans:
+            exid = olv.get("exchange_id", "")
+            coid = olv.get("client_oid", "")
+            if exid:
+                logger.warning(
+                    f"[GridBot] Handoff: orphaned order at price {olv['price']:.2f} "
+                    f"(exid={exid}) has no matching level in the rebuilt grid "
+                    f"— cancelling"
+                )
+                try:
+                    self._oms._rest_cancel_order(exid)
+                except Exception as e:
+                    logger.error(f"[GridBot] Handoff: cancel orphan failed: {e}")
+            if coid:
+                # Drop the early OMS registration too, or its fill_queue entry
+                # leaks for the life of the process — nothing will ever call
+                # wait_fill() for a client_oid no GridLevel references.
+                self._oms.forget_order(coid)
+
+        # Only NOW is the restore fully durable in this process's own state —
+        # clear the SQLite record so a future crash-recovery check doesn't
+        # find (and needlessly re-apply) a snapshot that's already been
+        # folded into a live, running grid. Deferred this long (rather than
+        # clearing as soon as the snapshot was read, back in
+        # _preregister_handoff_orders) specifically so a crash between those
+        # two points still leaves something for the next restart to resume.
+        # NOTE: bg_lock itself is NOT released here — we're continuing to run
+        # as the now-live process and are already heartbeating it (see
+        # start()); it's only released on a clean stop() or when we
+        # ourselves later hand off to a successor.
+        self._store.bg_clear_handoff_json()
+
+        snap_params  = snap.get("params", {})
+        new_params   = self._engine._params
+        exported_at  = snap.get("exported_at", 0)
+        age_ms       = int((time.time() - exported_at) * 1000) if exported_at else -1
+        logger.info(
+            f"[GridBot] Handoff applied: long_qty={self._engine._long_qty:.4f} "
+            f"restored={len(restore_plan)} orphaned={len(orphans)} "
+            f"snapshot_age={age_ms}ms | "
+            f"peer params range=[{snap_params.get('lower', 0):.2f},"
+            f"{snap_params.get('upper', 0):.2f}] spacing={snap_params.get('spacing', 0):.2f} "
+            f"-> this grid's range=[{new_params.lower:.2f},{new_params.upper:.2f}] "
+            f"spacing={new_params.spacing:.2f}"
+        )
+        self._alerter.send(
+            f"✅ Handoff applied: {self._engine._long_qty:.4f} BTC, "
+            f"{len(restore_plan)} orders restored in place, "
+            f"{len(orphans)} orphans cancelled & recreated fresh. "
+            f"Snapshot age {age_ms}ms."
+        )
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _run(self):
         logger.info("[GridBot] Main loop running")
         while not self._stop_event.is_set():
+            if self._handoff_shutdown_requested.is_set():
+                # A peer has requested (and, if export_handoff_snapshot()
+                # succeeded, already received) our handoff snapshot. Perform
+                # the actual stop() here, on the main thread, rather than
+                # from the watcher's background thread — see
+                # _start_handoff_watcher()'s docstring for why that
+                # distinction matters. stop() itself sets _stop_event, so
+                # this loop exits right after.
+                logger.info("[GridBot] Handoff shutdown requested — stopping")
+                self.stop()
+                break
+
             if self._halted:
                 self._check_auto_restart()
                 time.sleep(10)   # poll every 10s while halted
@@ -5139,12 +6079,35 @@ class GridBot:
             )
             return allow
 
+        # ── Blue-green: match any pending handoff snapshot against the grid
+        # we're about to build, BEFORE placing a single order ─────────────────
+        # This has to happen here (using new_params, not self._pending_handoff_snapshot's
+        # own old params) because the auto-tuner may have recomputed slightly
+        # different levels than the peer we're inheriting from had — matching
+        # is done by price against THIS grid's actual level prices, not by
+        # blindly trusting the snapshot's own range. See _match_handoff_levels().
+        #
+        # skip_indices tells GridEngine.start() which levels already have a
+        # live order (inherited) and must NOT get a fresh order placed on top
+        # of it — that duplicate-order bug (placing a brand new order, then
+        # immediately overwriting the in-memory reference to it with the old
+        # order's identity when the snapshot was applied) was the original,
+        # most severe bug in this feature.
+        restore_plan: Dict[int, dict] = {}
+        orphans:      List[dict]      = []
+        if self._pending_handoff_snapshot is not None:
+            restore_plan, orphans = self._match_handoff_levels(new_params)
+
         self._engine = GridEngine(
             params=new_params, oms=self._oms,
             instrument=INSTRUMENT, config=self._cfg,
             store=self._store,
             buy_gate_fn=_buy_gate)
-        self._engine.start(mid)
+        self._engine.start(mid, skip_indices=set(restore_plan.keys()))
+
+        if self._pending_handoff_snapshot is not None:
+            self._apply_handoff_restore(restore_plan, orphans)
+            self._pending_handoff_snapshot = None
 
         logger.info(
             f"[GridBot] Grid live: [{new_params.lower:.2f},{new_params.upper:.2f}] "
@@ -5793,11 +6756,38 @@ def _parse_args():
         help="Skip the interactive confirmation prompt for --reset-state "
              "(required when running non-interactively, e.g. under NSSM).",
     )
+    parser.add_argument(
+        "--role", choices=["blue", "green"], default="",
+        help=(
+            "Blue-green deployment role. Use 'blue' for the very first launch "
+            "(nothing to hand off from yet), then use 'green' for every deploy "
+            "after that — including the one after this one, and the one after "
+            "that. There's no need to relaunch a successor as 'blue' once it's "
+            "live: whichever process is currently running (regardless of which "
+            "role it was started with) registers itself as the live process and "
+            "watches for the next handoff request, so 'green' is always the "
+            "right choice for a deploy. "
+            "'green' requests a handoff from whoever is currently live on "
+            "startup; both roles freeze+export their orders on request from a "
+            "successor, then take over without cancelling or re-placing any "
+            "inherited order. "
+            "Omit entirely for standalone operation (no blue-green, normal "
+            "start/stop, cancels all orders on startup like before)."
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     args = _parse_args()
+
+    role = args.role  # "blue", "green", or ""
+
+    # Re-initialise logging with role suffix so blue/green write to separate files.
+    global logger
+    if role:
+        logger = _init_logging(GRID_CONFIG, role=role)
+        logger.info(f"[Main] Blue-green mode: role={role} pid={os.getpid()}")
 
     if args.reset_state:
         warning = (
@@ -5822,7 +6812,7 @@ def main():
                 )
                 sys.exit(1)
 
-    bot = GridBot(GRID_CONFIG, reset_state=args.reset_state)
+    bot = GridBot(GRID_CONFIG, reset_state=args.reset_state, role=role)
 
     def _shutdown(sig, frame):
         logger.info(f"[Main] Signal {sig} — shutting down")
