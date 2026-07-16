@@ -668,6 +668,7 @@ class _SafeQueueListener(logging.handlers.QueueListener):
 _log_queue:   queue.Queue        = queue.Queue(-1)
 _listener:    Optional[_SafeQueueListener] = None
 _file_handler: Optional[_HKTDailyRotatingHandler] = None
+_atexit_registered: bool = False
 
 
 def _init_logging(config: dict, role: str = "") -> logging.Logger:
@@ -677,8 +678,53 @@ def _init_logging(config: dict, role: str = "") -> logging.Logger:
     role: if non-empty ("blue" or "green"), log files are named
           grid_bot_{role}_YYYY-MM-DD.log instead of grid_bot_YYYY-MM-DD.log
           so that blue and green processes write to separate files.
+
+    Idempotent: this is called once unconditionally at module import (role=""
+    below) and, for a --role process, called AGAIN from main() once the role
+    is known. A prior version of this function wasn't safe to call twice —
+    each call spun up a brand new _SafeQueueListener thread and attached a
+    brand new QueueHandler to the same "GridBot" logger, on top of whatever
+    the previous call had already set up, rather than replacing it. Since
+    both listeners shared the same module-level _log_queue, the result was
+    two listener threads racing to dequeue from the same queue while two
+    QueueHandlers each enqueued every record once — non-deterministically
+    splitting and/or duplicating every subsequent log line across TWO
+    different files (the role-less grid_bot_YYYY-MM-DD.log from the import-time
+    call, and the role-specific grid_bot_<role>_YYYY-MM-DD.log from main()'s
+    call), depending purely on which listener thread happened to win the race
+    for the queue item that particular time. Confirmed via a standalone
+    reproduction: calling this twice reliably produced 0/1/2 copies of a
+    given line split unpredictably between the two files.
+
+    Now: any previously-running listener is stopped and any handler this
+    function previously attached to the logger is removed before the new
+    ones are created, so at most one QueueHandler/listener pair is ever
+    active regardless of how many times this is called.
     """
     global _listener, _file_handler
+
+    # Stop and detach whatever a previous call to this function set up, if
+    # anything — see docstring above for why this has to happen before
+    # creating the new listener/handler, not after.
+    if _listener is not None:
+        try:
+            _listener.stop()
+        except Exception:
+            pass
+    if _file_handler is not None:
+        try:
+            _file_handler.close()
+        except Exception:
+            pass
+    log = logging.getLogger("GridBot")
+    for h in list(log.handlers):
+        if isinstance(h, logging.handlers.QueueHandler):
+            log.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+
     log_dir      = config.get("log_dir", "logs_grid")
     backup_count = config.get("log_backup_count", 30)
     level        = getattr(logging, config.get("log_level", "INFO").upper(), logging.INFO)
@@ -715,9 +761,11 @@ def _init_logging(config: dict, role: str = "") -> logging.Logger:
         _orig_excepthook(exc_type, exc_value, exc_tb)
     sys.excepthook = _excepthook
 
-    atexit.register(lambda: _listener.stop() if _listener else None)
+    global _atexit_registered
+    if not _atexit_registered:
+        atexit.register(lambda: _listener.stop() if _listener else None)
+        _atexit_registered = True
 
-    log = logging.getLogger("GridBot")
     log.setLevel(logging.DEBUG)
     log.propagate = False
     qh = logging.handlers.QueueHandler(_log_queue)
