@@ -190,7 +190,7 @@ GRID_CONFIG: dict = {
     # min_grid_pct (0.0008) was the binding floor on spacing: with a fixed
     # maker_fee_rate, fee/gross ≈ 2 × maker_fee_rate / min_grid_pct, so widening
     # spacing is the only lever available to reduce the ratio.
-    "spacing_autotune_enabled":            False,  # opt-in; enable once comfortable
+    "spacing_autotune_enabled":            True,  # opt-in; enable once comfortable
     "spacing_autotune_target_fee_pct":     0.15,   # target fee/gross ratio
     "spacing_autotune_band":               0.05,   # +/- hysteresis band around target
     "spacing_autotune_step":               0.0002, # min_grid_pct adjustment per eval
