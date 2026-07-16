@@ -533,6 +533,21 @@ GRID_CONFIG: dict = {
     # needs to freeze + write JSON (typically < 1s), but short enough that a
     # dead blue process doesn't stall green's startup.
     "bg_handoff_timeout_s":   10,
+    # Blue-green: param continuity on handoff. When green's auto-tuner computes
+    # params that are "close enough" to the snapshot's, green reuses the
+    # snapshot's own lower/upper/spacing verbatim instead of the fresh values.
+    # This means every level price is identical to blue's → 100% order match
+    # instead of 0% match from a small mid-price drift. stop_price and
+    # notional_per_level are always taken from the fresh auto-tuner result.
+    #
+    # handoff_anchor_max_spacing_drift: how many spacings the new lower can
+    #   differ from the snapshot's lower before we treat it as a genuine
+    #   structural retune (not just a mid-price drift). Default 2.0 = if
+    #   the range shifted by less than 2 × spacing, it's drift, not retune.
+    # handoff_anchor_max_spacing_pct: max fractional change in spacing before
+    #   we treat the grid structure as genuinely different. Default 0.20 = 20%.
+    "handoff_anchor_max_spacing_drift": 2.0,
+    "handoff_anchor_max_spacing_pct":   0.20,
     # Minimum seconds to wait for the first live price tick (Phase 1 warmup).
     # Phase 2 waits separately inside start() until compute_atr() returns a
     # valid value (MIN_ATR_CANDLES=30 one-minute candles, ~30 min wall time).
@@ -6141,9 +6156,67 @@ class GridBot:
         # immediately overwriting the in-memory reference to it with the old
         # order's identity when the snapshot was applied) was the original,
         # most severe bug in this feature.
+        #
+        # HANDOFF PARAM CONTINUITY: if the snapshot's params are "close enough"
+        # to what the auto-tuner just computed, prefer the snapshot's own
+        # lower/upper/spacing over the freshly-computed ones. This is the key
+        # to avoiding a 0%-match on a minor mid-price drift between blue's
+        # freeze and green's rebuild. A small price movement (e.g. $17 on BTC)
+        # produces a new `lower` that's offset by that same amount, shifting
+        # every level price — even though the grid structure is identical.
+        # Reusing the snapshot's params keeps every level price identical to
+        # blue's, matching 100% of open orders.
+        #
+        # "Close enough" means:
+        #   - same level count (same number of orders to keep track of)
+        #   - lower/upper shift ≤ handoff_anchor_max_spacing_drift × spacing
+        #     (a pure mid-price drift, not a genuine structural retune)
+        #   - spacing within handoff_anchor_max_spacing_pct of the snapshot's
+        #     (auto-tuner has not meaningfully changed the grid structure)
+        # If any condition fails, the fresh params are used and mismatching
+        # orders are treated as orphans (cancel + recreate), as before.
         restore_plan: Dict[int, dict] = {}
         orphans:      List[dict]      = []
         if self._pending_handoff_snapshot is not None:
+            snap_p = self._pending_handoff_snapshot.get("params", {})
+            snap_levels   = int(snap_p.get("levels",  0))
+            snap_lower    = float(snap_p.get("lower",  0.0))
+            snap_upper    = float(snap_p.get("upper",  0.0))
+            snap_spacing  = float(snap_p.get("spacing", 0.0))
+
+            anchor_drift  = self._cfg.get("handoff_anchor_max_spacing_drift", 2.0)
+            anchor_sp_pct = self._cfg.get("handoff_anchor_max_spacing_pct", 0.20)
+
+            can_anchor = (
+                snap_levels > 0
+                and snap_spacing > 0
+                and new_params.levels == snap_levels
+                and abs(new_params.lower - snap_lower) <= anchor_drift * snap_spacing
+                and abs(new_params.spacing - snap_spacing) / snap_spacing <= anchor_sp_pct
+            )
+
+            if can_anchor:
+                # Reuse the snapshot's level prices verbatim.  Still recompute
+                # stop_price and notional_per_level from the fresh auto-tuner
+                # result so safety and sizing are always current.
+                anchored_params = GridParams(
+                    lower             = snap_lower,
+                    upper             = snap_upper,
+                    levels            = snap_levels,
+                    spacing           = snap_spacing,
+                    stop_price        = new_params.stop_price,
+                    notional_per_level= new_params.notional_per_level,
+                )
+                logger.info(
+                    f"[GridBot] Handoff anchor: reusing peer's level prices "
+                    f"range=[{snap_lower:.2f},{snap_upper:.2f}] spacing={snap_spacing:.2f} "
+                    f"(auto-tuner had [{new_params.lower:.2f},{new_params.upper:.2f}] "
+                    f"spacing={new_params.spacing:.2f} — within drift tolerance). "
+                    f"stop={new_params.stop_price:.2f} notional={new_params.notional_per_level:.2f} "
+                    f"kept fresh from auto-tuner."
+                )
+                new_params = anchored_params
+
             restore_plan, orphans = self._match_handoff_levels(new_params)
 
         self._engine = GridEngine(
@@ -6870,6 +6943,17 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
 
     bot.start()
+
+    # bot.start() is blocking — it only returns once stop() has fully run
+    # (either from a signal handler or the handoff watcher). At that point
+    # all trading activity has ceased and the DB connection is closed.
+    # Explicitly stop the async log QueueListener so its non-daemon thread
+    # doesn't keep the process alive indefinitely after main() returns.
+    # (The atexit handler does the same thing, but atexit only fires once
+    # Python's exit machinery can run — which it can't while a non-daemon
+    # thread is still blocking, creating the deadlock we see in practice.)
+    if _listener is not None:
+        _listener.stop()
 
 
 if __name__ == "__main__":
