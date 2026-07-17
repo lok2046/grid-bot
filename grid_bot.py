@@ -635,9 +635,21 @@ class _HKTDailyRotatingHandler(logging.handlers.BaseRotatingHandler):
         self._prune_old_logs()
 
     def _prune_old_logs(self) -> None:
+        """
+        Prune down to the last backup_count files.
+
+        Scans by a fixed shared prefix ("grid_bot"), NOT self.base_name.
+        base_name is now unique per live instance (grid_bot_gen{N}_...,
+        see _init_logging) specifically so concurrent/successive instances
+        never share a file. If this scanned by self.base_name instead, each
+        instance would only ever see its own single file and could never
+        prune any OTHER generation's old files — they'd accumulate forever.
+        Scanning by the family-wide prefix lets any instance's rollover
+        clean up everything, regardless of which generation or role wrote it.
+        """
         try:
             files = sorted(f for f in os.listdir(self.log_dir)
-                           if f.startswith(self.base_name) and f.endswith(".log"))
+                           if f.startswith("grid_bot") and f.endswith(".log"))
             for old in files[:-self.backup_count]:
                 os.remove(os.path.join(self.log_dir, old))
         except Exception:
@@ -686,35 +698,54 @@ _file_handler: Optional[_HKTDailyRotatingHandler] = None
 _atexit_registered: bool = False
 
 
-def _init_logging(config: dict, role: str = "") -> logging.Logger:
+def _init_logging(config: dict, role: str = "", log_gen: Optional[int] = None) -> logging.Logger:
     """
     Initialise async queue-based logging.
 
-    role: if non-empty ("blue" or "green"), log files are named
-          grid_bot_{role}_YYYY-MM-DD.log instead of grid_bot_YYYY-MM-DD.log
-          so that blue and green processes write to separate files.
+    role: cosmetic only now — included in the filename for human readability
+          (which role initiated this instance), but no longer what makes
+          filenames unique. Kept as a parameter so early-boot logging (the
+          module-import call below, and main()'s call before the bg_lock
+          generation is known) can still say "blue"/"green" in the filename
+          before log_gen exists.
+    log_gen: the bg_lock generation number for THIS live instance (see
+          GridStateStore.bg_lock_try_acquire). When given, log files are
+          named grid_bot_gen{N:05d}_{role|standalone}_YYYY-MM-DD.log — the
+          gen number is what actually guarantees a distinct file per
+          instance. Naming purely off role (the old scheme) broke down
+          once "no role swap" meant every deploy after the first used
+          --role green: all of them piled into the same
+          grid_bot_green_YYYY-MM-DD.log, since role no longer tracks which
+          process is actually live. When log_gen is None (only true before
+          any instance has acquired bg_lock), falls back to the role-only
+          name.
+    Zero-padded and placed immediately after the "grid_bot_gen" prefix so
+    that plain alphabetical filename sort is also chronological order,
+    regardless of role or date — see _prune_old_logs, which relies on that.
 
-    Idempotent: this is called once unconditionally at module import (role=""
-    below) and, for a --role process, called AGAIN from main() once the role
-    is known. A prior version of this function wasn't safe to call twice —
-    each call spun up a brand new _SafeQueueListener thread and attached a
-    brand new QueueHandler to the same "GridBot" logger, on top of whatever
-    the previous call had already set up, rather than replacing it. Since
-    both listeners shared the same module-level _log_queue, the result was
-    two listener threads racing to dequeue from the same queue while two
-    QueueHandlers each enqueued every record once — non-deterministically
-    splitting and/or duplicating every subsequent log line across TWO
-    different files (the role-less grid_bot_YYYY-MM-DD.log from the import-time
-    call, and the role-specific grid_bot_<role>_YYYY-MM-DD.log from main()'s
-    call), depending purely on which listener thread happened to win the race
-    for the queue item that particular time. Confirmed via a standalone
-    reproduction: calling this twice reliably produced 0/1/2 copies of a
-    given line split unpredictably between the two files.
+    Idempotent: this is called once unconditionally at module import
+    (role="", log_gen=None, below), again from main() once role is known
+    (still log_gen=None — bg_lock hasn't been acquired yet at that point),
+    and a third time from GridBot.start() once log_gen is known, so that
+    this instance's actual logging lands in its own file rather than
+    whatever main()'s early call picked. A prior version of this function
+    wasn't safe to call twice — each call spun up a brand new
+    _SafeQueueListener thread and attached a brand new QueueHandler to the
+    same "GridBot" logger, on top of whatever the previous call had already
+    set up, rather than replacing it. Since both listeners shared the same
+    module-level _log_queue, the result was two listener threads racing to
+    dequeue from the same queue while two QueueHandlers each enqueued every
+    record once — non-deterministically splitting and/or duplicating every
+    subsequent log line across TWO different files, depending purely on
+    which listener thread happened to win the race for the queue item that
+    particular time. Confirmed via a standalone reproduction: calling this
+    twice reliably produced 0/1/2 copies of a given line split unpredictably
+    between the two files.
 
     Now: any previously-running listener is stopped and any handler this
     function previously attached to the logger is removed before the new
     ones are created, so at most one QueueHandler/listener pair is ever
-    active regardless of how many times this is called.
+    active regardless of how many times this is called (now three).
     """
     global _listener, _file_handler
 
@@ -746,7 +777,15 @@ def _init_logging(config: dict, role: str = "") -> logging.Logger:
     fmt          = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                                      datefmt="%Y-%m-%d %H:%M:%S")
 
-    base_name = f"grid_bot_{role}" if role else "grid_bot"
+    if log_gen is not None:
+        base_name = f"grid_bot_gen{log_gen:05d}_{role or 'standalone'}"
+    else:
+        # Pre-acquisition calls (module import, and main() before bg_lock is
+        # taken) — no gen number exists yet. This name is transient: it's
+        # superseded the moment GridBot.start() re-calls _init_logging with
+        # the real log_gen, so nothing meaningful ever accumulates under it
+        # beyond a few lines of very-early boot logging.
+        base_name = f"grid_bot_{role}" if role else "grid_bot"
     _file_handler = _HKTDailyRotatingHandler(log_dir, base_name=base_name,
                                               backup_count=backup_count)
     _file_handler.setLevel(logging.DEBUG)
@@ -3827,7 +3866,7 @@ class TrendSignal:
 
 import sqlite3 as _sqlite3
 
-_GRID_DB_SCHEMA_VERSION = 6
+_GRID_DB_SCHEMA_VERSION = 7
 
 _GRID_DB_DDL = """
 -- Every grid fill: permanent, append-only audit log.
@@ -3888,10 +3927,19 @@ CREATE TABLE IF NOT EXISTS candle_cache (
 -- GridStateStore._BG_LOCK_STALE_AFTER_S or a later process is entitled to
 -- treat the lock as abandoned and take it over via the same atomic
 -- compare-and-swap used to originally acquire it. See GridStateStore.bg_lock_*.
+-- log_gen: monotonically incremented by the SAME compare-and-swap that
+-- grants the lock (see bg_lock_try_acquire), so every process that ever
+-- becomes the live holder — cold start, handoff winner, or crash-recovery
+-- resume, regardless of --role — gets a distinct number. Used to give each
+-- live instance its own log file (grid_bot_gen{N}_*.log) instead of naming
+-- log files off --role, which no longer 1:1-maps to "which process is
+-- live" now that role only controls handoff-request behaviour (see the
+-- blue-green deployment doc's "no role swap" section).
 CREATE TABLE IF NOT EXISTS bg_lock (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     holder_pid INTEGER,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    log_gen    INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -4007,6 +4055,21 @@ class GridStateStore:
                         "[GridStateStore] schema migrated -> v6 "
                         "(bg_live_pid/bg_handoff_claimant_pid replaced by bg_lock "
                         "CAS + heartbeat lease)"
+                    )
+                # v6->v7: log_gen column added to bg_lock. CREATE TABLE IF NOT
+                # EXISTS in the DDL above doesn't touch a table that already
+                # exists, so an existing bg_lock row needs an explicit ALTER.
+                if db_ver < 7:
+                    try:
+                        self._conn.execute(
+                            "ALTER TABLE bg_lock ADD COLUMN log_gen "
+                            "INTEGER NOT NULL DEFAULT 0"
+                        )
+                    except Exception:
+                        pass  # column already exists (idempotent)
+                    logger.info(
+                        "[GridStateStore] schema migrated -> v7 "
+                        "(bg_lock.log_gen for per-instance log file naming)"
                     )
                 if db_ver < _GRID_DB_SCHEMA_VERSION:
                     self._conn.execute(
@@ -4183,7 +4246,7 @@ class GridStateStore:
     BG_LOCK_HEARTBEAT_S   = 5.0
     BG_LOCK_STALE_AFTER_S = 20.0
 
-    def bg_lock_try_acquire(self, pid: int) -> bool:
+    def bg_lock_try_acquire(self, pid: int) -> Optional[int]:
         """
         Atomic compare-and-swap: acquires the single-instance lock iff it is
         currently unheld OR held-but-stale (its holder hasn't heartbeated
@@ -4194,18 +4257,37 @@ class GridStateStore:
         against the same DB file across processes, so two processes racing
         to acquire at the same instant can never both succeed — exactly one
         UPDATE's WHERE clause matches, the other's rowcount is 0.
-        Returns True iff THIS call acquired the lock.
+
+        The same UPDATE also atomically increments log_gen. Since this is
+        the single choke point every process passes through to become the
+        live holder — cold start, handoff winner, or crash-recovery resume,
+        regardless of --role (see _request_and_await_handoff) — log_gen
+        ends up a strictly-increasing, gap-free "instance number" that's
+        safe to use for per-instance log file naming without any separate
+        coordination.
+
+        Returns the new log_gen iff THIS call acquired the lock, else None.
+        (0 is never a valid return — log_gen starts at 0 and this always
+        increments before returning, so `is None` is the correct check, not
+        falsiness, though callers so far only ever check truthiness of a
+        result that's always >= 1 on success.)
         """
         now = time.time()
         stale_cutoff = now - self.BG_LOCK_STALE_AFTER_S
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE bg_lock SET holder_pid=?, updated_at=? "
+                "UPDATE bg_lock SET holder_pid=?, updated_at=?, log_gen=log_gen+1 "
                 "WHERE id=1 AND (holder_pid IS NULL OR updated_at < ?)",
                 (pid, now, stale_cutoff),
             )
+            if cur.rowcount != 1:
+                self._conn.commit()
+                return None
+            row = self._conn.execute(
+                "SELECT log_gen FROM bg_lock WHERE id=1"
+            ).fetchone()
             self._conn.commit()
-            return cur.rowcount == 1
+            return int(row["log_gen"])
 
     def bg_lock_heartbeat(self, pid: int) -> bool:
         """
@@ -4460,6 +4542,11 @@ class GridBot:
     def __init__(self, config: dict, reset_state: bool = False, role: str = ""):
         self._cfg         = config
         self._role        = role             # "blue", "green", or "" (standalone)
+        # Set by _try_acquire_bg_lock() once this process actually becomes
+        # the live holder (via any of the three paths — cold start, handoff
+        # winner, or crash-recovery resume). None until then. Used by
+        # start() to re-init logging into a file unique to this instance.
+        self._log_gen: Optional[int] = None
         self._stop_event  = threading.Event()
         self._engine:     Optional[GridEngine]    = None
         self._params:     Optional[GridParams]    = None
@@ -4761,9 +4848,17 @@ class GridBot:
         under WAL mode when multiple processes touch the DB at nearly the
         same instant. A real "someone else is genuinely running" case fails
         every attempt, since that holder's lease keeps refreshing.
+
+        On success, stashes the acquisition's log_gen on self._log_gen —
+        see GridBot.start() for where that's used to re-init logging into
+        this instance's own file, once it's known which of the three
+        acquisition paths (cold start / handoff winner / crash-recovery
+        resume) got here.
         """
         for attempt in range(5):
-            if self._store.bg_lock_try_acquire(os.getpid()):
+            gen = self._store.bg_lock_try_acquire(os.getpid())
+            if gen is not None:
+                self._log_gen = gen
                 return True
             if attempt < 4:
                 time.sleep(0.1)
@@ -5009,6 +5104,7 @@ class GridBot:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
+        global logger
         logger.info(f"[GridBot] Starting (role={self._role or 'standalone'})")
         self._oms.start()
         self._cmd_poller.start()   # start Telegram command polling early so /status works during warmup
@@ -5062,6 +5158,22 @@ class GridBot:
         # REST-seed-failure fallback, which can take tens of minutes) doesn't
         # get mistaken for a crash by some future process's staleness check.
         self._start_lock_heartbeat()
+
+        # Re-init logging now that log_gen is known, so this instance writes
+        # to its own file (grid_bot_gen{N}_*.log) instead of whatever file
+        # main()'s earlier role-only _init_logging call picked. _init_logging
+        # is idempotent (see its docstring) — safe to call again here; the
+        # previous listener/handler pair is torn down first. This is what
+        # actually fixes blue/green log commingling: log_gen is unique per
+        # live instance regardless of --role (see bg_lock_try_acquire), so
+        # unlike naming purely off --role, no two instances — however many
+        # deploys happen in a day — ever share a file.
+        if self._log_gen is not None:
+            logger = _init_logging(self._cfg, role=self._role, log_gen=self._log_gen)
+            logger.info(
+                f"[GridBot] Logging into generation {self._log_gen} "
+                f"(role={self._role or 'standalone'}, pid={os.getpid()})"
+            )
 
         self._market_ws.start()
 
