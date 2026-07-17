@@ -2437,7 +2437,8 @@ class SpacingAutoTuner:
     The tuned value is persisted via GridStateStore.set_meta() so it survives
     restarts instead of resetting to the hardcoded config default.
     """
-    META_KEY = "auto_tuned_min_grid_pct"
+    META_KEY          = "auto_tuned_min_grid_pct"
+    META_KEY_LAST_EVAL = "auto_tuned_last_eval_ts"
 
     def __init__(self, config: dict, store: "GridStateStore", alerter: "AlertManager"):
         self._cfg     = config
@@ -2447,6 +2448,10 @@ class SpacingAutoTuner:
         # cycles/day observed at the time of the most recent UP step, so the
         # NEXT evaluation can tell whether that step caused a collapse.
         self._cycles_after_last_widen: Optional[float] = None
+        # fee/gross observed at the time of the most recent UP step.  If the
+        # ratio hasn't improved meaningfully by the next evaluation, min_levels
+        # is likely overriding min_grid_pct and further widening is pointless.
+        self._fee_ratio_at_last_widen: Optional[float] = None
         # Set to True when _evaluate changes min_grid_pct; cleared by
         # GridBot._run() via pop_rebuild_requested() so the new spacing takes
         # effect immediately rather than waiting for the next natural retune.
@@ -2478,6 +2483,23 @@ class SpacingAutoTuner:
             + ("" if clamped == pct else f" (clamped from {pct:.5f})")
         )
 
+        # Restore last-eval timestamp so a restart within the 24h window
+        # doesn't immediately re-fire an evaluation (Bug: _last_eval_ts=0
+        # on every cold start caused one widen step per restart).
+        raw_ts = self._store.get_meta(self.META_KEY_LAST_EVAL)
+        if raw_ts is not None:
+            try:
+                self._last_eval_ts = float(raw_ts)
+                interval_s = self._cfg.get("spacing_autotune_interval_h", 24) * 3600
+                remaining_h = max(0.0, self._last_eval_ts + interval_s - time.time()) / 3600
+                logger.info(
+                    f"[SpacingAutoTuner] Restored last_eval_ts — "
+                    f"next eval in {remaining_h:.1f}h"
+                )
+            except (TypeError, ValueError):
+                logger.warning("[SpacingAutoTuner] Ignoring unparseable "
+                               f"persisted last_eval_ts: {raw_ts!r}")
+
     def pop_rebuild_requested(self) -> bool:
         """Return True (and clear the flag) if _evaluate changed min_grid_pct
         since the last call.  Called by GridBot._run() immediately after
@@ -2498,6 +2520,7 @@ class SpacingAutoTuner:
         if now - self._last_eval_ts < interval_s:
             return
         self._last_eval_ts = now
+        self._store.set_meta(self.META_KEY_LAST_EVAL, str(now))
         try:
             self._evaluate(now)
         except Exception:
@@ -2559,7 +2582,20 @@ class SpacingAutoTuner:
             reason = (f"cycles/day={cycles_per_day:.1f} < floor {min_cycles} "
                        f"after prior widening — backing off")
             self._cycles_after_last_widen = None
+            self._fee_ratio_at_last_widen = None
         elif fee_ratio > target + band and current < ceil:
+            # Guard: if we already widened once and fee/gross hasn't improved
+            # meaningfully, min_levels is likely overriding min_grid_pct and
+            # further widening will have no effect on actual spacing.
+            # Threshold: less than 10% relative improvement from last widen.
+            if (self._fee_ratio_at_last_widen is not None
+                    and fee_ratio >= self._fee_ratio_at_last_widen * 0.90):
+                logger.warning(
+                    f"[SpacingAutoTuner] fee/gross={fee_ratio:.1%} still high but "
+                    f"unchanged since last widen ({self._fee_ratio_at_last_widen:.1%}) — "
+                    f"min_levels is likely overriding min_grid_pct; skipping further widen"
+                )
+                return
             new_pct = min(ceil, round(current + step, 6))
             reason = f"fee/gross {fee_ratio:.1%} above target+band — widening spacing"
         elif fee_ratio < target - band and current > floor:
@@ -2575,6 +2611,7 @@ class SpacingAutoTuner:
         self._rebuild_requested = True
         if new_pct > current:
             self._cycles_after_last_widen = cycles_per_day
+            self._fee_ratio_at_last_widen = fee_ratio
         logger.info(
             f"[SpacingAutoTuner] ADJUST min_grid_pct {current:.5f} -> "
             f"{new_pct:.5f} ({reason})"
