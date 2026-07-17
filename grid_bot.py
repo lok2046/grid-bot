@@ -932,8 +932,24 @@ class TelegramCommandPoller:
         logger.info("[TgPoller] Command polling started")
 
     def stop(self) -> None:
+        """Signal stop and wait for the poll thread to drain (up to HTTP_TIMEOUT+5s)."""
         self._stop.set()
         self._thread.join(timeout=self._HTTP_TIMEOUT + 5)
+
+    def stop_nowait(self) -> None:
+        """
+        Signal stop WITHOUT joining the thread.  Used during blue-green handoff
+        export: the outgoing process needs to abort its in-flight getUpdates long-
+        poll (which holds the bot token exclusively for up to _POLL_TIMEOUT=30s)
+        so the incoming process's TgPoller doesn't get a 409 Conflict.  We
+        can't block here for up to 45s waiting for the HTTP request to drain —
+        the handoff must complete in under 2s.  The thread will exit on its own
+        once _stop is set (checked at the top of every poll iteration and inside
+        the retry back-off loop), and the process itself exits ~1-2s after the
+        handoff completes, so there is no thread leak.
+        """
+        self._stop.set()
+        logger.info("[TgPoller] stop_nowait — signalled (not joining; process exiting soon)")
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -4809,13 +4825,61 @@ class GridBot:
             self._store.bg_lock_release(os.getpid())
             return False
 
-        if snap.get("schema") != 2:
+        schema = snap.get("schema")
+        if schema not in (2, 3):
             logger.warning(
-                f"[GridBot] handoff snapshot: unknown schema {snap.get('schema')}"
+                f"[GridBot] handoff snapshot: unknown schema {schema}"
             )
             self._store.bg_clear_handoff_json()
             self._store.bg_lock_release(os.getpid())
             return False
+
+        # ── Schema 3: inject inherited price ticks and BuyGate scores early ──
+        # Do this before OMS registration and before warmup begins, so that:
+        #
+        # (a) compute_stability(5) returns ok=True at the very first AutoTuner
+        #     retune after handoff — the range guard is immediately available,
+        #     preventing the cold-cache SL that occurred on 2026-07-16 14:37:
+        #     the new process built a tight grid (stop=64588) only 214pts below
+        #     mid because compute_stability(5) returned ok=False (< 10 ticks in
+        #     the 5-min window) so the range guard was silently skipped.
+        #
+        # (b) _score_history has continuity across handoffs — if a SL occurs
+        #     shortly after the handoff, _calibrate_threshold() sees the
+        #     pre-handoff BuyGate scores and can auto-adjust the threshold.
+        if schema == 3:
+            price_ticks  = snap.get("price_ticks",  [])
+            score_history = snap.get("score_history", [])
+
+            if price_ticks:
+                # Merge inherited ticks into _price_cache._history.  The deque
+                # may already contain a few ticks from Phase 1 (the 10s warmup
+                # wait).  Sort chronologically; the deque's maxlen cap applies.
+                inherited = [(float(ts), float(mid)) for ts, mid in price_ticks]
+                with _price_cache._lock:
+                    existing = list(_price_cache._history)
+                    merged   = inherited + existing
+                    merged.sort(key=lambda x: x[0])
+                    _price_cache._history.clear()
+                    cap = _price_cache._history.maxlen or len(merged)
+                    for item in merged[-cap:]:
+                        _price_cache._history.append(item)
+                logger.info(
+                    f"[GridBot] Handoff: injected {len(inherited)} price ticks "
+                    f"from peer — compute_stability(5) now has "
+                    f"{len([t for t in merged if t[0] >= time.time()-300])} "
+                    f"ticks in last 5min"
+                )
+
+            if score_history:
+                # Prepend inherited scores to _score_history.  The pruning in
+                # _buy_gate() will clean up stale entries on the next BuyGate call.
+                inherited_scores = [(float(ts), float(sc)) for ts, sc in score_history]
+                self._score_history = inherited_scores + self._score_history
+                logger.info(
+                    f"[GridBot] Handoff: inherited {len(inherited_scores)} "
+                    f"BuyGate scores from peer"
+                )
 
         n_registered = 0
         for snap_lv in snap.get("levels", []):
@@ -5387,6 +5451,15 @@ class GridBot:
         logger.info("[GridBot] Handoff export: freezing order activity")
         self._engine._handoff_freeze = True
 
+        # Stop TgPoller immediately so the incoming process's TgPoller doesn't
+        # get a 409 Conflict from Telegram (two simultaneous getUpdates calls
+        # from the same bot token).  We signal stop but do NOT join() — the
+        # thread will drain on its own when the process exits ~1-2s later.
+        # Blocking here for up to HTTP_TIMEOUT+5=45s would break the <2s
+        # handoff window.
+        if self._cmd_poller is not None:
+            self._cmd_poller.stop_nowait()
+
         # Let any in-flight REST submissions complete before we snapshot.
         time.sleep(0.3)
 
@@ -5412,9 +5485,36 @@ class GridBot:
                     "is_initial_sell":  lv.client_oid in self._engine._initial_sell_oids,
                 })
 
+        # ── FIX: range guard warm-up + BuyGate calibration continuity ──────────
+        # Collect recent price ticks and BuyGate scores to hand off to the
+        # incoming process so it starts with a warm _price_cache and score history.
+        #
+        # Range guard (compute_stability(5)): needs ≥10 ticks within the last
+        # 5 minutes. We pass 10 minutes of ticks to give a comfortable margin
+        # even if warmup takes a few seconds.
+        #
+        # BuyGate calibration (_score_history): _calibrate_threshold() scans
+        # the last calib_lookback_s (default 120s) before a halt. If a SL
+        # occurs shortly after a handoff the score history in the new process
+        # would otherwise be empty. Pass the last lookback+60s of scores.
+        tick_window_s   = 10 * 60      # 10-minute tick window for range guard
+        score_window_s  = self._cfg.get("stop_score_calib_lookback_s", 120) + 60
+        now_export      = time.time()
+        with _price_cache._lock:
+            all_ticks = list(_price_cache._history)
+        tick_cutoff   = now_export - tick_window_s
+        recent_ticks  = [[ts, mid] for ts, mid in all_ticks if ts >= tick_cutoff]
+        score_cutoff  = now_export - score_window_s
+        recent_scores = [[ts, sc] for ts, sc in self._score_history
+                         if ts >= score_cutoff]
+        logger.info(
+            f"[GridBot] Handoff export: including {len(recent_ticks)} price ticks "
+            f"(last 10min) and {len(recent_scores)} BuyGate scores (last {score_window_s:.0f}s)"
+        )
+
         snapshot = {
-            "schema":      2,
-            "exported_at": time.time(),
+            "schema":      3,
+            "exported_at": now_export,
             "role":        self._role,
             "long_qty":    long_qty,
             "params": {
@@ -5426,7 +5526,10 @@ class GridBot:
                 "notional_per_level": params.notional_per_level,
                 "computed_at":        params.computed_at,
             },
-            "levels": levels_data,
+            "levels":       levels_data,
+            # Schema 3 additions:
+            "price_ticks":  recent_ticks,   # [[ts, mid], …] last 10 min
+            "score_history": recent_scores, # [[ts, score], …] last 120+60s
         }
 
         import json as _json
