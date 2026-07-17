@@ -778,7 +778,13 @@ def _init_logging(config: dict, role: str = "") -> logging.Logger:
 
     global _atexit_registered
     if not _atexit_registered:
-        atexit.register(lambda: _listener.stop() if (_listener and _listener._thread) else None)
+        def _stop_listener_atexit():
+            if _listener is not None:
+                try:
+                    _listener.stop()
+                except Exception:
+                    pass
+        atexit.register(_stop_listener_atexit)
         _atexit_registered = True
 
     log.setLevel(logging.DEBUG)
