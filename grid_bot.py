@@ -563,6 +563,13 @@ GRID_CONFIG: dict = {
     # causes missed fills or stale price decisions.
     "ws_reconnect_alert_count":    3,     # alert threshold (reconnects in window)
     "ws_reconnect_alert_window_s": 300,   # rolling window in seconds (default 5 min)
+    # Connect-failure alert: send a Telegram alert once the WS fails to
+    # connect ws_error_alert_count times IN A ROW with no successful reconnect
+    # in between (e.g. a Cloudflare/IP block on the handshake). This is
+    # separate from the reconnect-flood alert above, which only fires on
+    # successful reconnects — a total block would otherwise go unnoticed no
+    # matter how long it lasts, since no reconnect ever succeeds to trigger it.
+    "ws_error_alert_count": 5,            # consecutive failed attempts before alerting
     "ws_stale_threshold_s":   20,
     "ws_reconnect_backoff_s":  2,
     "ws_max_backoff_s":       60,
@@ -1780,7 +1787,8 @@ class _ReconnectingWS:
                  on_message_fn: Callable[[dict], None],
                  stale_s: float, backoff_init: float, backoff_max: float,
                  stop_event: threading.Event,
-                 on_reconnect_fn: Optional[Callable[[], None]] = None) -> None:
+                 on_reconnect_fn: Optional[Callable[[], None]] = None,
+                 on_error_fn: Optional[Callable[[str], None]] = None) -> None:
         self._name             = name
         self._url              = url
         self._subscribe_msg_fn = subscribe_msg_fn
@@ -1793,6 +1801,15 @@ class _ReconnectingWS:
         # first connect).  Used by GridBot to detect reconnect floods and
         # send a Telegram alert when the rate exceeds configured thresholds.
         self._on_reconnect_fn: Optional[Callable[[], None]] = on_reconnect_fn
+        # Optional callback fired on every FAILED connection attempt (e.g. a
+        # handshake 403/other error before on_open ever fires). Deliberately
+        # separate from on_reconnect_fn: a total block (WS handshake rejected
+        # every single attempt) never produces a successful reconnect, so
+        # on_reconnect_fn alone would never fire and a full outage could pass
+        # completely silently. Used by GridBot to alert on sustained
+        # connect-failure streaks regardless of whether a reconnect ever
+        # succeeds.
+        self._on_error_fn: Optional[Callable[[str], None]] = on_error_fn
         self._first_connect_done = False
 
         self._gen_lock  = threading.Lock()
@@ -1987,6 +2004,11 @@ class _ReconnectingWS:
     def _on_error(self, ws, error, gen: int) -> None:
         if self._is_current(ws):
             logger.warning(f"[{self._name}] WS error (gen={gen}): {error}")
+            if self._on_error_fn is not None:
+                try:
+                    self._on_error_fn(str(error))
+                except Exception as e:
+                    logger.warning(f"[{self._name}] on_error_fn error: {e}")
 
     def _on_close(self, ws, code, reason, gen: int) -> None:
         if self._is_current(ws):
@@ -4815,6 +4837,10 @@ class GridBot:
         # Rolling deque of reconnect timestamps for flood detection.
         # Kept on GridBot (not _ReconnectingWS) so alerting and config live in one place.
         self._ws_reconnect_times: collections.deque = collections.deque()
+        # Consecutive-failure outage tracking (see _on_ws_error / _on_ws_reconnect).
+        self._ws_consecutive_errors = 0
+        self._ws_outage_alerted     = False
+        self._ws_outage_since: Optional[float] = None
 
         self._market_ws = _ReconnectingWS(
             name             = "MarketWS",
@@ -4826,6 +4852,7 @@ class GridBot:
             backoff_max      = config.get("ws_max_backoff_s", 60),
             stop_event       = self._ws_stop,
             on_reconnect_fn  = self._on_ws_reconnect,
+            on_error_fn      = self._on_ws_error,
         )
 
     # ── WS subscriptions ──────────────────────────────────────────────────────
@@ -4898,6 +4925,61 @@ class GridBot:
                     f"[MarketWS] Reconnect flood continuing: {count} in "
                     f"{window_s:.0f}s (alert already sent)"
                 )
+
+        # A successful reconnect means the outage (if any) is over. If we'd
+        # previously sent a "can't connect" alert (see _on_ws_error), send a
+        # recovery message and reset the consecutive-failure streak.
+        if self._ws_outage_alerted:
+            outage_s = now - (self._ws_outage_since or now)
+            logger.info(f"[MarketWS] Reconnected after ~{outage_s:.0f}s outage")
+            self._alerter.send(
+                f"🟢 MarketWS reconnected after ~{int(outage_s)}s outage "
+                f"({self._ws_consecutive_errors} failed attempts)."
+            )
+        self._ws_consecutive_errors = 0
+        self._ws_outage_alerted     = False
+        self._ws_outage_since       = None
+
+    def _on_ws_error(self, error: str) -> None:
+        """
+        Called by _ReconnectingWS on EVERY failed connection attempt (e.g. a
+        handshake 403/other error before on_open ever fires) — unlike
+        _on_ws_reconnect, which only fires on a successful reconnect.
+
+        This exists specifically for the total-block case: if the WS never
+        successfully reconnects at all (e.g. a Cloudflare/IP block on the
+        handshake, as opposed to a flaky connection that keeps recovering),
+        _on_ws_reconnect never fires, so the existing reconnect-flood alert
+        would stay silent no matter how long the outage lasts. This tracks a
+        rolling count of consecutive failures (reset on the next successful
+        reconnect) and fires a single Telegram alert once that streak crosses
+        ws_error_alert_count, then stays quiet until either a reconnect
+        succeeds (see the recovery alert in _on_ws_reconnect) or the process
+        restarts.
+        """
+        self._ws_consecutive_errors += 1
+        threshold = self._cfg.get("ws_error_alert_count", 5)
+
+        if self._ws_outage_since is None:
+            self._ws_outage_since = time.time()
+
+        logger.info(
+            f"[MarketWS] Consecutive connect failures: "
+            f"{self._ws_consecutive_errors} (alert threshold={threshold})"
+        )
+
+        if self._ws_consecutive_errors == threshold and not self._ws_outage_alerted:
+            self._ws_outage_alerted = True
+            logger.warning(
+                f"[MarketWS] {self._ws_consecutive_errors} consecutive connect "
+                f"failures — sending outage alert. Last error: {error}"
+            )
+            self._alerter.send(
+                f"🔴 MarketWS can't connect: {self._ws_consecutive_errors} "
+                f"failed attempts in a row.\n"
+                f"Last error: {error}\n"
+                f"No live price feed — grid is running blind until this clears."
+            )
 
     # ── Blue-green: green-side handoff orchestration ──────────────────────────
 
