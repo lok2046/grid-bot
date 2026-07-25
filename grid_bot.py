@@ -5377,6 +5377,14 @@ class GridBot:
         # top-up (fetches only the gap since last shutdown, ~seconds of data).
         self._seed_atr_from_rest()
 
+        # ── Phase 2c: seed recent range ticks for compute_stability warm-up ───
+        # Guarantees compute_stability(5) returns ok=True at the first
+        # _rebuild_grid so the ATR range guard fires immediately on cold start.
+        # Root cause of 2026-07-17 13:40 SL: DB candles were ≥5 min old →
+        # 0 ticks in the 5-min window → range guard skipped → tight stop →
+        # SL within 12 minutes of boot. This 15-candle REST call fills the gap.
+        self._seed_recent_range_ticks()
+
         # ── Phase 2: wait until ATR is computable ─────────────────────────────
         # Normally instant after _seed_atr_from_rest().  Falls back to the
         # original live-accumulation path if the REST seed failed.
@@ -5662,6 +5670,145 @@ class GridBot:
             f"[GridBot] ATR seed complete: injected {injected} historical candles "
             f"({injected * 4} ticks) → {n_buckets} buckets now in cache"
         )
+
+    def _seed_recent_range_ticks(self) -> None:
+        """
+        Fetch the last 15 minutes of 1-min candles from CDC REST and inject
+        them into PriceCache._history with their real wall-clock timestamps.
+
+        Purpose
+        ───────
+        compute_stability(5) requires ≥10 ticks within the last 5 minutes of
+        wall-clock time.  The DB candle cache is snapshotted every 5 minutes,
+        so on a cold start the newest DB tick is ≥5 minutes old — outside the
+        5-min window.  _seed_atr_from_rest() skips the currently-open bucket
+        and typically injects ticks that are 1–2 minutes old, which may still
+        fall short.
+
+        Root cause of 2026-07-17 13:40 SL (cold-start stop-loss):
+          Bot started at 13:28; _seed_atr_from_rest fetched historical candles
+          but the most recent had ts ~13:27 (1 min old).  At the 13:28 rebuild
+          compute_stability(5) saw 0–2 ticks in [13:23,13:28] → ok=False →
+          range guard skipped → effective_atr=raw_atr → tight stop → SL.
+
+        This method fills that gap: 15 candles of 1-min OHLC cover the last
+        15 minutes, producing 60 synthetic ticks of which at least 20 fall
+        within the 5-min window (4 ticks × 5 candles).  After injection,
+        compute_stability(5) reliably returns ok=True at the very first build.
+
+        Implementation
+        ──────────────
+        Uses the same REST endpoint and injection strategy as _seed_atr_from_rest.
+        The 15-candle fetch is a separate, lightweight call (not merged into the
+        main seed) because:
+          1. It must run AFTER _seed_atr_from_rest so we don't overwrite the
+             carefully-merged historical data.
+          2. It targets a different goal (stability window freshness vs ATR
+             depth) with a different candle count and timestamp handling.
+          3. Keeping it separate makes the two phases independently testable.
+        """
+        rest_base = self._cfg.get("rest_base_url",
+                                   "https://api.crypto.com/exchange/v1")
+        url    = f"{rest_base}/public/get-candlestick"
+        params = {"instrument_name": INSTRUMENT, "timeframe": "1m", "count": 15}
+
+        logger.info(
+            "[GridBot] Phase 2c: seeding recent 5-min range ticks from REST "
+            "(15 × 1-min candles for compute_stability warm-up)..."
+        )
+        try:
+            resp = requests.get(url, params=params, timeout=10.0)
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as exc:
+            logger.warning(
+                f"[GridBot] Phase 2c: REST request failed ({exc}) — "
+                f"compute_stability(5) may return ok=False on first build; "
+                f"range guard will skip until live ticks accumulate (~5 min)"
+            )
+            return
+
+        if body.get("code", -1) != 0:
+            logger.warning(
+                f"[GridBot] Phase 2c: API returned code={body.get('code')} — "
+                f"range guard warm-up skipped"
+            )
+            return
+
+        candles = []
+        if isinstance(body.get("result"), dict):
+            candles = body["result"].get("data", [])
+
+        if not candles:
+            logger.warning("[GridBot] Phase 2c: empty candle list — range guard "
+                           "warm-up skipped")
+            return
+
+        current_bucket = int(time.time() // 60)
+        synthetic_ticks: list = []
+        injected = 0
+
+        for c in candles:
+            try:
+                ts_ms = int(c.get("t", 0))
+                o_px  = float(c.get("o", 0))
+                h_px  = float(c.get("h", 0))
+                l_px  = float(c.get("l", 0))
+                cl_px = float(c.get("c", 0))
+            except (TypeError, ValueError):
+                continue
+            if ts_ms <= 0 or any(p <= 0 for p in (o_px, h_px, l_px, cl_px)):
+                continue
+            ts_s   = ts_ms / 1000.0
+            bucket = int(ts_s // 60)
+            if bucket >= current_bucket:
+                continue   # skip the live open candle
+            synthetic_ticks.extend([
+                (ts_s +  0.0, o_px),
+                (ts_s + 15.0, h_px),
+                (ts_s + 45.0, l_px),
+                (ts_s + 59.0, cl_px),
+            ])
+            injected += 1
+
+        if injected == 0:
+            logger.warning("[GridBot] Phase 2c: no usable candles after filtering")
+            return
+
+        # Merge into _history (same strategy as _load_candles_from_db):
+        # sort chronologically, deduplicate by keeping the last value per
+        # timestamp (live WS ticks win over synthetic ones for the same ts).
+        synthetic_ticks.sort(key=lambda x: x[0])
+        with _price_cache._lock:
+            existing = list(_price_cache._history)
+            # Build a ts->mid dict so newer entries (live ticks) override older
+            # synthetic ones for the same timestamp.
+            merged_dict: dict = {}
+            for ts, mid in synthetic_ticks:
+                merged_dict[ts] = mid
+            for ts, mid in existing:
+                merged_dict[ts] = mid   # live ticks override synthetic
+            merged = sorted(merged_dict.items())
+            _price_cache._history.clear()
+            cap = _price_cache._history.maxlen or len(merged)
+            for item in merged[-cap:]:
+                _price_cache._history.append(item)
+
+        # Verify the warm-up worked
+        stab = _price_cache.compute_stability(5)
+        logger.info(
+            f"[GridBot] Phase 2c: injected {injected} recent candles "
+            f"({injected * 4} ticks) — compute_stability(5): "
+            f"ok={stab['ok']} n_ticks={stab['n_ticks']} "
+            f"hi_lo={stab['hi_lo']:.2f}"
+        )
+        if not stab["ok"]:
+            logger.warning(
+                "[GridBot] Phase 2c: compute_stability(5) still ok=False after "
+                f"seeding ({stab['n_ticks']} ticks in 5-min window) — range "
+                "guard will skip on first build; live ticks will warm it up "
+                "within ~5 minutes"
+            )
 
     def stop(self):
         logger.info("[GridBot] Stopping")
