@@ -200,6 +200,29 @@ GRID_CONFIG: dict = {
     "spacing_autotune_interval_h":         24,     # how often to re-evaluate
     "spacing_autotune_min_cycles_per_day": 30,     # floor — below this after a widen, back off
 
+    # ── TrendSignal-driven min_grid_levels auto-tuning ────────────────────────
+    # min_grid_levels is the binding constraint that defeats SpacingAutoTuner:
+    # with ATR ~38pts and a ~240pt grid, min_levels=5 forces 60pt spacing
+    # regardless of min_grid_pct.  The solution: auto-tune min_grid_levels
+    # based on TrendSignal regime, evaluated in real-time (every retune cycle).
+    #
+    # Rationale:
+    #   DOWN   → fewer, wider levels.  In a downtrend the grid risks being fully
+    #            swept by a sustained move.  Fewer levels = less total exposure,
+    #            wider spacing = each level captures more price movement.
+    #   NEUTRAL → balanced.  Default behaviour.
+    #   UP     → more levels.  In an uptrend the grid is less likely to be swept
+    #            downward; tighter spacing captures more chop cycles.
+    #
+    # When the regime changes, a grid rebuild is triggered immediately so the
+    # new level count takes effect without waiting for the next natural retune.
+    # The tuned value is stored in _cfg["min_grid_levels"] in-memory; the
+    # config default ("min_grid_levels": 5) is used as the NEUTRAL baseline.
+    "levels_autotune_enabled":        True,
+    "levels_autotune_down_levels":    3,   # DOWN regime  → at most 3 levels (wider, safer)
+    "levels_autotune_neutral_levels": 4,   # NEUTRAL      → 4 levels (balanced)
+    "levels_autotune_up_levels":      5,   # UP regime    → 5 levels (tighter, more cycles)
+
     # ── Dead-band stop-raise: risk-adaptive gating ────────────────────────────
     # When a dead-band retune wants to raise the in-place stop (see
     # GridBot._rebuild_grid()), four mechanisms now govern HOW that raise is
@@ -468,6 +491,21 @@ GRID_CONFIG: dict = {
     # Set stop_score_enabled=False to disable entirely (gate becomes a no-op).
     "stop_score_enabled":           True,
     "stop_score_threshold":         0.25,   # suppress buy if score ≥ this
+
+    # ── TrendSignal gate integration ──────────────────────────────────────────
+    # When TrendSignal is DOWN, the effective BuyGate threshold is multiplied
+    # by trend_gate_down_threshold_mult (< 1.0), making it easier to suppress
+    # buys.  e.g. threshold=0.25 * mult=0.60 → effective 0.15 on DOWN.
+    #
+    # Additionally, when the regime is DOWN and price is OUTSIDE_RANGE (the
+    # grid has been swept and the bot is fully long and most vulnerable),
+    # ALL new counter-buys are suppressed regardless of score. This directly
+    # addresses the SL2 pattern (2026-07-22 22:05-22:17): the drift-shift
+    # moved the grid up, BTC reversed, price went outside range below the
+    # grid, 5 buys accumulated into a DOWN regime → stop triggered.
+    "trend_gate_enabled":                         True,
+    "trend_gate_down_threshold_mult":             0.60,  # 0.25 * 0.60 = 0.15 effective threshold
+    "trend_gate_outside_range_block_on_down":     True,  # block ALL buys when DOWN + OUTSIDE_RANGE
                                             # 0.25 = suppress when mid is within ~2.25×ATR
                                             # of stop (with proximity_atr_scale=3).
                                             # Calibrated from 2026-07-08 log where peak
@@ -2437,8 +2475,9 @@ class SpacingAutoTuner:
     The tuned value is persisted via GridStateStore.set_meta() so it survives
     restarts instead of resetting to the hardcoded config default.
     """
-    META_KEY          = "auto_tuned_min_grid_pct"
+    META_KEY           = "auto_tuned_min_grid_pct"
     META_KEY_LAST_EVAL = "auto_tuned_last_eval_ts"
+    META_KEY_LEVELS    = "auto_tuned_min_grid_levels"
 
     def __init__(self, config: dict, store: "GridStateStore", alerter: "AlertManager"):
         self._cfg     = config
@@ -2452,10 +2491,14 @@ class SpacingAutoTuner:
         # ratio hasn't improved meaningfully by the next evaluation, min_levels
         # is likely overriding min_grid_pct and further widening is pointless.
         self._fee_ratio_at_last_widen: Optional[float] = None
-        # Set to True when _evaluate changes min_grid_pct; cleared by
-        # GridBot._run() via pop_rebuild_requested() so the new spacing takes
+        # Set to True when _evaluate changes min_grid_pct or when
+        # update_levels_from_trend() changes min_grid_levels; cleared by
+        # GridBot._run() via pop_rebuild_requested() so the new value takes
         # effect immediately rather than waiting for the next natural retune.
         self._rebuild_requested: bool = False
+        # Track the last regime seen so update_levels_from_trend() only
+        # triggers a rebuild when the regime actually changes, not every call.
+        self._last_levels_regime: str = ""
 
     def load_persisted(self) -> None:
         """Restore a previously auto-tuned min_grid_pct on startup, if any.
@@ -2500,10 +2543,98 @@ class SpacingAutoTuner:
                 logger.warning("[SpacingAutoTuner] Ignoring unparseable "
                                f"persisted last_eval_ts: {raw_ts!r}")
 
+    def load_persisted_levels(self) -> None:
+        """Restore a previously auto-tuned min_grid_levels on startup.
+        Call after load_persisted() so startup uses the last regime-tuned value."""
+        if self._store is None:
+            return
+        val = self._store.get_meta(self.META_KEY_LEVELS)
+        if val is None:
+            return
+        try:
+            levels = int(val)
+        except (TypeError, ValueError):
+            logger.warning(f"[SpacingAutoTuner] Ignoring unparseable persisted "
+                           f"levels value: {val!r}")
+            return
+        down_n    = self._cfg.get("levels_autotune_down_levels",    3)
+        up_n      = self._cfg.get("levels_autotune_up_levels",      5)
+        clamped   = max(down_n, min(up_n, levels))
+        self._cfg["min_grid_levels"] = clamped
+        logger.info(
+            f"[SpacingAutoTuner] Restored persisted min_grid_levels={clamped} "
+            f"from previous regime auto-tune"
+        )
+
+    def update_levels_from_trend(self, regime: str) -> None:
+        """
+        Adjust min_grid_levels in _cfg based on the current TrendSignal regime.
+        Called from GridBot._run() on every trend evaluation (every ~60s).
+
+        Design rationale:
+          DOWN    → 3 levels: fewer, wider grid levels reduce total long exposure
+                    in a falling market and produce a wider stop buffer per level.
+                    This breaks the SpacingAutoTuner deadlock: with min_levels=3
+                    and a 240pt grid, spacing=120pt which is well above the
+                    min_grid_pct floor of 0.0020×66400=133pt.
+          NEUTRAL → 4 levels: balanced.  One fewer than the config default (5)
+                    to allow SpacingAutoTuner to work without the binding constraint.
+          UP      → 5 levels: more levels in an uptrend captures more chop cycles;
+                    the grid is less likely to be swept downward in an uptrend.
+
+        Only triggers a rebuild (via _rebuild_requested flag) when the regime
+        changes — not on every call.  INSUFFICIENT_DATA leaves min_grid_levels
+        unchanged (hold the last known-good value).
+        """
+        if not self._cfg.get("levels_autotune_enabled", True):
+            return
+        # Ignore INSUFFICIENT_DATA: no information to act on; hold current value
+        if regime in (TrendSignal.REGIME_NODATA, "INSUFFICIENT_DATA"):
+            return
+        if regime == self._last_levels_regime:
+            return   # no change — avoid spurious rebuilds
+
+        down_n    = self._cfg.get("levels_autotune_down_levels",    3)
+        neutral_n = self._cfg.get("levels_autotune_neutral_levels", 4)
+        up_n      = self._cfg.get("levels_autotune_up_levels",      5)
+
+        new_levels = {
+            TrendSignal.REGIME_DOWN:    down_n,
+            TrendSignal.REGIME_NEUTRAL: neutral_n,
+            TrendSignal.REGIME_UP:      up_n,
+        }.get(regime, neutral_n)
+
+        old_levels = self._cfg.get("min_grid_levels", neutral_n)
+        self._cfg["min_grid_levels"] = new_levels
+        self._last_levels_regime = regime
+
+        if new_levels != old_levels:
+            logger.info(
+                f"[SpacingAutoTuner] Trend-driven levels: "
+                f"min_grid_levels {old_levels} → {new_levels} "
+                f"(regime={regime})"
+            )
+            self._rebuild_requested = True
+            if self._store is not None:
+                try:
+                    self._store.set_meta(self.META_KEY_LEVELS, str(new_levels))
+                except Exception as e:
+                    logger.warning(
+                        f"[SpacingAutoTuner] Failed to persist min_grid_levels: {e}"
+                    )
+        else:
+            # Same level count but regime changed (e.g. two regimes share the
+            # same configured value); update tracking but no rebuild needed.
+            logger.debug(
+                f"[SpacingAutoTuner] Regime changed to {regime}, "
+                f"min_grid_levels unchanged at {new_levels}"
+            )
+
     def pop_rebuild_requested(self) -> bool:
         """Return True (and clear the flag) if _evaluate changed min_grid_pct
-        since the last call.  Called by GridBot._run() immediately after
-        maybe_evaluate() so the new spacing takes effect on the next grid build
+        or update_levels_from_trend() changed min_grid_levels since the last
+        call.  Called by GridBot._run() immediately after maybe_evaluate() and
+        _evaluate_trend() so the new value takes effect on the next grid build
         rather than waiting for the next natural retune."""
         v, self._rebuild_requested = self._rebuild_requested, False
         return v
@@ -5281,6 +5412,7 @@ class GridBot:
         self._alerter.send(f"🟢 GridBot started — {TRADING_MODE.upper()} | {INSTRUMENT}")
 
         self._spacing_tuner.load_persisted()
+        self._spacing_tuner.load_persisted_levels()
         self._rebuild_grid()
 
         # ── Any --role process: watch for the next handoff request ───────────
@@ -6390,13 +6522,56 @@ class GridBot:
             _bot_ref._score_history = [
                 (t, s) for t, s in _bot_ref._score_history if t >= cutoff
             ]
-            threshold = _bot_ref._get_threshold()
+
+            # ── TrendSignal gate integration ──────────────────────────────────
+            # When TrendSignal is DOWN two protections activate (if enabled):
+            #
+            # 1. Threshold multiplier: effective threshold is lowered by
+            #    trend_gate_down_threshold_mult, making it easier to suppress
+            #    buys when the broader trend is bearish.
+            #
+            # 2. OUTSIDE_RANGE block: when regime is DOWN *and* price has
+            #    fallen below the grid lower bound (the bot is fully long and
+            #    most vulnerable to a continued decline), ALL new counter-buys
+            #    are blocked regardless of score.  This directly addresses
+            #    the SL2 pattern (2026-07-22 22:05–22:17): drift-shift moved
+            #    the grid up, BTC reversed hard, price went OUTSIDE_RANGE
+            #    below the grid into a DOWN regime, 5 buys accumulated
+            #    (0.0300 BTC) → stop triggered.
+            regime     = _bot_ref._last_trend_regime
+            trend_note = ""
+            threshold  = _bot_ref._get_threshold()
+
+            if _bot_ref._cfg.get("trend_gate_enabled", True):
+                is_down = (regime == TrendSignal.REGIME_DOWN)
+                if is_down:
+                    # Protection 2: OUTSIDE_RANGE block
+                    params = _bot_ref._params
+                    if (params is not None
+                            and _bot_ref._cfg.get(
+                                "trend_gate_outside_range_block_on_down", True)
+                            and mid_now < params.lower):
+                        logger.info(
+                            f"[BuyGate] SUPPRESS (TrendSignal DOWN + OUTSIDE_RANGE: "
+                            f"mid={mid_now:.2f} < lower={params.lower:.2f}) "
+                            f"score={score:.4f}"
+                        )
+                        return False
+
+                    # Protection 1: threshold multiplier
+                    mult = _bot_ref._cfg.get("trend_gate_down_threshold_mult", 0.60)
+                    old_thr = threshold
+                    threshold = threshold * mult
+                    trend_note = (
+                        f" [DOWN: threshold {old_thr:.4f}×{mult:.2f}={threshold:.4f}]"
+                    )
+
             allow = score < threshold
             # Always log at INFO so gate decisions are visible in the daily
             # log and calibration history is auditable.
             logger.info(
-                f"[BuyGate] score={score:.4f} threshold={threshold:.4f} "
-                f"→ {'ALLOW' if allow else 'SUPPRESS'}"
+                f"[BuyGate] score={score:.4f} threshold={threshold:.4f}"
+                f"{trend_note} → {'ALLOW' if allow else 'SUPPRESS'}"
             )
             return allow
 
@@ -7100,7 +7275,7 @@ class GridBot:
                 f"{icon} *Trend regime changed*: `{prev}` → `{regime}`\n"
                 f"EMA4h={result['ema_fast']:,.2f}  EMA24h={result['ema_slow']:,.2f}\n"
                 f"sep={result['separation']:+.3f}%  slope={result['slope_pct']:+.3f}%\n"
-                f"_Read-only signal — grid not affected_"
+                f"_Affects: BuyGate threshold and min grid levels_"
             )
             logger.info(
                 f"[TrendSignal] ⚠️  Regime change: {prev} → {regime} "
@@ -7109,6 +7284,14 @@ class GridBot:
 
         self._last_trend_regime = regime
         self._last_trend_slope_pct = result.get("slope_pct", 0.0)
+
+        # Adjust min_grid_levels based on the new regime.  This is the
+        # mechanism that breaks the SpacingAutoTuner deadlock: a regime
+        # change immediately sets a regime-appropriate level count and
+        # requests a grid rebuild, so the next retune uses the right levels
+        # without waiting for the 24h SpacingAutoTuner evaluation cycle.
+        self._spacing_tuner.update_levels_from_trend(regime)
+
         return result
 
 
