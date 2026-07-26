@@ -4831,6 +4831,7 @@ class GridBot:
             allowed_chat_id = config.get("telegram_chat_id",   ""),
         )
         self._cmd_poller.register("/status", self._handle_status_command)
+        self._cmd_poller.register("/handoff", self._handle_handoff_command)
 
         # WS market feed
         self._ws_stop = threading.Event()
@@ -7239,6 +7240,60 @@ class GridBot:
                 f"Grid is running again for now, but if it hits stop-loss and "
                 f"halts again, it will NOT auto-restart — manual restart required."
             )
+
+    # ── /handoff Telegram command ─────────────────────────────────────────────
+
+    def _handle_handoff_command(self) -> str:
+        """
+        Telegram /handoff command: initiate a blue-green handoff from within
+        the running process.
+
+        This is the safe way to deploy a new version without position
+        liquidation.  The sequence after this command is received:
+
+          1. This handler calls export_handoff_snapshot() on the TgPoller
+             thread — it freezes order activity, snapshots GridEngine state,
+             writes the JSON to SQLite, stops TgPoller (409-prevention), and
+             arms _handoff_stop so stop() won't liquidate.
+          2. This handler then sets _handoff_shutdown_requested so the main
+             _run() loop will call stop() on the main thread on its next
+             iteration (same pattern as _start_handoff_watcher — stop() must
+             run on the main thread, not the TgPoller thread).
+          3. The operator starts the new (green) process:
+               python grid_bot.py --role green
+             It finds the snapshot, acquires the lock, and resumes trading
+             with the inherited position and orders.
+
+        Returns a confirmation string — note TgPoller may not deliver it
+        because stop_nowait() is called inside export_handoff_snapshot() and
+        the underlying HTTP request may already be in flight when the poller
+        stops.  That is expected and harmless.
+        """
+        if self._engine is None:
+            return "⚠️ /handoff: no grid engine running — nothing to hand off."
+
+        logger.info("[GridBot] /handoff command received — initiating handoff")
+
+        try:
+            ok = self.export_handoff_snapshot()
+        except Exception as e:
+            logger.error(f"[GridBot] /handoff: export_handoff_snapshot failed: {e}")
+            return f"❌ /handoff: snapshot export failed: {e}"
+
+        if not ok:
+            return "⚠️ /handoff: snapshot export returned False — no engine running?"
+
+        # Signal the main thread to shut down (stop() must run on main thread).
+        # _handoff_stop is already True (set inside export_handoff_snapshot),
+        # so stop() will skip position liquidation.
+        self._handoff_shutdown_requested.set()
+
+        # Note: TgPoller was stopped by stop_nowait() inside
+        # export_handoff_snapshot(), so this reply string may not be delivered
+        # before the process exits.  That is expected — the /deploy Telegram
+        # alert will confirm the outgoing process stopped cleanly, and the
+        # incoming process's startup alert confirms the handoff succeeded.
+        return "✅ Handoff snapshot written — shutting down. Start green process now."
 
     # ── /status Telegram command ──────────────────────────────────────────────
 
