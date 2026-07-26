@@ -4830,8 +4830,9 @@ class GridBot:
             token           = config.get("telegram_bot_token", ""),
             allowed_chat_id = config.get("telegram_chat_id",   ""),
         )
-        self._cmd_poller.register("/status", self._handle_status_command)
+        self._cmd_poller.register("/status",  self._handle_status_command)
         self._cmd_poller.register("/handoff", self._handle_handoff_command)
+        self._cmd_poller.register("/help",    self._handle_help_command)
 
         # WS market feed
         self._ws_stop = threading.Event()
@@ -7294,6 +7295,28 @@ class GridBot:
         # alert will confirm the outgoing process stopped cleanly, and the
         # incoming process's startup alert confirms the handoff succeeded.
         return "✅ Handoff snapshot written — shutting down. Start green process now."
+
+    # ── /help Telegram command ───────────────────────────────────────────────
+
+    def _handle_help_command(self) -> str:
+        """Return a summary of all available Telegram commands."""
+        return (
+            "📖 Available commands\n"
+            "\n"
+            "Bot commands (grid_bot.py)\n"
+            "  /status    — Grid position, PnL, stop-score, TrendSignal\n"
+            "  /handoff   — Hibernate: save state and exit without liquidating\n"
+            "               (start new process with /restart to resume)\n"
+            "\n"
+            "Launcher commands (grid_bot_launcher.py)\n"
+            "  /restart   — Start new bot process (picks up /handoff snapshot)\n"
+            "  /pstatus   — Process status: PID, uptime, last 10 log lines\n"
+            "  /kill      — Emergency stop: SIGTERM → clean shutdown + liquidation\n"
+            "\n"
+            "Typical deployment flow\n"
+            "  1\u20e3  /handoff  → bot saves state, exits\n"
+            "  2\u20e3  /restart  → new bot resumes with same position"
+        )
 
     # ── /status Telegram command ──────────────────────────────────────────────
 

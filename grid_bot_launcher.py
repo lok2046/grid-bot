@@ -282,7 +282,7 @@ class Launcher:
 
     def run(self) -> None:
         log.info("[Launcher] Starting — listening for Telegram commands")
-        self._tg.send("🚀 Grid bot launcher started. Commands: /restart /pstatus /kill")
+        self._tg.send("🚀 Grid bot launcher started. Send /help for available commands.")
         last_heartbeat = time.time()
 
         while not self._stop.is_set():
@@ -310,9 +310,30 @@ class Launcher:
             self._cmd_status()
         elif cmd == "/kill":
             self._cmd_kill()
+        elif cmd == "/help":
+            self._cmd_help()
         else:
             # Ignore unknown commands (may be intended for the bot's own poller)
             log.debug(f"[Launcher] Ignoring unknown command: {cmd}")
+
+    def _cmd_help(self) -> None:
+        self._tg.send(
+            "📖 Available commands\n"
+            "\n"
+            "Bot commands (grid_bot.py)\n"
+            "  /status    — Grid position, PnL, stop-score, TrendSignal\n"
+            "  /handoff   — Hibernate: save state and exit without liquidating\n"
+            "               (start new process with /restart to resume)\n"
+            "\n"
+            "Launcher commands (grid_bot_launcher.py)\n"
+            "  /restart   — Start new bot process (picks up /handoff snapshot)\n"
+            "  /pstatus   — Process status: PID, uptime, last 10 log lines\n"
+            "  /kill      — Emergency stop: SIGTERM \u2192 clean shutdown + liquidation\n"
+            "\n"
+            "Typical deployment flow\n"
+            "  1\u20e3  /handoff  \u2192 bot saves state, exits\n"
+            "  2\u20e3  /restart  \u2192 new bot resumes with same position"
+        )
 
     def _cmd_restart(self) -> None:
         delay = self._cfg["restart_delay_s"]
