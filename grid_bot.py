@@ -343,6 +343,69 @@ GRID_CONFIG: dict = {
     "stop_buffer_atr_expansion_threshold": 1.5,  # ATR/mean_ATR ratio that triggers widening
     "stop_buffer_atr_max_mult":            2.0,  # cap: buffer never exceeds base × this
 
+    # ── Stop-buffer widening: baseline window + absolute floor (2026-07-28) ──
+    # 2026-07-28 06:02 rebuild: effective_atr=84.95 vs a mean of the last ~20
+    # RETUNE EVENTS (not a fixed time window). Because retunes cluster during
+    # volatile stretches (the morning already had multiple regime shifts), that
+    # event-count mean was itself already elevated (~60-80), so the relative
+    # ratio never crossed the 1.5x threshold and the buffer stayed at the base
+    # 3.0x even though 84.95 pts was ~2.4x the raw 24h ATR (34.91). A further
+    # ~330-pt move in well under a minute then breached the stop.
+    #
+    # Two independent additions, both layered on top of the pre-existing
+    # relative-expansion check (they only ever WIDEN the buffer further, never
+    # narrow it):
+    #
+    #  1. stop_buffer_baseline_window_hours — the "recent mean" used for the
+    #     relative-expansion ratio is now built from samples within a fixed
+    #     WALL-CLOCK window instead of the last N retune events, so a burst of
+    #     retunes during a choppy stretch can no longer drag the baseline up
+    #     to match current conditions. Falls back to the old event-count mean
+    #     if there isn't yet enough time-window history (e.g. just after
+    #     startup) — see stop_buffer_baseline_min_samples/_min_span_frac.
+    #
+    #  2. stop_buffer_atr_absolute_widen_mult — a SEPARATE, absolute trigger:
+    #     if effective_atr exceeds (min_atr_floor_pts × this), the buffer
+    #     widens proportionally regardless of what the recent mean is doing.
+    #     This catches the case above: 84.95 is 2.83x the 30.0-pt quiet-market
+    #     floor even though it wasn't "expanding" relative to an already-hot
+    #     recent baseline.
+    #
+    #     IMPORTANT — trend-regime gate: on 2026-07-28, TrendSignal had
+    #     already flagged DOWN at the same 06:02 rebuild. Checking what
+    #     actually happened next: price kept falling for hours afterwards
+    #     (mid ~63100-63700 through 11:00, well past the ~64113 flash low that
+    #     tripped the stop). A wider stop at that moment would NOT have saved
+    #     a whipsaw — it would have kept the position open into a much larger,
+    #     ongoing decline. So BOTH widen paths (relative expansion AND the
+    #     absolute trigger above) are gated OFF whenever TrendSignal reports
+    #     DOWN: widening is meant to protect against noise-driven ATR spikes
+    #     in a range-bound/uptrending market, not to loosen the stop during a
+    #     confirmed downtrend, which is exactly when the tighter stop is doing
+    #     its job. (The gate applies to both paths because the reasoning
+    #     doesn't depend on which check would have triggered the widen — an
+    #     earlier revision of this fix only gated the absolute path, which
+    #     left the relative-expansion path, now more sensitive thanks to the
+    #     windowed baseline above, able to widen the buffer during a
+    #     downtrend anyway. Corrected before this landed.) Set
+    #     stop_buffer_absolute_widen_skip_on_downtrend=False to remove this
+    #     gate entirely if you decide you don't want it.
+    #
+    #     NOTE: this gate depends on TrendSignal.regime being read as a
+    #     property (self._trend.regime, no parens) at the _rebuild_grid()
+    #     call site. TrendSignal.regime is decorated @property specifically
+    #     so that bare attribute access returns the confirmed regime string
+    #     rather than a bound method — an earlier revision of this patch
+    #     lacked that decorator, which made the trend_regime comparison
+    #     always False and silently disabled this entire gate. If you ever
+    #     see stop-buffer widening happening during a confirmed downtrend,
+    #     check that decorator is still there first.
+    "stop_buffer_baseline_window_hours":      12.0,  # wall-clock window for the relative-expansion mean
+    "stop_buffer_baseline_min_samples":        3,    # need >= this many samples in the window to trust it
+    "stop_buffer_baseline_min_span_frac":      0.25, # ...and they must span >= this fraction of the window
+    "stop_buffer_atr_absolute_widen_mult":     2.0,  # absolute reference = min_atr_floor_pts × this
+    "stop_buffer_absolute_widen_skip_on_downtrend": True,
+
     # ── ATR floor + recent-range guard ───────────────────────────────────────
     # During rapid directional moves (e.g. a fast 200-pt BTC spike) the 1-min
     # candles are all narrow and directional, which collapses the rolling ATR.
@@ -448,6 +511,31 @@ GRID_CONFIG: dict = {
                                              # this many ATRs below halt_stop (absolute lower bound).
                                              # Default 15 → floor never goes more than 15×ATR below
                                              # halt_stop regardless of how long the bot has been halted.
+                                             #
+                                             # 2026-07-28: after a 06:40 stop-loss (halt_stop=64126.45),
+                                             # price kept falling to ~63100-63300 and stayed there. The
+                                             # floor decay hit its 15×ATR cap at ~4.83h halted (floor
+                                             # pinned ~63565) and, since it never decays past that cap,
+                                             # the bot was still waiting at 11:33 (~4.9h halted) with
+                                             # mid ~300+ pts below the floor and no further easing ever
+                                             # coming — i.e. condition 2 (price recovery) could stay
+                                             # unsatisfiable indefinitely once the cap is hit, even
+                                             # though conditions 3/4 (tight range, flat/rising) might
+                                             # otherwise be satisfied by a genuinely calm new price level.
+                                             # See auto_restart_max_halt_hours below for the fix.
+    "auto_restart_max_halt_hours": 8.0,      # Hard timeout for condition 2 (price-recovery-floor) only.
+                                             # Once halted this long, condition 2 is SKIPPED entirely —
+                                             # the bot no longer waits for mid to clear the (now-capped)
+                                             # recovery floor at all. Conditions 1 (cooldown), 3 (tight
+                                             # range) and 4 (flat/rising trend) are NOT skipped: the bot
+                                             # still requires the market to have genuinely settled into a
+                                             # stable band before restarting, it just stops insisting that
+                                             # band be within reach of the OLD stop level. A one-time
+                                             # Telegram alert fires the moment the timeout is reached so
+                                             # you know the gate has changed, and manual /restart remains
+                                             # available at any time regardless of this setting.
+                                             # Set to 0 to disable (old behaviour: condition 2 can block
+                                             # forever once the floor decay is capped).
     "auto_restart_max_attempts":      3,     # give up after N failed attempts; 0 = unlimited
     "auto_restart_attempt_reset_hours": 24,  # if the grid has been running healthily (no halt)
                                              # for this long since the last auto-restart, the
@@ -2338,7 +2426,9 @@ class GridAutoTuner:
     def __init__(self, config: dict, cache: PriceCache):
         self._cfg        = config
         self._cache      = cache
-        self._recent_atrs: List[float] = []   # for adaptive stop buffer
+        self._recent_atrs: List[float] = []   # for adaptive stop buffer (legacy, event-count based;
+                                               # kept as-is for get_mean_atr(), used by StopScoreCalculator)
+        self._recent_atr_samples: List[Tuple[float, float]] = []  # (timestamp, effective_atr), wall-clock windowed
 
     def _resolve_notional(self, levels: int, mid: float) -> float:
         """
@@ -2380,7 +2470,7 @@ class GridAutoTuner:
         logger.warning("[AutoTuner] No investment amount configured — defaulting to $500/level")
         return 500.0
 
-    def compute(self) -> Optional[GridParams]:
+    def compute(self, trend_regime: Optional[str] = None) -> Optional[GridParams]:
         mid = self._cache.get_mid()
         if mid is None:
             logger.warning("[AutoTuner] No mid price")
@@ -2438,26 +2528,103 @@ class GridAutoTuner:
         # ── Adaptive stop buffer ──────────────────────────────────────────────
         # If ATR has expanded sharply vs its own recent mean, widen the buffer
         # proportionally to protect against sudden volatility regime shifts.
+        #
+        # Two checks feed into the same adaptive_mult (each can only WIDEN the
+        # buffer further — neither ever narrows it below the base):
+        #   (a) relative — effective_atr vs a wall-clock-windowed mean (falls
+        #       back to the legacy event-count mean if the time window doesn't
+        #       have enough history yet)
+        #   (b) absolute — effective_atr vs a fixed reference (min_atr_floor_pts
+        #       × stop_buffer_atr_absolute_widen_mult), independent of recent
+        #       history, gated off during a confirmed TrendSignal DOWN regime
+        #       (see GRID_CONFIG comment for the 2026-07-28 incident behind
+        #       this — a wider stop mid-downtrend would have held the position
+        #       into a much larger ongoing decline, not saved a whipsaw).
         expansion_threshold = self._cfg.get("stop_buffer_atr_expansion_threshold", 1.5)
         max_mult            = self._cfg.get("stop_buffer_atr_max_mult", 2.0)
+
+        # Legacy event-count list — kept as-is (also feeds get_mean_atr(), used
+        # elsewhere by StopScoreCalculator).
         recent_atrs = self._recent_atrs
         recent_atrs.append(effective_atr)
         if len(recent_atrs) > 20:          # keep last 20 builds (~20 retune events)
             recent_atrs.pop(0)
-        if len(recent_atrs) >= 3:
-            mean_atr = sum(recent_atrs[:-1]) / len(recent_atrs[:-1])
-            if mean_atr > 0:
-                expansion_ratio = effective_atr / mean_atr
-                if expansion_ratio > expansion_threshold:
-                    adaptive_mult = min(expansion_ratio / expansion_threshold, max_mult)
-                    old_buf = stop_buf
-                    stop_buf = round(stop_buf * adaptive_mult, 2)
-                    logger.info(
-                        f"[AutoTuner] ATR expansion detected: "
-                        f"effective_atr={effective_atr:.2f} vs mean={mean_atr:.2f} "
-                        f"(ratio={expansion_ratio:.2f}x) -> "
-                        f"stop_buffer {old_buf}xATR -> {stop_buf}xATR"
+
+        now = time.time()
+        window_h_cfg = self._cfg.get("stop_buffer_baseline_window_hours", 12.0)
+        baseline_mean = self._windowed_baseline_atr(now, effective_atr)
+        baseline_source = f"{window_h_cfg:g}h-window"
+        if baseline_mean is None and len(recent_atrs) >= 3:
+            baseline_mean = sum(recent_atrs[:-1]) / len(recent_atrs[:-1])
+            baseline_source = "event-count (fallback, insufficient time-window history)"
+
+        # Downtrend gate: computed once, applied to BOTH the relative and
+        # absolute widen checks below. The 2026-07-28 incident showed that a
+        # wider stop mid-confirmed-downtrend holds the position into a larger
+        # ongoing decline rather than surviving a whipsaw — that reasoning
+        # doesn't depend on which check (relative vs absolute) would have
+        # triggered the widen, so both are gated the same way.
+        skip_on_down = self._cfg.get("stop_buffer_absolute_widen_skip_on_downtrend", True)
+        downtrend_gated = skip_on_down and trend_regime == "DOWN"
+
+        adaptive_mult = 1.0
+        widen_notes = []
+        skipped_notes = []
+
+        if baseline_mean and baseline_mean > 0:
+            expansion_ratio = effective_atr / baseline_mean
+            if expansion_ratio > expansion_threshold:
+                if downtrend_gated:
+                    skipped_notes.append(
+                        f"relative (effective_atr={effective_atr:.2f} vs "
+                        f"{baseline_source} mean={baseline_mean:.2f}, "
+                        f"ratio={expansion_ratio:.2f}x)"
                     )
+                else:
+                    rel_mult = min(expansion_ratio / expansion_threshold, max_mult)
+                    if rel_mult > adaptive_mult:
+                        adaptive_mult = rel_mult
+                    widen_notes.append(
+                        f"relative: effective_atr={effective_atr:.2f} vs "
+                        f"{baseline_source} mean={baseline_mean:.2f} "
+                        f"(ratio={expansion_ratio:.2f}x)"
+                    )
+
+        absolute_widen_mult_cfg = self._cfg.get("stop_buffer_atr_absolute_widen_mult", 2.0)
+        absolute_reference = atr_floor * absolute_widen_mult_cfg
+
+        if effective_atr > absolute_reference:
+            if downtrend_gated:
+                skipped_notes.append(
+                    f"absolute (effective_atr={effective_atr:.2f} > "
+                    f"absolute_ref={absolute_reference:.2f}, "
+                    f"{absolute_widen_mult_cfg}x min_atr_floor_pts)"
+                )
+            else:
+                abs_ratio = effective_atr / absolute_reference
+                abs_mult = min(abs_ratio, max_mult)
+                if abs_mult > adaptive_mult:
+                    adaptive_mult = abs_mult
+                widen_notes.append(
+                    f"absolute: effective_atr={effective_atr:.2f} > "
+                    f"absolute_ref={absolute_reference:.2f} "
+                    f"({absolute_widen_mult_cfg}x min_atr_floor_pts, ratio={abs_ratio:.2f}x)"
+                )
+
+        if skipped_notes:
+            logger.info(
+                f"[AutoTuner] Stop-buffer widen skipped (TrendSignal=DOWN): "
+                f"{' & '.join(skipped_notes)} — keeping tighter stop while "
+                f"trend is confirmed down"
+            )
+
+        if adaptive_mult > 1.0:
+            old_buf = stop_buf
+            stop_buf = round(stop_buf * adaptive_mult, 2)
+            logger.info(
+                f"[AutoTuner] Stop-buffer widened ({' & '.join(widen_notes)}) -> "
+                f"stop_buffer {old_buf}xATR -> {stop_buf}xATR (mult={adaptive_mult:.2f}x)"
+            )
 
         lower = round(mid - atr_mult * effective_atr, 2)
         upper = round(mid + atr_mult * effective_atr, 2)
@@ -2516,6 +2683,41 @@ class GridAutoTuner:
             return None
         history = self._recent_atrs[:-1]   # exclude current sample, same as adaptive buffer
         return sum(history) / len(history)
+
+    def _windowed_baseline_atr(self, now: float, effective_atr: float) -> Optional[float]:
+        """
+        Wall-clock-windowed mean of recent effective_atr samples, for the
+        stop-buffer relative-expansion check.
+
+        Unlike the legacy self._recent_atrs (last ~20 RETUNE EVENTS, whatever
+        their timing), this prunes by elapsed time so a burst of retunes
+        during a choppy stretch can't drag the baseline up to match current
+        conditions (see stop_buffer_baseline_window_hours comment in
+        GRID_CONFIG for the 2026-07-28 incident this addresses).
+
+        Returns None (caller should fall back to the legacy event-count mean)
+        if there isn't yet enough time-window history to trust.
+        """
+        window_h = self._cfg.get("stop_buffer_baseline_window_hours", 12.0)
+        window_s = window_h * 3600.0
+
+        self._recent_atr_samples.append((now, effective_atr))
+        cutoff = now - window_s
+        self._recent_atr_samples = [
+            (t, a) for (t, a) in self._recent_atr_samples if t >= cutoff
+        ]
+
+        history = self._recent_atr_samples[:-1]   # exclude current sample
+        min_samples = self._cfg.get("stop_buffer_baseline_min_samples", 3)
+        if len(history) < min_samples:
+            return None
+
+        min_span_frac = self._cfg.get("stop_buffer_baseline_min_span_frac", 0.25)
+        span_s = history[-1][0] - history[0][0]
+        if span_s < window_s * min_span_frac:
+            return None
+
+        return sum(a for _, a in history) / len(history)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4082,6 +4284,7 @@ class TrendSignal:
             "prev_regime": prev_regime,
         }
 
+    @property
     def regime(self) -> str:
         """Return the last confirmed regime without recomputing."""
         with self._lock:
@@ -4832,6 +5035,9 @@ class GridBot:
         self._restart_attempts: int = 0     # number of auto-restart attempts made
         self._last_restart_time: float = 0.0  # timestamp of the last successful auto-restart
                                                # (0.0 = no auto-restart has happened yet)
+        self._recovery_floor_timeout_alerted = False  # one-shot alert flag for the hard
+                                                       # halt timeout (auto_restart_max_halt_hours),
+                                                       # reset on every new halt
 
         # ── BuyGate auto-calibration state ────────────────────────────────────
         # Rolling buffer of (timestamp, score) for the last N seconds of ticks.
@@ -6617,7 +6823,7 @@ class GridBot:
 
         logger.info("[GridBot] (Re)building grid...")
 
-        new_params = self._auto_tuner.compute()
+        new_params = self._auto_tuner.compute(trend_regime=self._trend.regime)
         if new_params is None:
             logger.error("[GridBot] Auto-tuner returned None — keeping existing params")
             new_params = self._params
@@ -7185,6 +7391,7 @@ class GridBot:
         self._halted      = True
         self._halt_time   = time.time()
         self._halt_stop_price = self._params.stop_price if self._params else mid
+        self._recovery_floor_timeout_alerted = False
 
         # Grid is being torn down — clear dead-band stop-raise EMA/debounce
         # state so nothing stale carries into whatever grid comes next.
@@ -7356,7 +7563,10 @@ class GridBot:
         else:
             recovery_floor = self._halt_stop_price   # strict fallback
 
-        if mid <= recovery_floor:
+        max_halt_hours = self._cfg.get("auto_restart_max_halt_hours", 8.0)
+        timeout_bypass = max_halt_hours > 0 and hours_halted >= max_halt_hours
+
+        if mid <= recovery_floor and not timeout_bypass:
             if atr_for_buffer and atr_for_buffer > 0:
                 buf_note = (f"buffer={base_buffer:.1f}+{decay_per_hour:.1f}"
                             f"x{hours_halted:.1f}h={total_buffer:.2f}xATR={atr_for_buffer:.2f}")
@@ -7368,6 +7578,32 @@ class GridBot:
                 f"halted={hours_halted:.1f}h {buf_note}) — waiting"
             )
             return
+
+        if mid <= recovery_floor and timeout_bypass:
+            # Condition 2 (price-recovery-floor) is a hard-timeout bypass here:
+            # once the floor decay has been capped (auto_restart_recovery_floor_min_atr)
+            # for long enough, it can never ease further on its own — see the
+            # 2026-07-28 GRID_CONFIG comment. Conditions 3/4 below are NOT
+            # bypassed: the market must still show a genuinely tight, flat-or-
+            # rising band before we restart, we just stop requiring that band
+            # be within reach of the OLD stop level.
+            if not self._recovery_floor_timeout_alerted:
+                self._recovery_floor_timeout_alerted = True
+                logger.warning(
+                    f"[AutoRestart] auto_restart_max_halt_hours ({max_halt_hours:.1f}h) "
+                    f"reached at mid={mid:.2f} (still below recovery_floor="
+                    f"{recovery_floor:.2f}, halt_stop={self._halt_stop_price:.2f}). "
+                    f"Skipping the price-recovery gate — still requires stability "
+                    f"conditions (tight range + flat/rising) to actually restart."
+                )
+                self._alerter.send(
+                    f"⏱️ Halted {hours_halted:.1f}h — price recovery floor gate "
+                    f"timed out (>{max_halt_hours:.0f}h) and is now bypassed.\n"
+                    f"mid={mid:.2f} vs halt_stop={self._halt_stop_price:.2f} "
+                    f"(recovery_floor={recovery_floor:.2f})\n"
+                    f"Still waiting on range-stability before auto-restart — "
+                    f"or send /restart to resume manually now."
+                )
 
         # Condition 3 + 4: stability window
         # Range (hi-lo) uses the long, conservative window (confidence big
@@ -7427,14 +7663,22 @@ class GridBot:
         # Make that explicit so log readers aren't misled about what was checked.
         # (The subsequent _rebuild_grid() stop-proximity guard is what actually
         # protects against arming a new stop too close to current mid.)
-        below_halt_stop = mid < self._halt_stop_price
-        recovery_note = (
-            f"mid={mid:.2f} < halt_stop={self._halt_stop_price:.2f} but > "
-            f"recovery_floor={recovery_floor:.2f} "
-            f"(halted {hours_halted:.1f}h, decayed floor)"
-            if below_halt_stop else
-            f"mid={mid:.2f} >= halt_stop={self._halt_stop_price:.2f}"
-        )
+        below_halt_stop  = mid < self._halt_stop_price
+        below_recovery_floor = mid <= recovery_floor   # only possible via timeout_bypass here
+        if below_recovery_floor:
+            recovery_note = (
+                f"mid={mid:.2f} < recovery_floor={recovery_floor:.2f} but "
+                f"auto_restart_max_halt_hours timeout reached "
+                f"(halted {hours_halted:.1f}h) — price-recovery gate bypassed"
+            )
+        elif below_halt_stop:
+            recovery_note = (
+                f"mid={mid:.2f} < halt_stop={self._halt_stop_price:.2f} but > "
+                f"recovery_floor={recovery_floor:.2f} "
+                f"(halted {hours_halted:.1f}h, decayed floor)"
+            )
+        else:
+            recovery_note = f"mid={mid:.2f} >= halt_stop={self._halt_stop_price:.2f}"
         logger.info(
             f"[AutoRestart] Stability confirmed: "
             f"hi-lo={hi_lo:.2f} < max={max_range:.2f}, "
@@ -7445,7 +7689,11 @@ class GridBot:
         self._alerter.send(
             f"🔄 Auto-restart #{self._restart_attempts}: stability confirmed\n"
             f"mid={mid:.2f} | hi-lo={hi_lo:.0f} < {max_range:.0f} ({stab_min}m window)\n"
-            + (f"⚠️ still below halt stop {self._halt_stop_price:.0f} (buffered recovery)\n"
+            + (f"⏱️ price-recovery gate timed out after {hours_halted:.1f}h — "
+               f"restarting below recovery floor {recovery_floor:.0f} "
+               f"(halt_stop {self._halt_stop_price:.0f})\n"
+               if below_recovery_floor else
+               f"⚠️ still below halt stop {self._halt_stop_price:.0f} (buffered recovery)\n"
                if below_halt_stop else "")
             + f"Rebuilding grid..."
         )
