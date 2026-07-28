@@ -3218,7 +3218,15 @@ class GridEngine:
             lv.client_oid = req.client_oid
             lv.qty        = qty
             lv.placed_at  = time.time()
-        self._oms.submit(req)
+        if self._oms.live_trading:
+            self._oms.submit(req)
+        # Paper mode: _simulate_paper_fills() is the sole fill authority for
+        # grid orders (checks mid vs lv.price every tick). Routing through
+        # OMS.submit()/_paper_fill() here would be dead weight — its FillEvent
+        # is never consumed (wait_fill() is only called for market/live
+        # orders), so it just leaks a Queue in OMS._fill_queues per order and
+        # logs a misleading "FILL" line for an order that hasn't actually
+        # crossed price yet.
         logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
 
     def _place_sell(self, lv: GridLevel):
@@ -3239,7 +3247,10 @@ class GridEngine:
             # Mark as an initial sell so _on_fill skips the long_qty decrement.
             if self._placing_initial:
                 self._initial_sell_oids.add(req.client_oid)
-        self._oms.submit(req)
+        if self._oms.live_trading:
+            self._oms.submit(req)
+        # See _place_buy: paper mode's fill authority is _simulate_paper_fills(),
+        # not OMS.submit()/_paper_fill(), so skip it here too.
         logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
 
     # ── Fill detection ────────────────────────────────────────────────────────
