@@ -607,7 +607,22 @@ GRID_CONFIG: dict = {
 
     # ── Risk / circuit breaker ────────────────────────────────────────────────
     "max_long_qty_btc":    0.5,        # alert if accumulated long exceeds this
-    "daily_loss_limit_usd": 500.0,
+    "daily_loss_limit_usd":     50.0,   # halt if today's net loss exceeds this USD
+    "daily_loss_limit_enabled": True,   # set False to disable without removing limit
+
+    # ── Funding rate (perpetuals) ────────────────────────────────────────────
+    # Fetch the 8-hourly funding rate from CDC REST and accumulate estimated
+    # funding cost/income based on net long position.
+    # Rate is fetched once per funding_rate_fetch_interval_s (default 8h).
+    "funding_rate_enabled":          True,
+    "funding_rate_fetch_interval_s": 28800,   # 8 hours — matches CDC settlement
+    "funding_rate_instrument":       "BTCUSD-PERP",
+
+    # ── Status reporting ─────────────────────────────────────────────────────
+    # How often to log Status and evaluate TrendSignal (seconds).
+    # 900 = 15 min is recommended for live — frequent enough to catch issues,
+    # quiet enough not to flood the log.  Set to 60 during debugging.
+    "status_interval_s": 900,
 
     # ── Telegram (optional) ───────────────────────────────────────────────────
     "telegram_bot_token": _secret("cdc_grid_tg_token",  "token",  "CDC_GRID_TG_BOT_TOKEN"),
@@ -1760,6 +1775,48 @@ class OMS:
                 logger.warning(f"[OMS] Startup reconcile: get-positions returned code={code}")
         except Exception as e:
             logger.error(f"[OMS] Startup reconcile: get-positions error: {e}")
+
+        # ── Step 3: compare live open orders against DB snapshot levels ─────────
+        # After a clean handoff the green process re-registers peer orders via
+        # _preregister_handoff_orders before calling reconcile_on_startup, so by
+        # the time we reach here those orders are in the OMS pending queue.
+        # We compare exchange live orders (before cancel) against expected count
+        # from the DB snapshot and alert if there is a significant mismatch.
+        # Note: cancel-all-orders in Step 1 already cleared exchange orders in
+        # live mode; here we query the DB snapshot, not the exchange, to detect
+        # cases where the DB and exchange diverged (e.g. partial crash).
+        try:
+            snap_raw = self._store.get_meta("bg_handoff_json")
+            if snap_raw:
+                import json as _json
+                snap = _json.loads(snap_raw)
+                snap_levels = snap.get("levels", [])
+                open_snap   = [lv for lv in snap_levels
+                               if lv.get("state") in ("BUY_OPEN", "SELL_OPEN")]
+                snap_long   = float(snap.get("long_qty", 0.0))
+                if abs(snap_long - long_qty) > 0.0001:
+                    logger.warning(
+                        f"[OMS] Position mismatch: DB snapshot long={snap_long:.4f} "
+                        f"but exchange reports long={long_qty:.4f} BTC — "
+                        f"delta={long_qty - snap_long:+.4f}. "
+                        f"Review carefully before resuming."
+                    )
+                    if self._alerter:
+                        _grid_bot_alerter.send(
+                            "⚠️ Position mismatch on startup:\n"
+                            f"  DB snapshot: {snap_long:.4f} BTC\n"
+                            f"  Exchange:    {long_qty:.4f} BTC\n"
+                            f"  Delta: {long_qty - snap_long:+.4f} BTC\n"
+                            "Review before resuming — bot will proceed with "
+                            "exchange-reported position."
+                        )
+                else:
+                    logger.info(
+                        f"[OMS] Position reconciled: exchange long={long_qty:.4f} "
+                        f"matches DB snapshot ({len(open_snap)} open orders in snapshot)"
+                    )
+        except Exception as e:
+            logger.warning(f"[OMS] Reconcile snapshot comparison failed: {e}")
 
         return long_qty
 
@@ -4725,7 +4782,9 @@ class GridStateStore:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GridBot:
-    STATUS_INTERVAL_S     = 60.0
+    # STATUS_INTERVAL_S is now read from config at runtime
+    # (see _run loop); the class constant below is the fallback.
+    STATUS_INTERVAL_S     = 900.0   # 15 min default (was 60s)
     RETUNE_CHECK_INTERVAL = 300.0
     CANDLE_SAVE_INTERVAL_S = 300.0   # snapshot PriceCache history to DB every 5 min
 
@@ -4746,9 +4805,14 @@ class GridBot:
         _grid_bot_alerter = self._alerter
         self._last_tune:  float = 0.0
         self._last_status:float = 0.0
+        self._last_funding_fetch: float = 0.0   # ts of last funding rate fetch
+        self._last_funding_rate:  float = 0.0   # most recent rate (decimal, e.g. 0.0001)
+        self._funding_accrued_usd: float = 0.0  # in-memory accumulator (lost on restart;
+                                                 #  DB meta "funding_accrued_usd" persists)
         self._last_retune_check: float = 0.0
         self._last_candle_save:  float = 0.0
         self._halted:     bool  = False
+        self._daily_loss_halted: bool = False  # True when daily loss circuit breaker fired
         self._halt_time:  float = 0.0       # timestamp of the last halt
         # Blue-green deployment state
         # _handoff_freeze lives on GridEngine (set there by export_handoff_snapshot)
@@ -4833,6 +4897,7 @@ class GridBot:
         self._cmd_poller.register("/status",  self._handle_status_command)
         self._cmd_poller.register("/handoff", self._handle_handoff_command)
         self._cmd_poller.register("/help",    self._handle_help_command)
+        self._cmd_poller.register("/pnl",     self._handle_pnl_command)
 
         # WS market feed
         self._ws_stop = threading.Event()
@@ -5501,6 +5566,29 @@ class GridBot:
             time.sleep(5)
 
         logger.info("[GridBot] Warmup complete")
+        # ── Live-mode config sanity log ───────────────────────────────────
+        # Log all operationally critical config values on every startup so
+        # the operator can verify them in the log before going live.
+        _mode = self._cfg.get("trading_mode", TRADING_MODE)
+        logger.info(
+            f"[GridBot] Config summary "
+            f"mode={_mode} "
+            f"instrument={self._cfg.get('instrument')} "
+            f"maker_fee={self._cfg.get('maker_fee_rate')} "
+            f"notional/level={self._cfg.get('notional_per_level')} "
+            f"stop_buf={self._cfg.get('stop_buffer_atr')}xATR "
+            f"atr_floor={self._cfg.get('min_atr_floor_pts')}pts "
+            f"daily_loss_limit={self._cfg.get('daily_loss_limit_usd')} USD "
+            f"rest={self._cfg.get('rest_base_url')} "
+            f"ws_market={self._cfg.get('ws_market_url')}"
+        )
+        # Restore persisted funding accrual from previous session
+        self._funding_accrued_usd = self._get_funding_accrued()
+        if self._funding_accrued_usd != 0.0:
+            logger.info(
+                f"[Funding] Restored accrued funding: "
+                f"{self._funding_accrued_usd:+.4f} USD from previous sessions"
+            )
         self._alerter.send(f"🟢 GridBot started — {TRADING_MODE.upper()} | {INSTRUMENT}")
 
         self._spacing_tuner.load_persisted()
@@ -5893,6 +5981,96 @@ class GridBot:
                 "guard will skip on first build; live ticks will warm it up "
                 "within ~5 minutes"
             )
+
+    # ── Funding rate ──────────────────────────────────────────────────────────
+
+    def _fetch_and_accrue_funding(self) -> None:
+        """
+        Fetch the current funding rate from CDC REST public/get-valuations and
+        accrue an estimated funding charge/income against the current net long.
+
+        BTCUSD-PERP settles funding every 8 hours. This method is called from
+        the main _run() loop every funding_rate_fetch_interval_s (default 8h).
+
+        Accrual formula:
+            funding_usd = long_qty_btc * mid_price * funding_rate
+        Positive rate → long pays short (cost for us).
+        Negative rate → short pays long (income for us).
+
+        The accrued total is persisted in the meta table under key
+        "funding_accrued_usd" so it survives restarts.
+        """
+        if not self._cfg.get("funding_rate_enabled", True):
+            return
+
+        rest_base  = self._cfg.get("rest_base_url",
+                                   "https://api.crypto.com/exchange/v1")
+        instrument = self._cfg.get("funding_rate_instrument", "BTCUSD-PERP")
+        url = f"{rest_base}/public/get-valuations"
+        params = {"instrument_name": instrument, "valuation_type": "funding_rate"}
+
+        try:
+            resp = requests.get(url, params=params, timeout=10.0)
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as e:
+            logger.warning(f"[Funding] REST request failed: {e}")
+            return
+
+        if body.get("code", -1) != 0:
+            logger.warning(f"[Funding] API returned code={body.get('code')}")
+            return
+
+        data = body.get("result", {}).get("data", [])
+        if not data:
+            logger.warning("[Funding] Empty data in funding rate response")
+            return
+
+        try:
+            latest   = data[-1]
+            rate     = float(latest.get("v", 0.0))
+        except (IndexError, TypeError, ValueError) as e:
+            logger.warning(f"[Funding] Failed to parse funding rate: {e}")
+            return
+
+        self._last_funding_rate = rate
+
+        # Accrue against current long position
+        mid      = _price_cache.get_mid()
+        long_qty = self._engine.get_stats().get("long_qty", 0.0) if self._engine else 0.0
+        if mid and long_qty > 0:
+            charge_usd = long_qty * mid * rate
+            self._funding_accrued_usd += charge_usd
+            # Persist to DB
+            try:
+                persisted = float(
+                    self._store.get_meta("funding_accrued_usd") or "0.0"
+                )
+                self._store.set_meta(
+                    "funding_accrued_usd",
+                    f"{persisted + charge_usd:.6f}"
+                )
+            except Exception as e:
+                logger.warning(f"[Funding] Failed to persist accrued funding: {e}")
+
+            sign = "+" if charge_usd >= 0 else ""
+            logger.info(
+                f"[Funding] rate={rate*100:.4f}%  long={long_qty:.4f} BTC  "
+                f"mid={mid:.2f}  charge={sign}{charge_usd:.4f} USD  "
+                f"accrued_total={self._funding_accrued_usd:+.4f} USD"
+            )
+        else:
+            logger.info(
+                f"[Funding] rate={rate*100:.4f}%  "
+                f"(no accrual — long_qty={long_qty:.4f})"
+            )
+
+    def _get_funding_accrued(self) -> float:
+        """Return total accrued funding from DB (survives restarts)."""
+        try:
+            return float(self._store.get_meta("funding_accrued_usd") or "0.0")
+        except Exception:
+            return 0.0
 
     def stop(self):
         logger.info("[GridBot] Stopping")
@@ -6288,16 +6466,28 @@ class GridBot:
                     self._rebuild_grid()
 
             # Periodic status + trend signal (share the same cadence)
-            if now - self._last_status > self.STATUS_INTERVAL_S:
+            _status_interval = self._cfg.get(
+                "status_interval_s", self.STATUS_INTERVAL_S)
+            if now - self._last_status > _status_interval:
                 self._last_status = now
                 self._log_status(mid)
                 self._evaluate_trend()
+                # Daily loss circuit breaker — same cadence as status
+                if self._check_daily_loss_limit():
+                    continue
 
             # Periodic candle snapshot — persists PriceCache history to DB so
             # TrendSignal warm-up survives service restarts.
             if now - self._last_candle_save > self.CANDLE_SAVE_INTERVAL_S:
                 self._last_candle_save = now
                 self._save_candles_to_db()
+
+            # Periodic funding rate fetch (every 8h)
+            if (self._cfg.get("funding_rate_enabled", True)
+                    and now - self._last_funding_fetch
+                    > self._cfg.get("funding_rate_fetch_interval_s", 28800)):
+                self._last_funding_fetch = now
+                self._fetch_and_accrue_funding()
 
             # Periodic spacing auto-tune — no-ops internally unless
             # spacing_autotune_enabled and its own interval has elapsed.
@@ -7064,6 +7254,37 @@ class GridBot:
 
     # ── Auto-restart ──────────────────────────────────────────────────────────
 
+    def _check_daily_loss_limit(self) -> bool:
+        """
+        Check today's realized net loss (HKT day) against daily_loss_limit_usd.
+        Called once per STATUS_INTERVAL_S from the main _run() loop.
+        If limit exceeded: fires _emergency_halt(), sets _daily_loss_halted=True
+        to block auto-restart (requires manual /restart), sends Telegram alert.
+        Returns True if the circuit breaker just fired.
+        """
+        if not self._cfg.get("daily_loss_limit_enabled", True):
+            return False
+        limit = self._cfg.get("daily_loss_limit_usd", 50.0)
+        if limit <= 0:
+            return False
+        today     = self._store.get_daily()
+        daily_net = today.get("net_pnl_usd", 0.0)
+        if daily_net >= 0 or abs(daily_net) < limit:
+            return False
+        mid = _price_cache.get_mid() or 0.0
+        logger.warning(
+            f"[GridBot] Daily loss circuit breaker: today net={daily_net:+.4f} USD "
+            f"exceeds limit -{limit:.2f} USD — halting"
+        )
+        self._daily_loss_halted = True
+        self._emergency_halt(mid)
+        self._alerter.send(
+            f"🛑 Daily loss limit hit: {daily_net:+.2f} USD today "
+            f"(limit: -{limit:.2f} USD)\n"
+            f"Bot halted — manual /restart required to resume."
+        )
+        return True
+
     def _check_auto_restart(self):
         """
         Called every 10s while the bot is halted. Evaluates four stability
@@ -7077,6 +7298,12 @@ class GridBot:
           5. Hi-lo range over stability window < stability_atr_mult × ATR
           6. Current price >= mean of stability window (flat or rising)
         """
+        # Daily loss circuit breaker blocks auto-restart — requires manual /restart
+        if self._daily_loss_halted:
+            logger.info("[AutoRestart] Blocked: daily loss circuit breaker active. "
+                        "Send /restart via launcher to resume manually.")
+            return
+
         if not self._cfg.get("auto_restart_enabled", True):
             return
 
@@ -7296,6 +7523,70 @@ class GridBot:
         # incoming process's startup alert confirms the handoff succeeded.
         return "✅ Handoff snapshot written — shutting down. Start green process now."
 
+    # ── /pnl Telegram command ────────────────────────────────────────────────
+
+    def _handle_pnl_command(self) -> str:
+        """
+        Return a concise PnL summary:
+          - Cumulative all-time net
+          - Today's net (HKT day)
+          - SL losses today
+          - Estimated funding accrued (all-time, from DB)
+          - Last 7 daily rows
+        """
+        acc   = self._store.get_accumulated()
+        today = self._store.get_daily()
+        week  = self._store.get_recent_daily(7)
+
+        cum_net      = acc.get("net_pnl",   0.0)
+        cum_gross    = acc.get("gross_pnl", 0.0)
+        cum_fees     = acc.get("fees",      0.0)
+        cum_cycles   = acc.get("cycle_count", 0)
+        cum_sl       = acc.get("sl_gross",  0.0)
+
+        today_net    = today.get("net_pnl_usd",   0.0)
+        today_gross  = today.get("gross_pnl_usd", 0.0)
+        today_fees   = today.get("fees_usd",      0.0)
+        today_cycles = today.get("cycle_count",   0)
+        today_sl     = today.get("sl_gross_usd",  0.0)
+
+        funding_usd  = self._get_funding_accrued()
+        net_after_funding = cum_net + funding_usd   # funding already negative if cost
+
+        def _s(v: float) -> str:
+            return f"{v:+.2f}"
+
+        lines = [
+            "💰 PnL Summary",
+            "",
+            "All-time",
+            f"  Net:      {_s(cum_net)} USD",
+            f"  Gross:    {_s(cum_gross)} USD",
+            f"  Fees:     {_s(-abs(cum_fees))} USD",
+            f"  SL loss:  {_s(cum_sl)} USD",
+            f"  Funding:  {_s(funding_usd)} USD (est.)",
+            f"  Net+fund: {_s(net_after_funding)} USD",
+            f"  Cycles:   {cum_cycles}",
+            "",
+            f"Today ({today.get('hkt_date','—')} HKT)",
+            f"  Net:      {_s(today_net)} USD",
+            f"  Gross:    {_s(today_gross)} USD",
+            f"  Fees:     {_s(-abs(today_fees))} USD",
+            f"  SL loss:  {_s(today_sl)} USD",
+            f"  Cycles:   {today_cycles}",
+        ]
+
+        if week:
+            lines += ["", "Last 7 days (HKT date | net | cycles)"]
+            for row in week:
+                lines.append(
+                    f"  {row['hkt_date']}  "
+                    f"{_s(row['net_pnl_usd']):>8}  "
+                    f"{row['cycle_count']:>4} cyc"
+                )
+
+        return "\n".join(lines)
+
     # ── /help Telegram command ───────────────────────────────────────────────
 
     def _handle_help_command(self) -> str:
@@ -7305,6 +7596,7 @@ class GridBot:
             "\n"
             "Bot commands (grid_bot.py)\n"
             "  /status    — Grid position, PnL, stop-score, TrendSignal\n"
+            "  /pnl       — Cumulative PnL, today's PnL, funding, 7-day history\n"
             "  /handoff   — Hibernate: save state and exit without liquidating\n"
             "               (start new process with /restart to resume)\n"
             "\n"
