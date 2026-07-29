@@ -324,6 +324,15 @@ GRID_CONFIG: dict = {
 
     # ── Stop-loss ─────────────────────────────────────────────────────────────
     "stop_loss_enabled": True,
+    # Confirmation window (2026-07-30): mid must stay continuously below
+    # stop_price for this many seconds before StopLossGuard actually latches
+    # _triggered, instead of the old instant single-tick trigger. Added after
+    # the 2026-07-28 06:40:47 halt, where mid touched 64113.05 (one tick below
+    # a stop of 64126.45) and had already recovered to 64150-64257 within
+    # ~30s — a wick, not a breakdown — but still cost a full liquidation plus
+    # ~11.5h of cooldown/recovery-floor downtime. Set to 0 to restore the old
+    # instant-trigger behavior. See StopLossGuard.check().
+    "stop_loss_confirm_s": 3.0,
     # stop = lower − stop_buffer_atr × ATR
     #
     # Observed data (Jul 3-4): halts 2-4 were triggered by moves of only
@@ -4031,6 +4040,12 @@ class StopLossGuard:
         self._stop_price = stop_price
         self._enabled    = config.get("stop_loss_enabled", True)
         self._triggered  = False
+        # See config default "stop_loss_confirm_s" for why this exists: a
+        # single tick below stop_price starts the clock rather than
+        # triggering immediately, so a wick that reverts within a few
+        # seconds doesn't cost a full liquidation + cooldown.
+        self._confirm_s     = config.get("stop_loss_confirm_s", 3.0)
+        self._below_since: Optional[float] = None
 
     def update_price(self, price: float):
         self._stop_price = price
@@ -4038,9 +4053,34 @@ class StopLossGuard:
     def check(self, mid: float) -> bool:
         if self._triggered or not self._enabled:
             return self._triggered
-        if self._stop_price > 0 and mid < self._stop_price:
+
+        if self._stop_price <= 0 or mid >= self._stop_price:
+            # Recovered (or never breached) — cancel any candidate breach.
+            if self._below_since is not None:
+                logger.info(
+                    f"[StopLoss] Candidate breach cancelled: mid={mid:.2f} "
+                    f"recovered above stop={self._stop_price:.2f} after "
+                    f"{time.time() - self._below_since:.1f}s below it"
+                )
+                self._below_since = None
+            return False
+
+        # mid < stop_price
+        now = time.time()
+        if self._below_since is None:
+            self._below_since = now
+            if self._confirm_s > 0:
+                logger.info(
+                    f"[StopLoss] Candidate breach: mid={mid:.2f} < "
+                    f"stop={self._stop_price:.2f} — confirming for "
+                    f"{self._confirm_s:.1f}s before triggering"
+                )
+
+        dwell = now - self._below_since
+        if dwell >= self._confirm_s:
             logger.warning(
-                f"[StopLoss] TRIGGERED: mid={mid:.2f} < stop={self._stop_price:.2f}")
+                f"[StopLoss] TRIGGERED: mid={mid:.2f} < stop={self._stop_price:.2f} "
+                f"(confirmed {dwell:.1f}s continuously below stop)")
             self._triggered = True
         return self._triggered
 
