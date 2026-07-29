@@ -3189,9 +3189,15 @@ class GridEngine:
                     break
                 if lv.index in skip_indices:
                     continue
+                # NOTE: was `elif lv.price > mid`, which silently placed no
+                # order at all when lv.price == mid exactly (observed live
+                # 2026-07-29 12:38:48 — level [2] never got an order because
+                # the AutoTuner-computed level price was bit-for-bit equal to
+                # the mid passed in here). `>=` makes the tie an explicit
+                # SELL instead of an orphaned level.
                 if lv.price < mid:
                     self._place_buy(lv)
-                elif lv.price > mid:
+                else:
                     self._place_sell(lv)
                 time.sleep(0.05)
         finally:
@@ -3267,6 +3273,14 @@ class GridEngine:
         else:
             self._simulate_paper_fills(mid)
 
+        # Catch any level left IDLE with no resting order — e.g. a
+        # cancel-timeout re-place, or (see _place_initial_orders) a level
+        # whose price tied mid exactly at build time. This used to only run
+        # in live mode (called from inside _poll_live_fills), so paper mode
+        # never self-healed: an orphaned level could sit unplaced for the
+        # rest of that grid's life. Now runs every tick regardless of mode.
+        self._replace_idle_levels()
+
         # Trailing checks run after fills so counter-orders are placed first
         self._check_trailing(mid)
 
@@ -3341,9 +3355,8 @@ class GridEngine:
                     # Timeout cancel — re-place same side
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
-                    # Will be re-placed by _replace_idle_levels() next tick
-
-        self._replace_idle_levels()
+                    # Will be re-placed by check_price_fills()'s unconditional
+                    # _replace_idle_levels() call right after this returns.
 
     def _replace_idle_levels(self):
         """Re-place any IDLE levels that should have an order.
@@ -3357,9 +3370,12 @@ class GridEngine:
             idle = [lv for lv in self._levels
                     if lv.state == LevelState.IDLE]     # SUPPRESSED excluded
         for lv in idle:
+            # See _place_initial_orders for why this is `>=`-via-else rather
+            # than a separate `elif lv.price > mid` — an exact tie must not
+            # silently leave the level unplaced.
             if lv.price < mid:
                 self._place_buy(lv)
-            elif lv.price > mid:
+            else:
                 self._place_sell(lv)
 
     # ── Trailing ──────────────────────────────────────────────────────────────
@@ -5115,6 +5131,7 @@ class GridBot:
         self._cmd_poller.register("/handoff", self._handle_handoff_command)
         self._cmd_poller.register("/help",    self._handle_help_command)
         self._cmd_poller.register("/pnl",     self._handle_pnl_command)
+        self._cmd_poller.register("/clear_halt", self._handle_clear_halt_command)
 
         # WS market feed
         self._ws_stop = threading.Event()
@@ -5810,7 +5827,20 @@ class GridBot:
 
         self._spacing_tuner.load_persisted()
         self._spacing_tuner.load_persisted_levels()
-        self._rebuild_grid()
+
+        # Restore a halt (stop-loss cooldown/recovery-floor wait, or a
+        # daily-loss circuit-breaker halt) from a previous session before
+        # deciding whether to build a fresh grid. See _restore_halt_state()
+        # docstring for why this matters — without it, a restart while
+        # halted silently discarded the halt.
+        if self._restore_halt_state():
+            logger.info(
+                "[GridBot] Startup: resuming in halted state — no grid "
+                "built; the main loop's auto-restart checks take over "
+                "from here."
+            )
+        else:
+            self._rebuild_grid()
 
         # ── Any --role process: watch for the next handoff request ───────────
         # Whether we started as --role blue, or as --role green and just took
@@ -6449,6 +6479,16 @@ class GridBot:
         payload = _json.dumps(snapshot)
         self._store.bg_write_handoff_json(payload)
         self._store.bg_clear_handoff_request()
+        # Stop the lock-heartbeat thread BEFORE releasing the lock below.
+        # Without this, there's a window (up to BG_LOCK_HEARTBEAT_S seconds)
+        # between the intentional release here and stop()'s own
+        # _lock_heartbeat_stop_event.set() during which the heartbeat thread
+        # can wake up, find it's no longer the recorded lock holder, and log
+        # its "Lost the instance lock while still running" CRITICAL — even
+        # though this is a completely normal, successful hand-off. Setting
+        # the stop event first closes that race so the CRITICAL is reserved
+        # for a genuine, unexpected loss of the lock.
+        self._lock_heartbeat_stop_event.set()
         # This is the actual hand-off moment: releasing the lock here is what
         # a waiting successor's bg_lock_try_acquire (polling since it saw the
         # JSON appear) is racing to catch. See GridStateStore.bg_lock_release
@@ -7470,6 +7510,86 @@ class GridBot:
                 f"No long position to liquidate. Bot HALTED — {_restart_note}"
             )
 
+        # Persist halt state — see _persist_halt_state()/_restore_halt_state()
+        # docstrings. Without this, a restart or blue-green handoff while
+        # halted (cooldown/recovery-floor wait, or a daily-loss circuit-
+        # breaker halt) silently dropped it, and the new process resumed
+        # trading immediately regardless of why we were halted.
+        self._persist_halt_state()
+
+    # ── Halt-state persistence (survives restart / blue-green handoff) ───────
+
+    def _persist_halt_state(self) -> None:
+        """
+        Persist halt/circuit-breaker state to SQLite so a process restart or
+        blue-green handoff that happens WHILE the bot is halted doesn't
+        silently drop the halt and let the new process resume trading
+        immediately.
+
+        Previously _halted / _daily_loss_halted / _halt_time /
+        _halt_stop_price / _restart_attempts / _last_restart_time lived only
+        in memory. export_handoff_snapshot() also bails out with "no engine
+        running" while halted (self._engine is None during a halt), writing
+        no snapshot at all — so ANY restart during a halt (a redeploy, a
+        crash + NSSM auto-restart, or even the documented manual /restart,
+        which just launches a fresh process) silently reset it. A daily-loss
+        halt is now cleared deliberately via /clear_halt instead of just by
+        restarting — see _handle_clear_halt_command().
+
+        Called from _emergency_halt() (new halt), _check_auto_restart() (on
+        a successful auto-restart and whenever the attempt counter changes),
+        and _handle_clear_halt_command() (manual clear).
+        """
+        if self._store is None:
+            return
+        self._store.set_meta("halt_active",           "1" if self._halted else "0")
+        self._store.set_meta("halt_daily_loss",        "1" if self._daily_loss_halted else "0")
+        self._store.set_meta("halt_time",              str(self._halt_time))
+        self._store.set_meta("halt_stop_price",        str(self._halt_stop_price))
+        self._store.set_meta("halt_restart_attempts",  str(self._restart_attempts))
+        self._store.set_meta("halt_last_restart_time", str(self._last_restart_time))
+
+    def _restore_halt_state(self) -> bool:
+        """
+        Restore halt state persisted by _persist_halt_state(). Called once
+        from start(), before _rebuild_grid(). Returns True if the bot should
+        stay halted — caller must skip _rebuild_grid() and let the main
+        loop's normal `if self._halted: self._check_auto_restart()` path
+        (see _run()) take over from here, exactly as it would have if this
+        were the same process that halted rather than a fresh one.
+
+        A restored daily-loss halt is intentionally NOT auto-resumed by
+        _check_auto_restart() (that function already returns immediately
+        when _daily_loss_halted is True) — it requires /clear_halt.
+        """
+        if self._store is None:
+            return False
+        if self._store.get_meta("halt_active") != "1":
+            return False
+
+        self._halted            = True
+        self._daily_loss_halted = self._store.get_meta("halt_daily_loss") == "1"
+        self._halt_time         = float(self._store.get_meta("halt_time") or time.time())
+        self._halt_stop_price   = float(self._store.get_meta("halt_stop_price") or 0.0)
+        self._restart_attempts  = int(self._store.get_meta("halt_restart_attempts") or 0)
+        self._last_restart_time = float(self._store.get_meta("halt_last_restart_time") or 0.0)
+
+        hours_halted = (time.time() - self._halt_time) / 3600.0
+        logger.warning(
+            f"[GridBot] Restored halt state from previous session: "
+            f"halted {hours_halted:.1f}h ago at stop={self._halt_stop_price:.2f} "
+            f"daily_loss_halted={self._daily_loss_halted} "
+            f"restart_attempts={self._restart_attempts} — staying halted."
+        )
+        self._alerter.send(
+            f"⚠️ Restart occurred while halted — halt state restored "
+            f"({hours_halted:.1f}h so far, stop={self._halt_stop_price:.2f}).\n"
+            + ("Daily-loss circuit breaker active — send /clear_halt to "
+               "resume manually.\n" if self._daily_loss_halted else
+               "Auto-restart checks resuming from where they left off.\n")
+        )
+        return True
+
     # ── Auto-restart ──────────────────────────────────────────────────────────
 
     def _check_daily_loss_limit(self) -> bool:
@@ -7666,6 +7786,7 @@ class GridBot:
 
         # All conditions met — restart
         self._restart_attempts += 1
+        self._persist_halt_state()
         # NOTE: condition 2 above only requires mid > recovery_floor (halt_stop_price
         # minus a configurable ATR buffer) — NOT mid > halt_stop_price itself. The
         # previous log line here read "above stop={halt_stop_price}", which was
@@ -7713,6 +7834,7 @@ class GridBot:
         self._last_restart_time = now
         # Reset the stop-loss guard so it can fire again on the new grid
         self._sl_guard = None
+        self._persist_halt_state()
 
         # Rebuild grid with fresh ATR-based params
         self._rebuild_grid()
@@ -7781,6 +7903,42 @@ class GridBot:
         # alert will confirm the outgoing process stopped cleanly, and the
         # incoming process's startup alert confirms the handoff succeeded.
         return "✅ Handoff snapshot written — shutting down. Start green process now."
+
+    # ── /clear_halt Telegram command ─────────────────────────────────────────
+
+    def _handle_clear_halt_command(self) -> str:
+        """
+        Telegram /clear_halt: explicitly clear a halt (including a
+        daily-loss circuit-breaker halt) and resume trading immediately.
+
+        Now that halt state is persisted across restarts (see
+        _persist_halt_state()/_restore_halt_state()), simply starting a new
+        process via /restart correctly PRESERVES a halt instead of
+        accidentally dropping it — so this command is the deliberate,
+        auditable way to actually clear one. In particular a daily-loss
+        halt, which is designed to require manual intervention, now
+        requires this rather than just a bare restart.
+        """
+        if not self._halted:
+            return "ℹ️ /clear_halt: bot is not currently halted."
+
+        was_daily_loss = self._daily_loss_halted
+        logger.warning(
+            f"[GridBot] /clear_halt: manually clearing halt "
+            f"(daily_loss_halted was {was_daily_loss})"
+        )
+        self._halted            = False
+        self._daily_loss_halted = False
+        self._restart_attempts  = 0
+        self._last_restart_time = time.time()
+        self._sl_guard = None
+        self._persist_halt_state()
+        self._rebuild_grid()
+        return (
+            "✅ Halt cleared manually"
+            + (" (was a daily-loss circuit-breaker halt)" if was_daily_loss else "")
+            + " — grid rebuilding now."
+        )
 
     # ── /pnl Telegram command ────────────────────────────────────────────────
 
@@ -7858,15 +8016,26 @@ class GridBot:
             "  /pnl       — Cumulative PnL, today's PnL, funding, 7-day history\n"
             "  /handoff   — Hibernate: save state and exit without liquidating\n"
             "               (start new process with /restart to resume)\n"
+            "  /clear_halt — Manually clear a stop-loss/daily-loss halt and\n"
+            "               resume trading now. Halt state now survives a\n"
+            "               restart (see 2026-07-29 fix) — /restart alone no\n"
+            "               longer clears a halt, including a daily-loss\n"
+            "               circuit-breaker halt. Use this instead.\n"
             "\n"
             "Launcher commands (grid_bot_launcher.py)\n"
-            "  /restart   — Start new bot process (picks up /handoff snapshot)\n"
+            "  /restart   — Start new bot process (picks up /handoff snapshot,\n"
+            "               or resumes a persisted halt if one is active)\n"
             "  /pstatus   — Process status: PID, uptime, last 10 log lines\n"
             "  /kill      — Emergency stop: SIGTERM → clean shutdown + liquidation\n"
             "\n"
             "Typical deployment flow\n"
             "  1\u20e3  /handoff  → bot saves state, exits\n"
-            "  2\u20e3  /restart  → new bot resumes with same position"
+            "  2\u20e3  /restart  → new bot resumes with same position\n"
+            "\n"
+            "Recovering from a halt\n"
+            "  If halted (stop-loss cooldown, or daily-loss circuit breaker),\n"
+            "  restarting the process no longer clears it — send /clear_halt\n"
+            "  instead once you've confirmed it's safe to resume."
         )
 
     # ── /status Telegram command ──────────────────────────────────────────────
