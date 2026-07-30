@@ -3146,6 +3146,12 @@ class GridEngine:
         self._fill_event  = threading.Event()
         self._fill_thread: Optional[threading.Thread] = None
 
+        # Indices with a fill detected (state already flipped to IDLE) but not
+        # yet processed by _on_fill() on the Grid-fills thread. _replace_idle_levels()
+        # must skip these — see its docstring for the same-level wash-trade bug
+        # this prevents (fixed 2026-07-30).
+        self._pending_fill_indices: set = set()
+
         self._build_levels()
 
     def _build_levels(self):
@@ -3340,6 +3346,7 @@ class GridEngine:
                 with self._lock:
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
+                    self._pending_fill_indices.add(lv.index)
                 self._fill_queue.append((lv.index, fill))
                 self._fill_event.set()
 
@@ -3358,6 +3365,7 @@ class GridEngine:
                 if fill.is_filled:
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
+                    self._pending_fill_indices.add(lv.index)
                     self._fill_queue.append((lv.index, fill))
                     self._fill_event.set()
                 elif fill.is_cancelled:
@@ -3371,13 +3379,46 @@ class GridEngine:
         """Re-place any IDLE levels that should have an order.
         SUPPRESSED levels are intentionally skipped — they are managed by
         GridBot._run() via release_one_suppressed_level() once the stop-score
-        recovers, so they must not be re-queued here."""
+        recovers, so they must not be re-queued here.
+
+        Levels with an index in _pending_fill_indices are ALSO skipped, and
+        this is load-bearing, not an optimization.
+
+        Root cause found 2026-07-30: _simulate_paper_fills() (and
+        _poll_live_fills()) flip a level's state to IDLE the instant a fill
+        is detected, then hand the fill off to _on_fill() asynchronously via
+        _fill_queue, processed on the separate Grid-fills thread. But
+        check_price_fills() calls this method synchronously, in the same
+        tick, immediately after — with no guarantee _on_fill() has run yet.
+        If mid is still sitting at/through that level's own price at that
+        instant (the same condition that just triggered the fill), the naive
+        `lv.price < mid` check below re-arms the level AT ITS OWN PRICE
+        rather than leaving the adjacent-level counter-order (which _on_fill
+        places correctly) to do its job. That re-armed order can then fill
+        again within the same price stall, over and over — a same-price
+        wash-trade loop. Each such SELL fill still runs the normal
+        gross_pnl = (this level's price - the level BELOW's price) × qty
+        calculation in _get_paired_buy_price(), crediting a full spacing
+        width of profit for inventory that was, in reality, bought and sold
+        at the identical price moments apart. Observed live 2026-07-30 on
+        gen00013: level [1] wash-traded at a fixed price (e.g. 64260.18)
+        eleven times in ~8 minutes, each logged as gross=+1.0309 — real
+        cumulative_net climbed by that amount every ~30-90s with mid barely
+        moving, and was the primary driver of that day's 428-cycle,
+        +256.46 USD "daily PnL" figure being far outside the range of any
+        other day. Skipping pending-fill indices here closes the race: the
+        level stays untouched until _on_fill() has processed the original
+        fill (placing its own, correct, adjacent-level order), at which
+        point the NEXT tick's _replace_idle_levels() call re-arms it (if
+        still orphaned) against whatever mid is by then — no longer
+        guaranteed to be sitting exactly on this level's own price."""
         mid = _price_cache.get_mid()
         if mid is None:
             return
         with self._lock:
             idle = [lv for lv in self._levels
-                    if lv.state == LevelState.IDLE]     # SUPPRESSED excluded
+                    if lv.state == LevelState.IDLE          # SUPPRESSED excluded
+                    and lv.index not in self._pending_fill_indices]
         for lv in idle:
             # See _place_initial_orders for why this is `>=`-via-else rather
             # than a separate `elif lv.price > mid` — an exact tie must not
@@ -3556,6 +3597,10 @@ class GridEngine:
             if idx < 0 or idx >= len(self._levels):
                 return
             is_buy = fill.purpose == "grid_buy"
+            # Done racing _replace_idle_levels() for this index — from here on
+            # the correct counter-order (placed below, at the adjacent level)
+            # is what should happen next, not a naive re-arm of this level.
+            self._pending_fill_indices.discard(idx)
 
         self._total_fees += fill.fee
         now = time.time()
