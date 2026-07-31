@@ -5579,6 +5579,12 @@ class GridBot:
         # ── Trend signal (Phase 1 — read-only observer) ───────────────────────
         self._trend = TrendSignal(config, _price_cache)
         self._last_trend_regime: str   = TrendSignal.REGIME_NODATA
+        # Most recent regime that was NOT INSUFFICIENT_DATA. _buy_gate() falls
+        # back to this while the live regime is INSUFFICIENT_DATA, instead of
+        # treating "unknown" as "safe to buy" — see _buy_gate()'s trend-gate
+        # block for why. Starts at NEUTRAL (no confirmed regime yet at a true
+        # cold start, so no special protection is assumed until one commits).
+        self._last_confirmed_trend_regime: str = TrendSignal.REGIME_NEUTRAL
         self._last_trend_log:    float = 0.0   # ts of last trend log line
         self._last_trend_slope_pct: float = 0.0  # cached for compute_trend_risk(),
                                                   # refreshed every _evaluate_trend() call
@@ -7464,7 +7470,7 @@ class GridBot:
 
         logger.info("[GridBot] (Re)building grid...")
 
-        new_params = self._auto_tuner.compute(trend_regime=self._trend.regime)
+        new_params = self._auto_tuner.compute(trend_regime=self._effective_trend_regime())
         if new_params is None:
             logger.error("[GridBot] Auto-tuner returned None — keeping existing params")
             new_params = self._params
@@ -7558,7 +7564,7 @@ class GridBot:
                     trend_risk = 0.0
                     if self._stop_scorer is not None:
                         trend_risk = self._stop_scorer.compute_trend_risk(
-                            mid, self._last_trend_regime, self._last_trend_slope_pct
+                            mid, self._effective_trend_regime(), self._last_trend_slope_pct
                         )
 
                     if raw_new_stop <= cur_stop:
@@ -7811,7 +7817,13 @@ class GridBot:
             threshold  = _bot_ref._get_threshold()
 
             if _bot_ref._cfg.get("trend_gate_enabled", True):
-                is_down = (regime == TrendSignal.REGIME_DOWN)
+                # See _effective_trend_regime() for why this isn't just
+                # `regime` — INSUFFICIENT_DATA shouldn't silently read as
+                # "not DOWN".
+                via_fallback = (regime == TrendSignal.REGIME_NODATA)
+                effective_regime = _bot_ref._effective_trend_regime()
+
+                is_down = (effective_regime == TrendSignal.REGIME_DOWN)
                 if is_down:
                     # Protection 2: OUTSIDE_RANGE block
                     params = _bot_ref._params
@@ -7820,7 +7832,9 @@ class GridBot:
                                 "trend_gate_outside_range_block_on_down", True)
                             and mid_now < params.lower):
                         logger.info(
-                            f"[BuyGate] SUPPRESS (TrendSignal DOWN + OUTSIDE_RANGE: "
+                            f"[BuyGate] SUPPRESS (TrendSignal DOWN"
+                            f"{' [carried through INSUFFICIENT_DATA]' if via_fallback else ''}"
+                            f" + OUTSIDE_RANGE: "
                             f"mid={mid_now:.2f} < lower={params.lower:.2f}) "
                             f"score={score:.4f}"
                         )
@@ -7831,7 +7845,9 @@ class GridBot:
                     old_thr = threshold
                     threshold = threshold * mult
                     trend_note = (
-                        f" [DOWN: threshold {old_thr:.4f}×{mult:.2f}={threshold:.4f}]"
+                        f" [DOWN"
+                        f"{' (carried through INSUFFICIENT_DATA)' if via_fallback else ''}"
+                        f": threshold {old_thr:.4f}×{mult:.2f}={threshold:.4f}]"
                     )
 
             allow = score < threshold
@@ -8929,6 +8945,8 @@ class GridBot:
             )
 
         self._last_trend_regime = regime
+        if regime != TrendSignal.REGIME_NODATA:
+            self._last_confirmed_trend_regime = regime
         self._last_trend_slope_pct = result.get("slope_pct", 0.0)
 
         # Adjust min_grid_levels based on the new regime.  This is the
@@ -8939,6 +8957,36 @@ class GridBot:
         self._spacing_tuner.update_levels_from_trend(regime)
 
         return result
+
+    def _effective_trend_regime(self) -> str:
+        """
+        The regime every DOWN-gated protection should actually read, instead
+        of the raw live TrendSignal output.
+
+        _last_trend_regime can be INSUFFICIENT_DATA for reasons that have
+        nothing to do with the market having calmed down — a cold start, or
+        rebuilding trust after a feed gap (which can take ~26h even after a
+        gap of just a couple of hours, since trend_signal_min_history_h needs
+        that much fresh contiguous data regardless of how short the gap that
+        triggered the reset was). Every call site that gates on "== DOWN" was
+        found reading the raw value directly, which meant a routine WS gap
+        would silently and fully lift every one of these protections for as
+        long as the rebuild took — exactly when the bot might still be in the
+        downtrend that caused the gap in the first place:
+
+          - _buy_gate()'s OUTSIDE_RANGE block and threshold multiplier
+          - GridAutoTuner.compute()'s ATR-widen skip-on-downtrend
+          - StopScoreCalculator.compute_trend_risk()'s regime-risk component
+
+        This carries the last CONFIRMED (non-INSUFFICIENT_DATA) regime
+        forward instead, matching how SpacingAutoTuner already holds
+        min_grid_levels steady through INSUFFICIENT_DATA rather than
+        resetting it — the same principle, applied consistently everywhere
+        the regime feeds a protective decision.
+        """
+        if self._last_trend_regime == TrendSignal.REGIME_NODATA:
+            return self._last_confirmed_trend_regime
+        return self._last_trend_regime
 
 
 # ─────────────────────────────────────────────────────────────────────────────
