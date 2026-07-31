@@ -3058,6 +3058,26 @@ class LevelState(Enum):
 
 
 @dataclass
+class OpenLeg:
+    """
+    A position opened by one fill, not yet closed by another.
+
+    Deliberately side-neutral in naming (open_side, not "buy price") — a leg
+    can be opened by a SELL (a fresh short, when total_investment_btc allows
+    net-short exposure) just as validly as by a BUY. Whichever fill created
+    it, gross PnL on close is computed against THIS leg's own open_price and
+    qty — never against the price of an unrelated adjacent grid level, which
+    was the source of the 2026-07-30 fabricated-PnL bug this replaces.
+    """
+    leg_id:           int
+    open_side:        str      # 'BUY' | 'SELL' — the fill that opened this leg
+    open_price:       float
+    qty:              float
+    opened_ts:        float
+    opened_level_idx: int      # diagnostics only; the leg outlives any one level
+
+
+@dataclass
 class GridLevel:
     index:       int
     price:       float
@@ -3067,6 +3087,13 @@ class GridLevel:
     qty:         float      = 0.0
     placed_at:   float      = 0.0  # epoch time this order was (re)placed;
                                     # used by paper_fill_min_resting_s guard
+    # Set only when this level's resting order is a designated closer for a
+    # specific OpenLeg (placed by _on_fill's counter-order step, or restored
+    # across a rebuild/handoff by reconcile_open_legs / _apply_handoff_restore).
+    # None means "this is a fresh open, whatever fills here starts a new leg"
+    # — the same role the old _initial_sell_oids set served, generalized to
+    # every level, not just startup sells.
+    closes_leg_id: Optional[int] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3126,20 +3153,31 @@ class GridEngine:
             self._total_fees   = 0.0
             self._cycle_count  = 0
 
-        # long_qty is NOT seeded from DB — it reflects live open orders only.
-        # On a fresh start the grid is rebuilt from scratch (all orders re-placed),
-        # so the accumulated long starts at 0 and grows as BUY fills come in.
-        self._long_qty: float = 0.0
+        # long_qty is now a derived @property (see below) — computed from
+        # _open_legs, not tracked as a separate counter that could drift out
+        # of sync with the actual leg ledger.
 
-        # Track client_oids of SELL orders placed at grid startup (_place_initial_orders).
-        # These SELLs have no corresponding BUY fill in this session — they are the
-        # initial resting asks placed above mid, not exits from a real long position.
-        # When they fill, _long_qty must NOT be decremented (there is nothing to close).
-        # Without this guard, startup SELLs filling before their counter-BUYs makes
-        # _long_qty go negative, which shows "short=" in the Status line even though
-        # no actual short exists.
-        self._initial_sell_oids: set = set()
-        self._placing_initial:   bool = False   # True only during _place_initial_orders
+        # Open-legs ledger: the durable, real cost-basis source of truth,
+        # replacing the old "adjacent grid level's price" assumption (see
+        # OpenLeg docstring and the 2026-07-30 wash-trade-PnL fix this
+        # generalizes). Seeded from DB so a plain process restart resumes
+        # with real, correct cost basis instead of starting blind — the
+        # same reason _realized_pnl/_total_fees/_cycle_count are seeded above.
+        self._open_legs: Dict[int, "OpenLeg"] = {}
+        self._local_leg_seq: int = 0   # fallback negative-id source when store is None
+        if store is not None:
+            for row in store.get_open_legs():
+                leg = OpenLeg(
+                    leg_id=row["leg_id"], open_side=row["open_side"],
+                    open_price=row["open_price"], qty=row["qty"],
+                    opened_ts=row["opened_ts"], opened_level_idx=row["opened_level_idx"],
+                )
+                self._open_legs[leg.leg_id] = leg
+            if self._open_legs:
+                logger.info(
+                    f"[GridEngine] Seeded {len(self._open_legs)} open leg(s) from DB "
+                    f"(net_qty={self._long_qty:+.4f})"
+                )
 
         # Fill queue for _fill_thread
         self._fill_queue: collections.deque = collections.deque()
@@ -3153,6 +3191,22 @@ class GridEngine:
         self._pending_fill_indices: set = set()
 
         self._build_levels()
+
+    @property
+    def _long_qty(self) -> float:
+        """
+        Net position, derived from _open_legs — a BUY-opened leg is long
+        qty, a SELL-opened leg is short qty (negative). Replaces the old
+        independently-mutated counter: keeping this derived rather than a
+        separately-tracked value that both _on_fill and the leg ledger had
+        to remember to update in lockstep removes an entire class of
+        desync bugs between "what we think we hold" and "what the ledger
+        of actual open legs says we hold."
+        """
+        total = 0.0
+        for leg in self._open_legs.values():
+            total += leg.qty if leg.open_side == "BUY" else -leg.qty
+        return total
 
     def _build_levels(self):
         prices = self._params.level_prices
@@ -3186,37 +3240,43 @@ class GridEngine:
         """
         Place a BUY or SELL for every level, except those in skip_indices.
 
-        skip_indices is used during a blue-green handoff: those indices
-        already have a live order inherited from the predecessor process
-        (applied afterward by GridBot._apply_handoff_restore), so placing a
-        fresh order here would create a duplicate resting order at that
-        price — the exchange would end up holding both, while this engine's
-        only in-memory reference would point at whichever one gets applied
-        last, silently orphaning the other.
+        skip_indices has two callers, both meaning "a different code path
+        already gave this specific level the order it should have — don't
+        overwrite it with a generic one":
+          - Blue-green handoff: those indices have a live order inherited
+            from the predecessor process (applied afterward by
+            GridBot._apply_handoff_restore) — placing a fresh order here
+            would create a duplicate resting order at that price.
+          - Leg reconciliation at rebuild time (GridBot._rebuild_grid via
+            GridEngine.reconcile_open_legs): those indices are about to get
+            a designated closer for a specific still-open leg (applied
+            afterward by apply_leg_reassignments), sized to that leg's own
+            qty rather than the standard per-level notional.
+
+        Every order placed here has no closes_leg_id — each is a fresh
+        open, exactly like the old "initial sell" case, just no longer
+        special-cased: whatever fills here starts a new OpenLeg (see
+        GridEngine._on_fill).
         """
         skip_indices = skip_indices or set()
         with self._lock:
             levels = list(self._levels)
-        self._placing_initial = True
-        try:
-            for lv in levels:
-                if self._stop_event.is_set():
-                    break
-                if lv.index in skip_indices:
-                    continue
-                # NOTE: was `elif lv.price > mid`, which silently placed no
-                # order at all when lv.price == mid exactly (observed live
-                # 2026-07-29 12:38:48 — level [2] never got an order because
-                # the AutoTuner-computed level price was bit-for-bit equal to
-                # the mid passed in here). `>=` makes the tie an explicit
-                # SELL instead of an orphaned level.
-                if lv.price < mid:
-                    self._place_buy(lv)
-                else:
-                    self._place_sell(lv)
-                time.sleep(0.05)
-        finally:
-            self._placing_initial = False
+        for lv in levels:
+            if self._stop_event.is_set():
+                break
+            if lv.index in skip_indices:
+                continue
+            # NOTE: was `elif lv.price > mid`, which silently placed no
+            # order at all when lv.price == mid exactly (observed live
+            # 2026-07-29 12:38:48 — level [2] never got an order because
+            # the AutoTuner-computed level price was bit-for-bit equal to
+            # the mid passed in here). `>=` makes the tie an explicit
+            # SELL instead of an orphaned level.
+            if lv.price < mid:
+                self._place_buy(lv)
+            else:
+                self._place_sell(lv)
+            time.sleep(0.05)
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -3224,21 +3284,23 @@ class GridEngine:
         raw = self._params.notional_per_level / price
         return round(math.floor(raw * 10000) / 10000, 4)
 
-    def _place_buy(self, lv: GridLevel):
+    def _place_buy(self, lv: GridLevel, qty_override: Optional[float] = None,
+                   closes_leg_id: Optional[int] = None):
         if self._handoff_freeze:
             logger.debug(f"[GridEngine] BUY  [{lv.index}] suppressed — handoff freeze active")
             return
-        qty = self._qty(lv.price)
+        qty = qty_override if qty_override is not None else self._qty(lv.price)
         if qty <= 0:
             return
         req = OrderRequest.limit_maker(
             side="BUY", qty=qty, price=lv.price,
             instrument=self._instrument, purpose="grid_buy")
         with self._lock:
-            lv.state      = LevelState.BUY_OPEN
-            lv.client_oid = req.client_oid
-            lv.qty        = qty
-            lv.placed_at  = time.time()
+            lv.state         = LevelState.BUY_OPEN
+            lv.client_oid    = req.client_oid
+            lv.qty           = qty
+            lv.placed_at     = time.time()
+            lv.closes_leg_id = closes_leg_id
         if self._oms.live_trading:
             self._oms.submit(req)
         # Paper mode: _simulate_paper_fills() is the sole fill authority for
@@ -3248,31 +3310,32 @@ class GridEngine:
         # orders), so it just leaks a Queue in OMS._fill_queues per order and
         # logs a misleading "FILL" line for an order that hasn't actually
         # crossed price yet.
-        logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
+        tag = f" closes_leg={closes_leg_id}" if closes_leg_id is not None else ""
+        logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}{tag}")
 
-    def _place_sell(self, lv: GridLevel):
+    def _place_sell(self, lv: GridLevel, qty_override: Optional[float] = None,
+                    closes_leg_id: Optional[int] = None):
         if self._handoff_freeze:
             logger.debug(f"[GridEngine] SELL [{lv.index}] suppressed — handoff freeze active")
             return
-        qty = self._qty(lv.price)
+        qty = qty_override if qty_override is not None else self._qty(lv.price)
         if qty <= 0:
             return
         req = OrderRequest.limit_maker(
             side="SELL", qty=qty, price=lv.price,
             instrument=self._instrument, purpose="grid_sell")
         with self._lock:
-            lv.state      = LevelState.SELL_OPEN
-            lv.client_oid = req.client_oid
-            lv.qty        = qty
-            lv.placed_at  = time.time()
-            # Mark as an initial sell so _on_fill skips the long_qty decrement.
-            if self._placing_initial:
-                self._initial_sell_oids.add(req.client_oid)
+            lv.state         = LevelState.SELL_OPEN
+            lv.client_oid    = req.client_oid
+            lv.qty           = qty
+            lv.placed_at     = time.time()
+            lv.closes_leg_id = closes_leg_id
         if self._oms.live_trading:
             self._oms.submit(req)
         # See _place_buy: paper mode's fill authority is _simulate_paper_fills(),
         # not OMS.submit()/_paper_fill(), so skip it here too.
-        logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}")
+        tag = f" closes_leg={closes_leg_id}" if closes_leg_id is not None else ""
+        logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}{tag}")
 
     # ── Fill detection ────────────────────────────────────────────────────────
 
@@ -3396,22 +3459,27 @@ class GridEngine:
         rather than leaving the adjacent-level counter-order (which _on_fill
         places correctly) to do its job. That re-armed order can then fill
         again within the same price stall, over and over — a same-price
-        wash-trade loop. Each such SELL fill still runs the normal
+        wash-trade loop. At the time, each such SELL fill still ran the old
         gross_pnl = (this level's price - the level BELOW's price) × qty
-        calculation in _get_paired_buy_price(), crediting a full spacing
-        width of profit for inventory that was, in reality, bought and sold
-        at the identical price moments apart. Observed live 2026-07-30 on
-        gen00013: level [1] wash-traded at a fixed price (e.g. 64260.18)
-        eleven times in ~8 minutes, each logged as gross=+1.0309 — real
-        cumulative_net climbed by that amount every ~30-90s with mid barely
-        moving, and was the primary driver of that day's 428-cycle,
-        +256.46 USD "daily PnL" figure being far outside the range of any
-        other day. Skipping pending-fill indices here closes the race: the
-        level stays untouched until _on_fill() has processed the original
-        fill (placing its own, correct, adjacent-level order), at which
-        point the NEXT tick's _replace_idle_levels() call re-arms it (if
-        still orphaned) against whatever mid is by then — no longer
-        guaranteed to be sitting exactly on this level's own price."""
+        calculation, crediting a full spacing width of profit for inventory
+        that was, in reality, bought and sold at the identical price moments
+        apart. Observed live 2026-07-30 on gen00013: level [1] wash-traded at
+        a fixed price (e.g. 64260.18) eleven times in ~8 minutes, each logged
+        as gross=+1.0309 — real cumulative_net climbed by that amount every
+        ~30-90s with mid barely moving, and was the primary driver of that
+        day's 428-cycle, +256.46 USD "daily PnL" figure being far outside the
+        range of any other day. (The adjacent-level-price assumption itself
+        was later replaced entirely by the OpenLeg ledger — see _on_fill —
+        so a same-level wash-trade can no longer fabricate profit even if it
+        recurs; this race-condition fix stands independently of that, since
+        skipping pending-fill indices here is also what lets _on_fill's own
+        counter-order land on the correct adjacent level in the first place.)
+        Skipping pending-fill indices here closes the race: the level stays
+        untouched until _on_fill() has processed the original fill (placing
+        its own, correct, adjacent-level order), at which point the NEXT
+        tick's _replace_idle_levels() call re-arms it (if still orphaned)
+        against whatever mid is by then — no longer guaranteed to be sitting
+        exactly on this level's own price."""
         mid = _price_cache.get_mid()
         if mid is None:
             return
@@ -3601,31 +3669,111 @@ class GridEngine:
             # the correct counter-order (placed below, at the adjacent level)
             # is what should happen next, not a naive re-arm of this level.
             self._pending_fill_indices.discard(idx)
+            lv = self._levels[idx]
+            closes_leg_id = lv.closes_leg_id
+            lv.closes_leg_id = None   # consumed either way
 
         self._total_fees += fill.fee
         now = time.time()
+        side_str = "BUY" if is_buy else "SELL"
 
-        if is_buy:
-            self._long_qty += fill.filled_qty
+        leg_closed: Optional[OpenLeg] = None
+        if closes_leg_id is not None:
+            with self._lock:
+                leg_closed = self._open_legs.pop(closes_leg_id, None)
+            if leg_closed is None:
+                logger.error(
+                    f"[GridEngine] FILL {side_str} [{idx}] @ {fill.avg_price:.2f} was "
+                    f"tagged closes_leg_id={closes_leg_id}, but that leg isn't in "
+                    f"_open_legs. Treating as a fresh open so this fill isn't "
+                    f"silently dropped from accounting either way."
+                )
+
+        new_leg: Optional[OpenLeg] = None
+        if leg_closed is not None:
+            # ── Closing fill: real PnL against the SPECIFIC leg it closes ──────
+            # Same formula either direction — a long leg profits when the close
+            # price is higher than the open price, a short leg profits when
+            # it's lower. Never the price of an unrelated adjacent grid level.
+            if leg_closed.open_side == "BUY":
+                gross_pnl = (fill.avg_price - leg_closed.open_price) * fill.filled_qty
+            else:
+                gross_pnl = (leg_closed.open_price - fill.avg_price) * fill.filled_qty
+            self._realized_pnl += gross_pnl
+            self._cycle_count  += 1
+            net_pnl = gross_pnl - fill.fee
+            if self._store is not None:
+                try:
+                    self._store.close_leg(leg_closed.leg_id)
+                except Exception as e:
+                    logger.error(f"[GridEngine] DB close_leg error: {e}", exc_info=True)
+            logger.info(
+                f"[GridEngine] FILL {side_str} [{idx}] @ {fill.avg_price:.2f} "
+                f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} | "
+                f"closed leg #{leg_closed.leg_id} (opened {leg_closed.open_side} "
+                f"@ {leg_closed.open_price:.2f}) cycle #{self._cycle_count} "
+                f"gross={gross_pnl:+.4f} net={net_pnl:+.4f} "
+                f"cumulative_net={self._realized_pnl - self._total_fees:+.4f} USD"
+            )
+            fill_leg_id = leg_closed.leg_id
+        else:
+            # ── Opening fill: starts a new leg. Nothing realized yet — matches
+            # the old BUY-fill behavior (gross_pnl always 0), now applied
+            # symmetrically to a SELL that opens a fresh short too, instead of
+            # the old is_initial_sell special case that only covered startup.
+            gross_pnl = 0.0
+            leg_id = None
+            if self._store is not None:
+                try:
+                    leg_id = self._store.open_leg(
+                        open_side=side_str, open_price=fill.avg_price,
+                        qty=fill.filled_qty, opened_ts=now, opened_level_idx=idx,
+                    )
+                except Exception as e:
+                    logger.error(f"[GridEngine] DB open_leg error: {e}", exc_info=True)
+            if leg_id is None:
+                # No store (unit tests) or the write failed — a locally unique
+                # negative id keeps in-memory accounting correct for the life
+                # of this process even without DB backing.
+                with self._lock:
+                    self._local_leg_seq -= 1
+                    leg_id = self._local_leg_seq
+            new_leg = OpenLeg(leg_id=leg_id, open_side=side_str,
+                              open_price=fill.avg_price, qty=fill.filled_qty,
+                              opened_ts=now, opened_level_idx=idx)
+            with self._lock:
+                self._open_legs[leg_id] = new_leg
             net = self._long_qty
             net_label = f"long={net:.4f}" if net >= 0 else f"short={-net:.4f}"
             logger.info(
-                f"[GridEngine] FILL BUY  [{idx}] @ {fill.avg_price:.2f} "
-                f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} "
-                f"{net_label} BTC"
+                f"[GridEngine] FILL {side_str} [{idx}] @ {fill.avg_price:.2f} "
+                f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} | "
+                f"opened leg #{leg_id} {net_label} BTC"
             )
-            # Persist to DB (gross_pnl=0 for BUY fills — profit only realised on SELL)
-            if self._store is not None:
-                try:
-                    self._store.record_fill(
-                        ts_utc=now, side="BUY", level_idx=idx,
-                        price_usd=fill.avg_price, qty_btc=fill.filled_qty,
-                        fee_usd=fill.fee, gross_pnl=0.0, cycle_num=self._cycle_count,
-                    )
-                except Exception as e:
-                    logger.error(f"[GridEngine] DB record_fill BUY error: {e}", exc_info=True)
+            fill_leg_id = leg_id
 
-            # Snapshot counter-level under lock, then place outside lock
+        if self._store is not None:
+            try:
+                self._store.record_fill(
+                    ts_utc=now, side=side_str, level_idx=idx,
+                    price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                    fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=self._cycle_count,
+                    leg_id=fill_leg_id, close_reason=None,
+                    is_close=(leg_closed is not None),
+                )
+            except Exception as e:
+                logger.error(f"[GridEngine] DB record_fill error: {e}", exc_info=True)
+
+        # ── Counter-order at the adjacent level ─────────────────────────────
+        # Direction is unchanged from before (BUY fill -> counter-SELL one
+        # level up; SELL fill -> counter-BUY one level down, subject to the
+        # buy-gate). What's new: if this fill just opened `new_leg`, the
+        # counter-order is tagged as ITS designated closer and sized to its
+        # exact qty — not the standard per-level notional — so whenever it
+        # fills, it closes exactly this leg and nothing else. If this fill
+        # just closed `leg_closed` instead, the counter-order is a fresh,
+        # untagged opening, same as any normal grid re-entry.
+        if is_buy:
             sell_lv = None
             sell_idx = idx + 1
             with self._lock:
@@ -3634,43 +3782,12 @@ class GridEngine:
                     if candidate.state == LevelState.IDLE:
                         sell_lv = candidate
             if sell_lv is not None:
-                self._place_sell(sell_lv)
+                if new_leg is not None:
+                    self._place_sell(sell_lv, qty_override=new_leg.qty,
+                                      closes_leg_id=new_leg.leg_id)
+                else:
+                    self._place_sell(sell_lv)
         else:
-            # Skip long_qty decrement for SELLs placed at grid startup.
-            # Those orders were placed above mid before any BUY fill existed in
-            # this session — decrementing would drive long_qty negative ("short=")
-            # even though no real short position exists.
-            is_initial_sell = fill.client_oid in self._initial_sell_oids
-            if is_initial_sell:
-                self._initial_sell_oids.discard(fill.client_oid)
-                logger.debug(
-                    f"[GridEngine] SELL [{idx}] @ {fill.avg_price:.2f} is an initial"
-                    f" sell — skipping long_qty decrement (was {self._long_qty:.4f})"
-                )
-            else:
-                self._long_qty -= fill.filled_qty
-            buy_price = self._get_paired_buy_price(idx)
-            gross_pnl = (fill.avg_price - buy_price) * fill.filled_qty if buy_price else 0.0
-            self._realized_pnl += gross_pnl
-            self._cycle_count  += 1
-            net_pnl = gross_pnl - fill.fee
-            logger.info(
-                f"[GridEngine] FILL SELL [{idx}] @ {fill.avg_price:.2f} "
-                f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} | "
-                f"cycle #{self._cycle_count} gross={gross_pnl:+.4f} net={net_pnl:+.4f} "
-                f"cumulative_net={self._realized_pnl - self._total_fees:+.4f} USD"
-            )
-            # Persist to DB
-            if self._store is not None:
-                try:
-                    self._store.record_fill(
-                        ts_utc=now, side="SELL", level_idx=idx,
-                        price_usd=fill.avg_price, qty_btc=fill.filled_qty,
-                        fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=self._cycle_count,
-                    )
-                except Exception as e:
-                    logger.error(f"[GridEngine] DB record_fill SELL error: {e}", exc_info=True)
-
             # Snapshot counter-level under lock, then place outside lock
             buy_lv = None
             suppress = False
@@ -3695,7 +3812,11 @@ class GridEngine:
                     f"🛡 Buy [{buy_idx}] suppressed — stop-score gate active"
                 )
             elif buy_lv is not None:
-                self._place_buy(buy_lv)
+                if new_leg is not None:
+                    self._place_buy(buy_lv, qty_override=new_leg.qty,
+                                     closes_leg_id=new_leg.leg_id)
+                else:
+                    self._place_buy(buy_lv)
 
             # ── Drift-shift: top-level sell → shift range up one spacing ──────
             # If this fill was the top-level SELL, price has drifted above the
@@ -3794,62 +3915,144 @@ class GridEngine:
         self._needs_rebuild = False
         return flag
 
-    def _get_paired_buy_price(self, sell_idx: int) -> Optional[float]:
-        with self._lock:
-            buy_idx = sell_idx - 1
-            if 0 <= buy_idx < len(self._levels):
-                return self._levels[buy_idx].price
-        return None
-
     def get_cost_basis(self) -> Tuple[float, float]:
         """
         Weighted-average cost basis of the net long position, expressed as
-        (qty, avg_price), where qty matches _long_qty (the running counter
-        of filled BUYs minus filled SELLs) rather than the raw count of
-        SELL_OPEN levels.
+        (qty, avg_price).
 
-        Why the two can diverge: _long_qty can go negative during a rapid
-        price rally (SELL fills outpace BUY counter-fills).  When it later
-        recovers through zero back into positive territory the BUY fills
-        that covered the short are absorbed first; only the remaining qty
-        represents a genuine long entry.  Summing ALL SELL_OPEN levels in
-        that state would overcount and inflate the cost basis.
+        Previously this scanned SELL_OPEN levels and assumed each one's cost
+        basis was "whatever the adjacent lower level happens to be priced
+        at" — the same assumption behind the 2026-07-30 fabricated-PnL bug,
+        just on the reporting side rather than the accounting side. Now it's
+        a direct sum over _open_legs, the real ledger of what was actually
+        paid for what's actually still held: every BUY-opened leg IS a piece
+        of the net long position, at its own real open_price, full stop.
 
-        Algorithm: collect SELL_OPEN levels sorted lowest-index first
-        (i.e. lowest buy price first, matching the most recent entries),
-        accumulate until total_qty == _long_qty, then stop.  If _long_qty
-        <= 0 there is no net long and we return (0.0, 0.0).
-
-        Must be called before stop() tears down level state.
+        Must be called before stop() tears down level state — actually no
+        longer true (legs live independently of level state now), kept
+        callable at the same point regardless since callers still expect it.
         """
         with self._lock:
-            net_long = self._long_qty
-            if net_long <= 0.0:
-                return 0.0, 0.0
-
-            # Collect SELL_OPEN levels in ascending index order (lowest buy
-            # price first = most recently entered positions when price fell).
-            candidates = []
-            for lv in self._levels:
-                if lv.state == LevelState.SELL_OPEN and lv.qty > 0:
-                    buy_idx   = lv.index - 1
-                    buy_price = (self._levels[buy_idx].price
-                                 if 0 <= buy_idx < len(self._levels) else lv.price)
-                    candidates.append((lv.index, buy_price, lv.qty))
-            candidates.sort(key=lambda x: x[0])
-
-            # Accumulate only enough levels to match net_long.
-            total_qty  = 0.0
-            total_cost = 0.0
-            for _, buy_price, qty in candidates:
-                take = min(qty, net_long - total_qty)
-                total_cost += buy_price * take
-                total_qty  += take
-                if total_qty >= net_long - 1e-9:
-                    break
+            long_legs = [leg for leg in self._open_legs.values() if leg.open_side == "BUY"]
+            total_qty  = sum(leg.qty for leg in long_legs)
+            total_cost = sum(leg.qty * leg.open_price for leg in long_legs)
 
         avg_price = (total_cost / total_qty) if total_qty > 0 else 0.0
         return total_qty, avg_price
+
+    # ── Rebuild-time leg reconciliation ─────────────────────────────────────
+    # Called by GridBot._rebuild_grid on the NEW engine, after _build_levels()
+    # (so self._levels/self._open_legs already reflect the new grid and the
+    # DB-seeded ledger) but before start() places any orders.
+
+    def reconcile_open_legs(
+        self, exclude_indices: Optional[set] = None,
+        already_handled_leg_ids: Optional[set] = None,
+    ) -> Tuple[Dict[int, int], List["OpenLeg"]]:
+        """
+        Decide, for every currently-open leg, whether it still fits the
+        just-rebuilt grid.
+
+        - Still within [new lower, new upper]: pick the best-fit level to
+          host its designated closer (nearest to one new-spacing away in the
+          closing direction, among levels not already claimed by another
+          leg or excluded by the caller) and reserve it — returned as
+          {level_index: leg_id} for the caller to pass into
+          start(skip_indices=...), then apply via apply_leg_reassignments()
+          once start() has finished placing everything else.
+        - No longer fits (price now outside the new range, or every
+          candidate level on the closing side is already claimed): returned
+          in the second list. This method does NOT liquidate them itself —
+          it only decides; GridBot._rebuild_grid executes the actual market
+          close (real fill, real fee, real fill event in grid_fills) and
+          only then removes the leg from the ledger. A leg that can't be
+          reconciled stays fully tracked and safe until that happens.
+
+        exclude_indices: level indices already spoken for by something else
+        (currently: a blue-green handoff's restore_plan) — never a candidate
+        here. already_handled_leg_ids: legs already re-attached by that same
+        mechanism — skipped entirely rather than double-assigned.
+        """
+        exclude_indices = exclude_indices or set()
+        already_handled_leg_ids = already_handled_leg_ids or set()
+        with self._lock:
+            legs = [leg for leg in self._open_legs.values()
+                    if leg.leg_id not in already_handled_leg_ids]
+            levels = [lv for lv in self._levels if lv.index not in exclude_indices]
+
+        if not legs:
+            return {}, []
+        if not levels:
+            return {}, list(legs)
+
+        lower   = levels[0].price
+        upper   = levels[-1].price
+        spacing = (upper - lower) / (len(levels) - 1) if len(levels) > 1 else 0.0
+
+        assignments:  Dict[int, int] = {}
+        claimed:      set            = set()
+        to_liquidate: List[OpenLeg]  = []
+
+        # Oldest-opened first: whichever position has been waiting longest
+        # gets first pick if two legs' ideal target levels collide.
+        for leg in sorted(legs, key=lambda l: l.opened_ts):
+            in_range = lower <= leg.open_price <= upper
+            if not in_range:
+                to_liquidate.append(leg)
+                continue
+
+            if leg.open_side == "BUY":
+                # Long leg closes with a SELL above what it paid — never at
+                # or below, that would be locking in a loss the grid itself
+                # didn't ask for.
+                target = leg.open_price + spacing if spacing > 0 else leg.open_price
+                candidates = [lv for lv in levels
+                              if lv.index not in claimed and lv.price > leg.open_price]
+            else:
+                target = leg.open_price - spacing if spacing > 0 else leg.open_price
+                candidates = [lv for lv in levels
+                              if lv.index not in claimed and lv.price < leg.open_price]
+
+            if not candidates:
+                to_liquidate.append(leg)
+                continue
+
+            best = min(candidates, key=lambda lv: abs(lv.price - target))
+            claimed.add(best.index)
+            assignments[best.index] = leg.leg_id
+
+        if assignments or to_liquidate:
+            logger.info(
+                f"[GridEngine] reconcile_open_legs: {len(assignments)} leg(s) "
+                f"re-anchored to the rebuilt grid, {len(to_liquidate)} no longer "
+                f"fit (new range=[{lower:.2f},{upper:.2f}]) and need liquidating"
+            )
+        return assignments, to_liquidate
+
+    def apply_leg_reassignments(self, assignments: Dict[int, int]) -> None:
+        """
+        Place the designated-closer order for each (level_index -> leg_id)
+        pair from reconcile_open_legs. Call AFTER start() so these specific
+        indices (passed as skip_indices to start()) are still IDLE and
+        weren't given a generic fresh-open order instead.
+        """
+        with self._lock:
+            level_by_index = {lv.index: lv for lv in self._levels}
+            legs_by_id = dict(self._open_legs)
+        for idx, leg_id in assignments.items():
+            lv  = level_by_index.get(idx)
+            leg = legs_by_id.get(leg_id)
+            if lv is None or leg is None:
+                logger.error(
+                    f"[GridEngine] apply_leg_reassignments: index={idx} "
+                    f"leg_id={leg_id} not resolvable — leg stays tracked, just "
+                    f"untargeted until the next rebuild's reconciliation."
+                )
+                continue
+            if leg.open_side == "BUY":
+                self._place_sell(lv, qty_override=leg.qty, closes_leg_id=leg.leg_id)
+            else:
+                self._place_buy(lv, qty_override=leg.qty, closes_leg_id=leg.leg_id)
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
@@ -4428,11 +4631,12 @@ class TrendSignal:
 
 import sqlite3 as _sqlite3
 
-_GRID_DB_SCHEMA_VERSION = 7
+_GRID_DB_SCHEMA_VERSION = 8
 
 _GRID_DB_DDL = """
 -- Every grid fill: permanent, append-only audit log.
--- gross_pnl is meaningful only for SELL fills (price gain over paired BUY level).
+-- gross_pnl is meaningful only for closing fills (real realized PnL against
+-- the specific leg closed — see open_legs below). 0 for opening fills.
 -- fee_usd is always positive (a cost).
 CREATE TABLE IF NOT EXISTS grid_fills (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4443,12 +4647,33 @@ CREATE TABLE IF NOT EXISTS grid_fills (
     price_usd   REAL    NOT NULL,
     qty_btc     REAL    NOT NULL,
     fee_usd     REAL    NOT NULL,          -- maker fee paid (positive = cost)
-    gross_pnl   REAL    NOT NULL DEFAULT 0.0,  -- (sell_price - buy_price) * qty; 0 for BUY fills
-    cycle_num   INTEGER NOT NULL DEFAULT 0     -- monotonic cycle counter at time of fill
+    gross_pnl   REAL    NOT NULL DEFAULT 0.0,  -- real realized PnL; 0 for opening fills
+    cycle_num   INTEGER NOT NULL DEFAULT 0,    -- monotonic cycle counter at time of fill
+    leg_id        INTEGER,                  -- the open_legs.leg_id this fill opened or closed
+    close_reason  TEXT                      -- NULL for a normal grid-cycle close;
+                                             -- 'rebuild_reprice' for a leg the auto-tuner's
+                                             -- new range no longer spans (see reconcile_open_legs)
+);
+
+-- Ledger of currently-open legs: one row per fill that opened a position with
+-- nothing yet closing it. A leg is deleted from here the instant the fill
+-- that closes it is processed (see GridEngine._on_fill) — this table is the
+-- live "what do we actually hold and at what price" state, kept durable so
+-- it survives both an in-process grid rebuild and a full process restart,
+-- not just carried in memory. Added 2026-07-31 replacing the old
+-- adjacent-level-price cost-basis assumption (see grid_fills.close_reason
+-- comment and the 2026-07-30 wash-trade-PnL fix this generalizes).
+CREATE TABLE IF NOT EXISTS open_legs (
+    leg_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    open_side         TEXT    NOT NULL,      -- 'BUY' | 'SELL' — the fill that opened this leg
+    open_price        REAL    NOT NULL,
+    qty               REAL    NOT NULL,
+    opened_ts         REAL    NOT NULL,
+    opened_level_idx  INTEGER NOT NULL
 );
 
 -- Pre-aggregated daily PnL (HKT date); updated atomically with each fill.
--- gross_pnl_usd: sum of (sell_price - buy_level_price) * qty for completed cycles
+-- gross_pnl_usd: sum of real realized PnL for completed cycles
 -- fees_usd:      total maker fees paid (stored as negative — a cost)
 -- net_pnl_usd:   gross_pnl_usd + fees_usd  (fees are negative, so this subtracts)
 CREATE TABLE IF NOT EXISTS daily_pnl (
@@ -4633,6 +4858,26 @@ class GridStateStore:
                         "[GridStateStore] schema migrated -> v7 "
                         "(bg_lock.log_gen for per-instance log file naming)"
                     )
+                # v7->v8: open_legs table (CREATE IF NOT EXISTS in the DDL above
+                # handles new DBs); grid_fills gets leg_id + close_reason columns
+                # for existing DBs, added via ALTER since the table already exists.
+                if db_ver < 8:
+                    for col, typedef in [
+                        ("leg_id",       "INTEGER"),
+                        ("close_reason", "TEXT"),
+                    ]:
+                        try:
+                            self._conn.execute(
+                                f"ALTER TABLE grid_fills ADD COLUMN {col} {typedef}"
+                            )
+                        except Exception:
+                            pass  # column already exists (idempotent)
+                    logger.info(
+                        "[GridStateStore] schema migrated -> v8 "
+                        "(open_legs ledger + grid_fills.leg_id/close_reason — "
+                        "real per-leg cost basis replacing the adjacent-level-"
+                        "price assumption)"
+                    )
                 if db_ver < _GRID_DB_SCHEMA_VERSION:
                     self._conn.execute(
                         "UPDATE meta SET value=? WHERE key='schema_version'",
@@ -4650,9 +4895,12 @@ class GridStateStore:
         price_usd:      float,
         qty_btc:        float,
         fee_usd:        float,     # positive = cost
-        gross_pnl:      float,     # 0.0 for BUY fills
+        gross_pnl:      float,     # 0.0 for an opening fill
         cycle_num:      int,
         is_liquidation: bool = False,  # True for stop-loss / shutdown liquidations
+        leg_id:         Optional[int] = None,   # open_legs.leg_id this fill opened/closed
+        close_reason:   Optional[str] = None,   # e.g. 'rebuild_reprice'; NULL = normal cycle
+        is_close:       bool = False,           # True if this fill closed a leg (real PnL)
     ) -> None:
         """
         Append one fill row and update the daily_pnl bucket atomically.
@@ -4660,19 +4908,29 @@ class GridStateStore:
         (the fill thread processes fills sequentially; a slow DB write here
         delays counter-order placement).  WAL + NORMAL sync keeps writes
         to ~1-2 ms on spinning rust; SSD is faster.
+
+        is_close must be passed explicitly rather than inferred from side.
+        Under the old adjacent-level-price model every real cycle ended in
+        a SELL, so `side == "SELL"` was a correct proxy for "this completed
+        a cycle." That's no longer true — a BUY can now close a short leg
+        (real gross_pnl, a real completed round trip) just as validly as a
+        SELL closes a long one. Inferring from side would silently
+        undercount cycle_count/fill_count for daily_pnl whenever a short is
+        involved, while gross_pnl_usd/net_pnl_usd stayed correct — a visible
+        inconsistency between the dollar totals and the cycle tally.
         """
         hkt_date = _db_hkt_date(ts_utc)
         # Liquidation SELLs (stop-loss) are not completed grid cycles.
-        cycles_delta = 1 if side == "SELL" and not is_liquidation else 0
+        cycles_delta = 1 if is_close and not is_liquidation else 0
 
         with self._lock:
             self._conn.execute(
                 """INSERT INTO grid_fills
                    (ts_utc, hkt_date, side, level_idx, price_usd,
-                    qty_btc, fee_usd, gross_pnl, cycle_num)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    qty_btc, fee_usd, gross_pnl, cycle_num, leg_id, close_reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (ts_utc, hkt_date, side, level_idx, price_usd,
-                 qty_btc, fee_usd, gross_pnl, cycle_num),
+                 qty_btc, fee_usd, gross_pnl, cycle_num, leg_id, close_reason),
             )
             # Update daily bucket — fees stored as negative (cost subtracted from net)
             sl_gross = gross_pnl if is_liquidation else 0.0
@@ -4694,6 +4952,42 @@ class GridStateStore:
                  sl_gross, sl_delta),
             )
             self._conn.commit()
+
+    # ── Open-legs ledger ──────────────────────────────────────────────────────
+    # The durable source of truth for GridEngine._open_legs — see the
+    # open_legs table comment in _GRID_DB_DDL. Written through synchronously
+    # on every leg open/close so a plain process restart (not just an
+    # in-process grid rebuild) can pick up exactly where it left off, the
+    # same way _realized_pnl/_total_fees/_cycle_count are seeded from
+    # get_accumulated() today.
+
+    def open_leg(self, open_side: str, open_price: float, qty: float,
+                 opened_ts: float, opened_level_idx: int) -> int:
+        """Insert a new open leg row. Returns its leg_id."""
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO open_legs
+                   (open_side, open_price, qty, opened_ts, opened_level_idx)
+                   VALUES (?,?,?,?,?)""",
+                (open_side, open_price, qty, opened_ts, opened_level_idx),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def close_leg(self, leg_id: int) -> None:
+        """Remove a leg once the fill that closes it has been processed."""
+        with self._lock:
+            self._conn.execute("DELETE FROM open_legs WHERE leg_id = ?", (leg_id,))
+            self._conn.commit()
+
+    def get_open_legs(self) -> List[dict]:
+        """All currently-open legs — used to seed GridEngine._open_legs."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT leg_id, open_side, open_price, qty, opened_ts, opened_level_idx
+                   FROM open_legs"""
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Accumulated totals ────────────────────────────────────────────────────
 
@@ -6492,7 +6786,7 @@ class GridBot:
         time.sleep(0.3)
 
         with self._engine._lock:
-            long_qty = self._engine._long_qty
+            long_qty = self._engine._long_qty   # logging/alert display only now — see below
             params   = self._engine._params
             levels_data = []
             for lv in self._engine._levels:
@@ -6506,11 +6800,11 @@ class GridBot:
                     "exchange_id":      exchange_id,
                     "qty":              lv.qty,
                     "placed_at":        lv.placed_at,
-                    # Needed so a restored SELL_OPEN level's counter-fill
-                    # accounting matches what this process would have done —
-                    # see GridEngine._on_fill's is_initial_sell handling and
-                    # GridBot._apply_handoff_restore.
-                    "is_initial_sell":  lv.client_oid in self._engine._initial_sell_oids,
+                    # Needed so a restored order's eventual fill still closes
+                    # the SAME OpenLeg it was the designated closer for — see
+                    # GridEngine._on_fill and GridBot._apply_handoff_restore.
+                    # None means "fresh open", same as any other untagged level.
+                    "closes_leg_id":    lv.closes_leg_id,
                 })
 
         # ── FIX: range guard warm-up + BuyGate calibration continuity ──────────
@@ -6661,12 +6955,21 @@ class GridBot:
         already happened in _preregister_handoff_orders(), as early in
         startup as possible — see that method's docstring for why. This step
         only has to: set the matched GridLevel objects' state/client_oid/qty/
-        placed_at (and initial-sell flag, so a restored SELL_OPEN level that
-        was one of the peer's initial sells doesn't wrongly decrement
-        long_qty when it fills — see GridEngine._on_fill), seed long_qty, and
-        cancel + forget any orphaned orders that no longer correspond to any
-        level in the grid we just built (GridEngine.start() already placed a
-        fresh order at whatever new level took that price's place, if any).
+        placed_at/closes_leg_id (so a restored level's eventual fill closes
+        the correct OpenLeg — see GridEngine._on_fill), and cancel + forget
+        any orphaned orders that no longer correspond to any level in the
+        grid we just built (GridEngine.start() already placed a fresh order
+        at whatever new level took that price's place, if any).
+
+        long_qty is NOT restored here — it's a derived property computed
+        from _open_legs, which GridEngine.__init__ already seeded straight
+        from the shared DB (the predecessor wrote through to the same
+        open_legs table on every leg open/close, so this process sees the
+        same ledger without any snapshot involved). What IS worth doing
+        here is a sanity check: if our freshly-derived long_qty disagrees
+        with what the predecessor itself reported at export time, something
+        is inconsistent between the two processes' view of the ledger —
+        worth a loud log rather than silent trust either way.
         """
         snap = self._pending_handoff_snapshot
         assert snap is not None and self._engine is not None
@@ -6678,14 +6981,24 @@ class GridBot:
                 if lv is None:
                     continue  # shouldn't happen — restore_plan keys came from this same grid
                 state_str = snap_lv["state"]
-                lv.state      = LevelState(state_str)
-                lv.client_oid = snap_lv["client_oid"]
-                lv.qty        = snap_lv["qty"]
-                lv.placed_at  = snap_lv.get("placed_at", time.time())
-                if state_str == "SELL_OPEN" and snap_lv.get("is_initial_sell", False):
-                    self._engine._initial_sell_oids.add(snap_lv["client_oid"])
+                lv.state         = LevelState(state_str)
+                lv.client_oid    = snap_lv["client_oid"]
+                lv.qty           = snap_lv["qty"]
+                lv.placed_at     = snap_lv.get("placed_at", time.time())
+                lv.closes_leg_id = snap_lv.get("closes_leg_id")
 
-            self._engine._long_qty = float(snap.get("long_qty", 0.0))
+            restored_long_qty = self._engine._long_qty
+
+        expected_long_qty = float(snap.get("long_qty", restored_long_qty))
+        if abs(restored_long_qty - expected_long_qty) > 1e-6:
+            logger.warning(
+                f"[GridBot] Handoff: long_qty mismatch after restore — "
+                f"predecessor reported {expected_long_qty:.4f}, this process's "
+                f"open_legs ledger derives {restored_long_qty:.4f}. Both "
+                f"processes read the same DB, so this points at a write that "
+                f"didn't land (or landed between export and this check) — "
+                f"worth a manual look at the open_legs table."
+            )
 
         for olv in orphans:
             exid = olv.get("exchange_id", "")
@@ -6886,11 +7199,15 @@ class GridBot:
                 try:
                     # level_idx=-1 / cycle_num=-1: sentinel marking this as a
                     # liquidation fill rather than a normal numbered grid level/cycle.
+                    # is_close=True preserves this method's pre-existing behavior
+                    # exactly (it was always inferred from side=="SELL" before
+                    # record_fill's is_close param existed — this function only
+                    # ever closes/reduces a position, never opens one).
                     self._store.record_fill(
                         ts_utc=time.time(), side="SELL", level_idx=-1,
                         price_usd=fill.avg_price, qty_btc=fill.filled_qty,
                         fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
-                        is_liquidation=is_liquidation,
+                        is_liquidation=is_liquidation, is_close=True,
                     )
                 except Exception as e:
                     logger.error(
@@ -6912,6 +7229,89 @@ class GridBot:
                 f"{qty:.4f} BTC position may still be open.\n"
                 f"MANUAL INTERVENTION REQUIRED"
             )
+
+    def _liquidate_leg_at_market(self, leg: "OpenLeg", reason: str = "rebuild_reprice") -> bool:
+        """
+        Close one specific OpenLeg via a market order, for a leg that
+        reconcile_open_legs decided no longer fits the just-rebuilt grid
+        (its open_price fell outside the new range, or every level on its
+        closing side was already claimed by another leg).
+
+        Symmetric counterpart to _liquidate_position: that method always
+        market-SELLs to reduce a long; this closes whichever direction the
+        leg actually needs — a market BUY to cover a short leg is just as
+        valid here as a market SELL to close a long one, since a leg can be
+        opened by either side (see OpenLeg docstring).
+
+        Returns True if the leg was confirmed closed (and has been removed
+        from _open_legs / the DB ledger) — False on a timeout, in which
+        case the leg is deliberately left tracked rather than assumed
+        closed, so it's picked up again by the next rebuild's reconciliation
+        instead of silently vanishing from the books.
+        """
+        close_side = "SELL" if leg.open_side == "BUY" else "BUY"
+        tag = f"[{reason}]"
+        logger.warning(
+            f"[GridBot]{tag} Leg #{leg.leg_id} (opened {leg.open_side} "
+            f"{leg.qty:.4f} @ {leg.open_price:.2f}) no longer fits the "
+            f"rebuilt grid — closing via market {close_side}"
+        )
+        req = OrderRequest.market(side=close_side, qty=leg.qty,
+                                   instrument=INSTRUMENT, purpose="liquidate")
+        self._oms.submit(req)
+        fill = self._oms.wait_fill(req.client_oid, timeout=15.0)
+        if not (fill and fill.is_filled):
+            logger.error(
+                f"[GridBot]{tag} Leg #{leg.leg_id} liquidation TIMED OUT — "
+                f"{leg.qty:.4f} BTC ({leg.open_side} @ {leg.open_price:.2f}) may "
+                f"still be open. Leaving it tracked; MANUAL CHECK RECOMMENDED."
+            )
+            self._alerter.send(
+                f"🚨 Leg #{leg.leg_id} liquidation TIMED OUT ({reason})\n"
+                f"{leg.qty:.4f} BTC ({leg.open_side} @ {leg.open_price:.2f}) "
+                f"may still be open. MANUAL CHECK RECOMMENDED."
+            )
+            return False
+
+        if leg.open_side == "BUY":
+            gross_pnl = (fill.avg_price - leg.open_price) * fill.filled_qty
+        else:
+            gross_pnl = (leg.open_price - fill.avg_price) * fill.filled_qty
+        net_pnl = gross_pnl - fill.fee
+
+        logger.warning(
+            f"[GridBot]{tag} Leg #{leg.leg_id} liquidated: {close_side} "
+            f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f} | "
+            f"gross={gross_pnl:+.4f} net={net_pnl:+.4f} USD"
+        )
+        if self._store is not None:
+            try:
+                # level_idx=-1/cycle_num=-1: same sentinel _liquidate_position
+                # uses — this isn't a normal numbered grid level fill.
+                self._store.record_fill(
+                    ts_utc=time.time(), side=close_side, level_idx=-1,
+                    price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                    fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
+                    is_liquidation=False, leg_id=leg.leg_id,
+                    close_reason=reason, is_close=True,
+                )
+                self._store.close_leg(leg.leg_id)
+            except Exception as e:
+                logger.error(
+                    f"[GridBot]{tag} DB record_fill/close_leg error: {e}",
+                    exc_info=True,
+                )
+        if self._engine is not None:
+            with self._engine._lock:
+                self._engine._open_legs.pop(leg.leg_id, None)
+
+        self._alerter.send(
+            f"🔁 Leg closed at rebuild ({reason})\n"
+            f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
+            f"(opened {leg.open_side} @ {leg.open_price:.2f}) | "
+            f"realized {gross_pnl:+.4f} USD"
+        )
+        return True
 
     def _update_pending_raise(self, candidate_stop: float, noise_tolerance: float = 0.0) -> bool:
         """
@@ -7420,11 +7820,40 @@ class GridBot:
             instrument=INSTRUMENT, config=self._cfg,
             store=self._store,
             buy_gate_fn=_buy_gate)
-        self._engine.start(mid, skip_indices=set(restore_plan.keys()))
+
+        # ── Reconcile every still-open leg against the grid we just built ────
+        # _open_legs was just seeded from DB inside GridEngine.__init__ above,
+        # so this covers BOTH a same-process rebuild (the legs the OLD engine
+        # was tracking a moment ago) and, incidentally, a plain process
+        # restart (since the ledger lives in the DB, not memory). Legs a
+        # handoff snapshot already re-attached (restore_plan) are excluded —
+        # see _apply_handoff_restore's closes_leg_id restoration below.
+        already_handled_leg_ids = {
+            snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
+            if snap_lv.get("closes_leg_id") is not None
+        }
+        leg_assignments, legs_to_liquidate = self._engine.reconcile_open_legs(
+            exclude_indices=set(restore_plan.keys()),
+            already_handled_leg_ids=already_handled_leg_ids,
+        )
+
+        self._engine.start(
+            mid, skip_indices=set(restore_plan.keys()) | set(leg_assignments.keys())
+        )
 
         if self._pending_handoff_snapshot is not None:
             self._apply_handoff_restore(restore_plan, orphans)
             self._pending_handoff_snapshot = None
+
+        if leg_assignments:
+            self._engine.apply_leg_reassignments(leg_assignments)
+            logger.info(
+                f"[GridBot] Re-anchored {len(leg_assignments)} open leg(s) to "
+                f"the rebuilt grid"
+            )
+
+        for leg in legs_to_liquidate:
+            self._liquidate_leg_at_market(leg, reason="rebuild_reprice")
 
         logger.info(
             f"[GridBot] Grid live: [{new_params.lower:.2f},{new_params.upper:.2f}] "
