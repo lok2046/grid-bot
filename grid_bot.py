@@ -3491,10 +3491,25 @@ class GridEngine:
             # See _place_initial_orders for why this is `>=`-via-else rather
             # than a separate `elif lv.price > mid` — an exact tie must not
             # silently leave the level unplaced.
+            #
+            # closes_leg_id/qty must be carried through the re-arm. A level
+            # can go IDLE without ever passing through _on_fill — e.g. a
+            # maker-timeout cancel in _poll_live_fills, which resets
+            # state/client_oid but (correctly) leaves closes_leg_id alone,
+            # since that fill never happened. Re-arming it as a plain,
+            # untagged, standard-notional order here would silently strip
+            # the designated-closer tag from whatever OpenLeg it was placed
+            # for — that leg would still be tracked correctly, just with
+            # nothing actively targeting it for close until the next
+            # rebuild's reconcile_open_legs happens to sweep it up.
+            # Re-placing it as the SAME tagged closer, same qty, is a plain
+            # retry of the order that just got cancelled, not a fresh open.
+            tag_qty = lv.qty if lv.closes_leg_id is not None else None
+            tag_leg = lv.closes_leg_id
             if lv.price < mid:
-                self._place_buy(lv)
+                self._place_buy(lv, qty_override=tag_qty, closes_leg_id=tag_leg)
             else:
-                self._place_sell(lv)
+                self._place_sell(lv, qty_override=tag_qty, closes_leg_id=tag_leg)
 
     # ── Trailing ──────────────────────────────────────────────────────────────
 
@@ -3658,6 +3673,30 @@ class GridEngine:
                     break
                 self._on_fill(idx, fill)
 
+    def _retry_db_write(self, fn, attempts: int = 3, base_delay: float = 0.05) -> Tuple[bool, object]:
+        """
+        Retry a synchronous DB write a few times with small backoff before
+        giving up. Local SQLite failures at this call rate are almost always
+        transient (a WAL checkpoint, a momentary lock from another writer on
+        the same file) rather than permanent — a couple of retries a few
+        tens of milliseconds apart clears the great majority of them without
+        meaningfully delaying counter-order placement (record_fill's own
+        docstring already budgets for ~1-2ms per write; three attempts here
+        is still well under 200ms worst case).
+        Returns (True, result) on success, (False, last_exception) if every
+        attempt failed — the caller decides how loudly to escalate a real,
+        persistent failure.
+        """
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                return True, fn()
+            except Exception as e:
+                last_exc = e
+                if attempt < attempts - 1:
+                    time.sleep(base_delay * (attempt + 1))
+        return False, last_exc
+
     def _on_fill(self, idx: int, fill: FillEvent):
         # Snapshot the level reference and intent under lock, then release
         # before calling _place_buy/_place_sell (which acquire lock themselves).
@@ -3703,10 +3742,36 @@ class GridEngine:
             self._cycle_count  += 1
             net_pnl = gross_pnl - fill.fee
             if self._store is not None:
-                try:
-                    self._store.close_leg(leg_closed.leg_id)
-                except Exception as e:
-                    logger.error(f"[GridEngine] DB close_leg error: {e}", exc_info=True)
+                ok, err = self._retry_db_write(
+                    lambda: self._store.close_leg(leg_closed.leg_id))
+                if not ok:
+                    # This leg is ALREADY popped from _open_legs and its PnL
+                    # already realized in-memory (and in grid_fills) above —
+                    # that part is correct and must not be undone. The risk
+                    # is purely durability: if this DELETE never lands, the
+                    # next engine construction (rebuild OR plain restart)
+                    # re-seeds this exact leg from DB as still-open, and its
+                    # eventual re-anchored close will realize the SAME PnL a
+                    # second time. Loud + distinct from the generic DB-error
+                    # log so it doesn't get lost among routine noise —
+                    # manual fix is one DELETE statement, but only a human
+                    # who saw this will know to run it.
+                    logger.critical(
+                        f"[GridEngine] PERSISTENT close_leg FAILURE for leg "
+                        f"#{leg_closed.leg_id} (opened {leg_closed.open_side} "
+                        f"{leg_closed.qty:.4f} @ {leg_closed.open_price:.2f}) "
+                        f"after retries: {err}. GHOST-LEG RISK: this leg is "
+                        f"closed in memory/grid_fills but the open_legs row "
+                        f"may still exist — if so it will be re-seeded and "
+                        f"its PnL double-counted at the next rebuild/restart. "
+                        f"Manual fix: DELETE FROM open_legs WHERE leg_id={leg_closed.leg_id};",
+                        exc_info=err,
+                    )
+                    self._alerter_send(
+                        f"🚨 GHOST-LEG RISK: close_leg DB write failed for leg "
+                        f"#{leg_closed.leg_id} after retries — see log. Manual "
+                        f"DB cleanup recommended before the next rebuild/restart."
+                    )
             logger.info(
                 f"[GridEngine] FILL {side_str} [{idx}] @ {fill.avg_price:.2f} "
                 f"qty={fill.filled_qty:.4f} fee={fill.fee:.6f} | "
@@ -3723,14 +3788,20 @@ class GridEngine:
             # the old is_initial_sell special case that only covered startup.
             gross_pnl = 0.0
             leg_id = None
+            db_write_failed = False
             if self._store is not None:
-                try:
-                    leg_id = self._store.open_leg(
-                        open_side=side_str, open_price=fill.avg_price,
-                        qty=fill.filled_qty, opened_ts=now, opened_level_idx=idx,
+                ok, result = self._retry_db_write(lambda: self._store.open_leg(
+                    open_side=side_str, open_price=fill.avg_price,
+                    qty=fill.filled_qty, opened_ts=now, opened_level_idx=idx,
+                ))
+                if ok:
+                    leg_id = result
+                else:
+                    db_write_failed = True
+                    logger.error(
+                        f"[GridEngine] DB open_leg error after retries: {result}",
+                        exc_info=result,
                     )
-                except Exception as e:
-                    logger.error(f"[GridEngine] DB open_leg error: {e}", exc_info=True)
             if leg_id is None:
                 # No store (unit tests) or the write failed — a locally unique
                 # negative id keeps in-memory accounting correct for the life
@@ -3738,6 +3809,29 @@ class GridEngine:
                 with self._lock:
                     self._local_leg_seq -= 1
                     leg_id = self._local_leg_seq
+                if db_write_failed:
+                    # Unlike close_leg failing (where the position is still
+                    # correctly tracked, just at risk of a double-count
+                    # later), THIS leg has no durable record at all. It's
+                    # fine for the rest of THIS process's life (the negative
+                    # local id keeps in-memory accounting/reconciliation
+                    # correct), but a rebuild or restart constructs a brand
+                    # new engine that seeds _open_legs strictly from DB —
+                    # this leg, and the real exposure it represents, would
+                    # silently vanish from the books at that point.
+                    logger.critical(
+                        f"[GridEngine] UNTRACKED LEG: open_leg DB write failed "
+                        f"after retries for {side_str} {fill.filled_qty:.4f} @ "
+                        f"{fill.avg_price:.2f} (local leg #{leg_id}). This "
+                        f"position is real and tracked in-memory for now, but "
+                        f"will be silently lost from the ledger at the next "
+                        f"rebuild or restart. Manual note recommended."
+                    )
+                    self._alerter_send(
+                        f"🚨 UNTRACKED LEG: {side_str} {fill.filled_qty:.4f} @ "
+                        f"{fill.avg_price:.2f} not persisted to DB after retries "
+                        f"— will be lost from the ledger on next rebuild/restart."
+                    )
             new_leg = OpenLeg(leg_id=leg_id, open_side=side_str,
                               open_price=fill.avg_price, qty=fill.filled_qty,
                               opened_ts=now, opened_level_idx=idx)
@@ -3978,16 +4072,27 @@ class GridEngine:
         with self._lock:
             legs = [leg for leg in self._open_legs.values()
                     if leg.leg_id not in already_handled_leg_ids]
-            levels = [lv for lv in self._levels if lv.index not in exclude_indices]
+            all_levels = list(self._levels)
+            levels = [lv for lv in all_levels if lv.index not in exclude_indices]
 
         if not legs:
             return {}, []
         if not levels:
             return {}, list(legs)
 
-        lower   = levels[0].price
-        upper   = levels[-1].price
-        spacing = (upper - lower) / (len(levels) - 1) if len(levels) > 1 else 0.0
+        # lower/upper/spacing describe the REBUILT GRID'S true range, from
+        # every level regardless of exclusion — not just the subset left
+        # over after removing exclude_indices. Those two ranges diverge
+        # whenever a handoff restore_plan happens to claim a boundary index
+        # (e.g. the very lowest or highest level): using the filtered list
+        # here would narrow the effective range and could mark a leg that's
+        # genuinely still inside the grid as "no longer fits", sending it to
+        # a needless market liquidation. `levels` (filtered) is still what
+        # candidate-selection below draws from, since those ARE the only
+        # slots actually available to host a new closer.
+        lower   = all_levels[0].price
+        upper   = all_levels[-1].price
+        spacing = (upper - lower) / (len(all_levels) - 1) if len(all_levels) > 1 else 0.0
 
         assignments:  Dict[int, int] = {}
         claimed:      set            = set()
