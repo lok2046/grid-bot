@@ -7288,6 +7288,21 @@ class GridBot:
                 time.sleep(0.2)
                 continue
 
+            # Pull the engine's live params before anything below reads
+            # self._params. _trail_up/_trail_down (grid drift-shift) rebind
+            # the ENGINE's own params to a new object whenever the top/bottom
+            # level fills — GridBot._params otherwise only gets refreshed on
+            # a full _rebuild_grid(), so every check below (stop-score,
+            # should_retune's outside-range check, the dead-band bypass,
+            # the Telegram /status handler) would keep evaluating against a
+            # stale pre-shift range until the next full rebuild — which, if
+            # should_retune() itself is one of the things reading stale data,
+            # may never come. See GridEngine.get_params()'s docstring; this
+            # mirrors the same pull _log_status() already does, just at the
+            # top of the tick instead of only at status-log time.
+            if self._engine is not None:
+                self._params = self._engine.get_params()
+
             # Stop-loss
             if self._sl_guard and self._sl_guard.check(mid):
                 self._emergency_halt(mid)
