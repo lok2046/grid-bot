@@ -1083,6 +1083,12 @@ class AlertManager:
                     continue
                 logger.warning(f"[AlertManager] attempt {attempt} HTTP "
                                 f"{resp.status_code}: {resp.text[:200]}")
+                if (resp.status_code == 400 and payload.get("parse_mode")
+                        and "can't parse entities" in resp.text):
+                    logger.warning("[AlertManager] malformed Markdown entities — "
+                                    "retrying as plain text")
+                    payload.pop("parse_mode")
+                    continue
             except Exception as e:
                 logger.warning(f"[AlertManager] attempt {attempt} error: "
                                 f"{_redact_secret(str(e), self._token)}")
