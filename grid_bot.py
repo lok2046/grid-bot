@@ -2663,11 +2663,13 @@ class GridAutoTuner:
         # but had no way to fix the actual cause; this does.
         levels = max(1, min(max_levels, raw_levels))
         if min_levels > levels:
-            logger.info(
-                f"[AutoTuner] min_grid_levels={min_levels} not reachable at "
-                f"current range/ATR without breaking the min_grid_pct floor "
-                f"({min_spacing:.2f}) — using {levels} level(s) instead "
-                f"(raw_levels={raw_levels} from range width {upper-lower:.2f})"
+            logger.warning(
+                f"[AutoTuner] NOT REACHABLE: min_grid_levels={min_levels} target "
+                f"(regime-driven) exceeds what the min_grid_pct floor allows at "
+                f"current range/ATR — spacing floor takes priority, using "
+                f"{levels} level(s) instead of {min_levels} "
+                f"(raw_levels={raw_levels}, range width={upper-lower:.2f}, "
+                f"min_spacing floor={min_spacing:.2f})"
             )
         spacing = round((upper - lower) / levels, 2)
 
@@ -3710,6 +3712,19 @@ class GridEngine:
         meaningfully delaying counter-order placement (record_fill's own
         docstring already budgets for ~1-2ms per write; three attempts here
         is still well under 200ms worst case).
+
+        Rolls back the connection after each failed attempt before retrying.
+        Required for any multi-statement write sharing one commit (e.g.
+        record_fill's grid_fills insert + daily_pnl upsert): without this,
+        a statement that already succeeded before a later one in the same
+        call raises stays pending on the connection (sqlite3's deferred-
+        transaction mode doesn't auto-rollback on a failed execute()), so a
+        retry re-runs it again — if a later attempt then fully succeeds,
+        everything from every attempt commits together, double-counting
+        whatever already-succeeded statement got re-run. Harmless no-op for
+        single-statement writes (open_leg/close_leg) since there's nothing
+        pending to discard when the one statement is what failed.
+
         Returns (True, result) on success, (False, last_exception) if every
         attempt failed — the caller decides how loudly to escalate a real,
         persistent failure.
@@ -3720,6 +3735,8 @@ class GridEngine:
                 return True, fn()
             except Exception as e:
                 last_exc = e
+                if self._store is not None:
+                    self._store.rollback()
                 if attempt < attempts - 1:
                     time.sleep(base_delay * (attempt + 1))
         return False, last_exc
@@ -5140,6 +5157,29 @@ class GridStateStore:
         with self._lock:
             self._conn.execute("DELETE FROM open_legs WHERE leg_id = ?", (leg_id,))
             self._conn.commit()
+
+    def rollback(self) -> None:
+        """
+        Discard any uncommitted statements on the shared connection.
+        Needed between retry attempts on a multi-statement write (e.g.
+        record_fill's grid_fills insert + daily_pnl upsert): sqlite3's
+        default deferred-transaction mode does NOT auto-rollback a failed
+        execute() — a statement that already succeeded before a later one
+        in the same call raised stays pending until the next commit(),
+        including a commit() from a totally unrelated later write on this
+        connection. Without an explicit rollback here, retrying the whole
+        function re-runs the already-succeeded statement(s) again; if a
+        later attempt then succeeds, everything from every attempt commits
+        together — e.g. two grid_fills rows and a doubled daily_pnl delta
+        for what was really one fill. Best-effort: a rollback failure here
+        shouldn't mask the original write error the caller is already
+        handling.
+        """
+        with self._lock:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
 
     def get_open_legs(self) -> List[dict]:
         """All currently-open legs — used to seed GridEngine._open_legs."""
