@@ -400,15 +400,19 @@ GRID_CONFIG: dict = {
     #     stop_buffer_absolute_widen_skip_on_downtrend=False to remove this
     #     gate entirely if you decide you don't want it.
     #
-    #     NOTE: this gate depends on TrendSignal.regime being read as a
-    #     property (self._trend.regime, no parens) at the _rebuild_grid()
-    #     call site. TrendSignal.regime is decorated @property specifically
+    #     NOTE: this gate originally depended on TrendSignal.regime being read
+    #     as a property (self._trend.regime, no parens) at the _rebuild_grid()
+    #     call site — TrendSignal.regime is decorated @property specifically
     #     so that bare attribute access returns the confirmed regime string
-    #     rather than a bound method — an earlier revision of this patch
-    #     lacked that decorator, which made the trend_regime comparison
-    #     always False and silently disabled this entire gate. If you ever
-    #     see stop-buffer widening happening during a confirmed downtrend,
-    #     check that decorator is still there first.
+    #     rather than a bound method; an earlier revision of this patch lacked
+    #     that decorator, which made the trend_regime comparison always False
+    #     and silently disabled this entire gate. The call site has since
+    #     moved to self._effective_trend_regime() (see that method), which
+    #     carries the last CONFIRMED regime through INSUFFICIENT_DATA stretches
+    #     instead of reading TrendSignal live — but it still ultimately reads
+    #     regime strings produced the same way, so the same failure mode
+    #     (a bound method compared to a string, always False) is worth
+    #     knowing about if this gate ever appears silently disabled again.
     "stop_buffer_baseline_window_hours":      12.0,  # wall-clock window for the relative-expansion mean
     "stop_buffer_baseline_min_samples":        3,    # need >= this many samples in the window to trust it
     "stop_buffer_baseline_min_span_frac":      0.25, # ...and they must span >= this fraction of the window
@@ -3870,16 +3874,45 @@ class GridEngine:
             fill_leg_id = leg_id
 
         if self._store is not None:
-            try:
-                self._store.record_fill(
-                    ts_utc=now, side=side_str, level_idx=idx,
-                    price_usd=fill.avg_price, qty_btc=fill.filled_qty,
-                    fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=self._cycle_count,
-                    leg_id=fill_leg_id, close_reason=None,
-                    is_close=(leg_closed is not None),
+            ok, err = self._retry_db_write(lambda: self._store.record_fill(
+                ts_utc=now, side=side_str, level_idx=idx,
+                price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=self._cycle_count,
+                leg_id=fill_leg_id, close_reason=None,
+                is_close=(leg_closed is not None),
+            ))
+            if not ok:
+                # Unlike open_leg/close_leg failing, this doesn't put the
+                # ledger itself at risk — _open_legs and _realized_pnl above
+                # are already correct in memory, and that's what future
+                # decisions (closer placement, reconciliation) actually use.
+                # What's lost is this one fill's row in grid_fills and its
+                # contribution to daily_pnl/accumulated PnL — the numbers
+                # /status reports would permanently undercount by exactly
+                # this fill's gross/fee, with no ledger corruption behind
+                # it. Still worth a loud, distinct log rather than the
+                # generic error that was here before, since "why is my
+                # daily PnL missing a fill I can see in the console log"
+                # is exactly the kind of silent discrepancy this whole
+                # ledger rework exists to eliminate.
+                logger.critical(
+                    f"[GridEngine] PERSISTENT record_fill FAILURE for "
+                    f"{side_str} [{idx}] @ {fill.avg_price:.2f} qty="
+                    f"{fill.filled_qty:.4f} gross={gross_pnl:+.4f} after "
+                    f"retries: {err}. AUDIT-TRAIL GAP: in-memory accounting "
+                    f"is correct, but this fill's grid_fills row and its "
+                    f"daily_pnl/accumulated contribution never landed — "
+                    f"/status will undercount by exactly this fill's "
+                    f"gross={gross_pnl:+.4f} fee={fill.fee:.6f} until "
+                    f"manually backfilled.",
+                    exc_info=err,
                 )
-            except Exception as e:
-                logger.error(f"[GridEngine] DB record_fill error: {e}", exc_info=True)
+                self._alerter_send(
+                    f"⚠️ record_fill DB write failed for {side_str} [{idx}] "
+                    f"@ {fill.avg_price:.2f} after retries — see log. "
+                    f"Daily/accumulated PnL will undercount by "
+                    f"{gross_pnl:+.4f} until backfilled."
+                )
 
         # ── Counter-order at the adjacent level ─────────────────────────────
         # Direction is unchanged from before (BUY fill -> counter-SELL one
