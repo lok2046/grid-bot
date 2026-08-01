@@ -2641,8 +2641,31 @@ class GridAutoTuner:
 
         min_spacing = max(min_sp_pct * mid, 2.0 * maker_fee * mid * 1.5)
         raw_levels  = int((upper - lower) / min_spacing)
-        levels      = max(min_levels, min(max_levels, raw_levels))
-        spacing     = round((upper - lower) / levels, 2)
+
+        # min_grid_levels (config default, or the trend-regime-driven target
+        # from SpacingAutoTuner.update_levels_from_trend) is an ASPIRATION,
+        # reachable only when the ATR-derived range is wide enough to hold
+        # that many levels without spacing falling under min_spacing. It must
+        # never PUSH levels past raw_levels — doing so is exactly what
+        # breaks the floor it's meant to sit above: e.g. a 206pt range at a
+        # 126pt min_spacing floor only supports 1 level, but a NEUTRAL-regime
+        # target of 4 would force spacing down to 51pt, well under the floor
+        # and under typical 5-min price noise, causing the same level to
+        # cross back and forth repeatedly without ever reaching the adjacent
+        # (designated-closer) level — real fills, real fees, ~$0 captured
+        # spread each time. SpacingAutoTuner._evaluate's "min_levels is
+        # likely overriding min_grid_pct" guard already detects the downstream
+        # symptom of this (fee/gross stuck high despite widening min_grid_pct)
+        # but had no way to fix the actual cause; this does.
+        levels = max(1, min(max_levels, raw_levels))
+        if min_levels > levels:
+            logger.info(
+                f"[AutoTuner] min_grid_levels={min_levels} not reachable at "
+                f"current range/ATR without breaking the min_grid_pct floor "
+                f"({min_spacing:.2f}) — using {levels} level(s) instead "
+                f"(raw_levels={raw_levels} from range width {upper-lower:.2f})"
+            )
+        spacing = round((upper - lower) / levels, 2)
 
         notional = self._resolve_notional(levels, mid)
         logger.info(
