@@ -3227,6 +3227,20 @@ class GridEngine:
         # this prevents (fixed 2026-07-30).
         self._pending_fill_indices: set = set()
 
+        # Allow-list of level indices _replace_idle_levels() is permitted to
+        # naively re-arm (2026-08-01 — see _replace_idle_levels() docstring).
+        # A level only belongs here if it's IDLE for a reason OTHER than "its
+        # own order just filled": a cancelled-order re-post, or a residual
+        # unplaced level from _place_initial_orders. It must NOT contain a
+        # level that just filled — that level's re-arm is _on_fill()'s job
+        # (placing an order at the ADJACENT level), and it must sit out until
+        # the adjacent level's own eventual fill cycles back to it. The
+        # OpenLeg ledger (see _on_fill) means a violation of this can no
+        # longer fabricate profit, but it still burns real fees opening and
+        # closing legs at the same stalled price for zero edge — this
+        # allow-list is what actually stops that from happening at all.
+        self._rearm_eligible: set = set()
+
         self._build_levels()
 
     @property
@@ -3303,6 +3317,14 @@ class GridEngine:
                 break
             if lv.index in skip_indices:
                 continue
+            # Defensive: mark eligible for _replace_idle_levels()'s naive
+            # re-arm BEFORE attempting placement, so if _place_buy()/
+            # _place_sell() raises or this loop is interrupted (_stop_event),
+            # the level doesn't end up stuck IDLE with no path back to
+            # getting an order. Placement below almost always succeeds and
+            # moves the level off IDLE anyway, so this is a fallback, not
+            # the normal path.
+            self._rearm_eligible.add(lv.index)
             # NOTE: was `elif lv.price > mid`, which silently placed no
             # order at all when lv.price == mid exactly (observed live
             # 2026-07-29 12:38:48 — level [2] never got an order because
@@ -3447,6 +3469,12 @@ class GridEngine:
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
                     self._pending_fill_indices.add(lv.index)
+                    # This level's own order just filled — it must NOT be
+                    # naively re-armed by _replace_idle_levels(). Its
+                    # counter-order belongs at the ADJACENT level (_on_fill()
+                    # places it there); this level waits for THAT level's
+                    # eventual fill to cycle back. See _rearm_eligible.
+                    self._rearm_eligible.discard(lv.index)
                 self._fill_queue.append((lv.index, fill))
                 self._fill_event.set()
 
@@ -3466,12 +3494,23 @@ class GridEngine:
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
                     self._pending_fill_indices.add(lv.index)
+                    # See _simulate_paper_fills' matching comment — this
+                    # level's own fill must NOT make it eligible for
+                    # _replace_idle_levels()'s naive re-arm.
+                    self._rearm_eligible.discard(lv.index)
                     self._fill_queue.append((lv.index, fill))
                     self._fill_event.set()
                 elif fill.is_cancelled:
-                    # Timeout cancel — re-place same side
+                    # Timeout cancel — re-place same side. Unlike a fill,
+                    # there's no adjacent-level counter-order to wait for
+                    # here, so this level IS eligible for the naive re-arm.
+                    # closes_leg_id is deliberately left untouched (see
+                    # _replace_idle_levels' comment) — a cancel means the
+                    # closing fill never happened, so the leg it was tagged
+                    # to close is still open and still needs a closer.
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
+                    self._rearm_eligible.add(lv.index)
                     # Will be re-placed by check_price_fills()'s unconditional
                     # _replace_idle_levels() call right after this returns.
 
@@ -3481,10 +3520,16 @@ class GridEngine:
         GridBot._run() via release_one_suppressed_level() once the stop-score
         recovers, so they must not be re-queued here.
 
-        Levels with an index in _pending_fill_indices are ALSO skipped, and
-        this is load-bearing, not an optimization.
+        Only levels in _rearm_eligible are touched. This is an ALLOW-list,
+        not a blacklist, and that distinction is the fix — see the
+        2026-08-01 entry below. Levels in _pending_fill_indices are excluded
+        too, as defense in depth, though membership in the two sets is
+        mutually exclusive by construction.
 
-        Root cause found 2026-07-30: _simulate_paper_fills() (and
+        History:
+
+        2026-07-30 (gen00013, level [1] @ 64260.18, 11 wash-trades in ~8min,
+        +256.46 USD/day outlier): _simulate_paper_fills() (and
         _poll_live_fills()) flip a level's state to IDLE the instant a fill
         is detected, then hand the fill off to _on_fill() asynchronously via
         _fill_queue, processed on the separate Grid-fills thread. But
@@ -3492,37 +3537,60 @@ class GridEngine:
         tick, immediately after — with no guarantee _on_fill() has run yet.
         If mid is still sitting at/through that level's own price at that
         instant (the same condition that just triggered the fill), the naive
-        `lv.price < mid` check below re-arms the level AT ITS OWN PRICE
-        rather than leaving the adjacent-level counter-order (which _on_fill
-        places correctly) to do its job. That re-armed order can then fill
-        again within the same price stall, over and over — a same-price
-        wash-trade loop. At the time, each such SELL fill still ran the old
-        gross_pnl = (this level's price - the level BELOW's price) × qty
-        calculation, crediting a full spacing width of profit for inventory
-        that was, in reality, bought and sold at the identical price moments
-        apart. Observed live 2026-07-30 on gen00013: level [1] wash-traded at
-        a fixed price (e.g. 64260.18) eleven times in ~8 minutes, each logged
-        as gross=+1.0309 — real cumulative_net climbed by that amount every
-        ~30-90s with mid barely moving, and was the primary driver of that
-        day's 428-cycle, +256.46 USD "daily PnL" figure being far outside the
-        range of any other day. (The adjacent-level-price assumption itself
-        was later replaced entirely by the OpenLeg ledger — see _on_fill —
-        so a same-level wash-trade can no longer fabricate profit even if it
-        recurs; this race-condition fix stands independently of that, since
-        skipping pending-fill indices here is also what lets _on_fill's own
-        counter-order land on the correct adjacent level in the first place.)
-        Skipping pending-fill indices here closes the race: the level stays
-        untouched until _on_fill() has processed the original fill (placing
-        its own, correct, adjacent-level order), at which point the NEXT
-        tick's _replace_idle_levels() call re-arms it (if still orphaned)
-        against whatever mid is by then — no longer guaranteed to be sitting
-        exactly on this level's own price."""
+        `lv.price < mid` check re-arms the level AT ITS OWN PRICE rather than
+        leaving the adjacent-level counter-order (which _on_fill places
+        correctly, at idx+1 for a BUY fill / idx-1 for a SELL fill) to do its
+        job. At the time, each such re-fill still ran the old gross_pnl =
+        (this level's price − the level BELOW's price) × qty calculation,
+        crediting a full spacing width of profit for inventory that was, in
+        reality, bought and sold at the identical price moments apart. The
+        fix at the time was a same-tick blacklist (_pending_fill_indices):
+        skip a level until _on_fill() has processed its fill.
+
+        2026-08-01 (gen00014, level [2] @ 62666.75, 35+ wash-trades over
+        ~35min in one incident, 84 runs / +383.51 USD phantom gross across
+        the full day — exceeding that day's entire +329.81 USD reported net
+        gain): the 07-30 fix was necessary but not sufficient. It only
+        closes the race for the ONE tick immediately following a fill.
+        _on_fill() places a BUY/SELL at the ADJACENT level ONLY if that
+        adjacent level is currently IDLE; if it's occupied (has its own
+        resting order — the common case once a grid has been running a
+        while), _on_fill() correctly does nothing further, and the
+        just-filled level is left IDLE with _pending_fill_indices already
+        discarded (see _on_fill) — the old blacklist-only logic then
+        considered it fair game again. If mid keeps sitting at that level's
+        own price for many subsequent ticks (a stalled/ranging market, not a
+        one-tick blip), the naive re-arm fired again on EVERY such tick —
+        same-price BUY→SELL→BUY→SELL, indefinitely, for as long as the
+        stall lasted.
+
+        The OpenLeg ledger (see _on_fill) was added independently around
+        this time and closes the FINANCIAL half of this on its own: a
+        re-armed order comes out of this method with closes_leg_id=None
+        (whatever tag the level had is consumed by _on_fill before this
+        method is ever allowed to touch the index again), so a same-price
+        wash-trade fill now opens a fresh, real leg — gross_pnl=0.0 — rather
+        than fabricating a spacing-width profit. It genuinely cannot inflate
+        PnL anymore. But the re-arm itself was still happening: every cycle
+        is still two real fills, two real fees, a real DB open_leg() write,
+        and zero edge, plus an orphaned leg sitting in _open_legs until some
+        later rebuild's reconcile_open_legs happens to sweep it up. This is
+        what the allow-list below actually stops — not a PnL-integrity fix
+        at this point (OpenLeg already covers that), but a fee-bleed and
+        leg-bookkeeping-bloat fix: a level must be explicitly marked
+        _rearm_eligible for a reason OTHER than "its own order just filled"
+        (a cancelled-order re-post, or a residual unplaced level from
+        _place_initial_orders) before this method will touch it. A level
+        that just filled stays ineligible indefinitely — correctly waiting
+        on the adjacent level's own eventual fill to cycle back to it via
+        _on_fill(), no matter how many ticks that takes."""
         mid = _price_cache.get_mid()
         if mid is None:
             return
         with self._lock:
             idle = [lv for lv in self._levels
                     if lv.state == LevelState.IDLE          # SUPPRESSED excluded
+                    and lv.index in self._rearm_eligible
                     and lv.index not in self._pending_fill_indices]
         for lv in idle:
             # See _place_initial_orders for why this is `>=`-via-else rather
@@ -3547,6 +3615,7 @@ class GridEngine:
                 self._place_buy(lv, qty_override=tag_qty, closes_leg_id=tag_leg)
             else:
                 self._place_sell(lv, qty_override=tag_qty, closes_leg_id=tag_leg)
+            self._rearm_eligible.discard(lv.index)
 
     # ── Trailing ──────────────────────────────────────────────────────────────
 
