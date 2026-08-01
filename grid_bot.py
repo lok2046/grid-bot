@@ -3781,42 +3781,18 @@ class GridEngine:
 
     def _retry_db_write(self, fn, attempts: int = 3, base_delay: float = 0.05) -> Tuple[bool, object]:
         """
-        Retry a synchronous DB write a few times with small backoff before
-        giving up. Local SQLite failures at this call rate are almost always
-        transient (a WAL checkpoint, a momentary lock from another writer on
-        the same file) rather than permanent — a couple of retries a few
-        tens of milliseconds apart clears the great majority of them without
-        meaningfully delaying counter-order placement (record_fill's own
-        docstring already budgets for ~1-2ms per write; three attempts here
-        is still well under 200ms worst case).
-
-        Rolls back the connection after each failed attempt before retrying.
-        Required for any multi-statement write sharing one commit (e.g.
-        record_fill's grid_fills insert + daily_pnl upsert): without this,
-        a statement that already succeeded before a later one in the same
-        call raises stays pending on the connection (sqlite3's deferred-
-        transaction mode doesn't auto-rollback on a failed execute()), so a
-        retry re-runs it again — if a later attempt then fully succeeds,
-        everything from every attempt commits together, double-counting
-        whatever already-succeeded statement got re-run. Harmless no-op for
-        single-statement writes (open_leg/close_leg) since there's nothing
-        pending to discard when the one statement is what failed.
-
-        Returns (True, result) on success, (False, last_exception) if every
-        attempt failed — the caller decides how loudly to escalate a real,
-        persistent failure.
+        Thin wrapper — the real logic now lives on GridStateStore.execute_with_retry
+        so GridBot's liquidation paths can share it too (see that method's
+        docstring). Kept here under the original name so existing call sites
+        in _on_fill (and existing tests) don't need to change. Every current
+        call site already guards `if self._store is not None:` before
+        reaching here; this defensive check is just so a future call site
+        that forgets that guard gets a clean (False, error) back instead of
+        an AttributeError several frames deep in fill processing.
         """
-        last_exc = None
-        for attempt in range(attempts):
-            try:
-                return True, fn()
-            except Exception as e:
-                last_exc = e
-                if self._store is not None:
-                    self._store.rollback()
-                if attempt < attempts - 1:
-                    time.sleep(base_delay * (attempt + 1))
-        return False, last_exc
+        if self._store is None:
+            return False, RuntimeError("_retry_db_write called with no store configured")
+        return self._store.execute_with_retry(fn, attempts, base_delay)
 
     def _on_fill(self, idx: int, fill: FillEvent):
         # Snapshot the level reference and intent under lock, then release
@@ -5257,6 +5233,42 @@ class GridStateStore:
                 self._conn.rollback()
             except Exception:
                 pass
+
+    def execute_with_retry(self, fn, attempts: int = 3, base_delay: float = 0.05):
+        """
+        Retry a synchronous DB write a few times with small backoff before
+        giving up, rolling back between attempts (see rollback()'s docstring
+        for why that's required for any multi-statement write).
+
+        Lives on the store rather than on GridEngine specifically because
+        both GridEngine._on_fill and GridBot's liquidation paths
+        (_liquidate_position, _liquidate_leg_at_market) write through this
+        same store and need the identical protection — originally only
+        GridEngine had it (as _retry_db_write, now a thin wrapper delegating
+        here), which left the liquidation paths on bare try/except with no
+        retry and no rollback at all.
+
+        Local SQLite failures at this call rate are almost always transient
+        (a WAL checkpoint, a momentary lock from another writer on the same
+        file) rather than permanent — a couple of retries a few tens of
+        milliseconds apart clears the great majority of them without
+        meaningfully delaying whatever the caller does next (three attempts
+        here is still well under 200ms worst case).
+
+        Returns (True, result) on success, (False, last_exception) if every
+        attempt failed — the caller decides how loudly to escalate a real,
+        persistent failure.
+        """
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                return True, fn()
+            except Exception as e:
+                last_exc = e
+                self.rollback()
+                if attempt < attempts - 1:
+                    time.sleep(base_delay * (attempt + 1))
+        return False, last_exc
 
     def get_open_legs(self) -> List[dict]:
         """All currently-open legs — used to seed GridEngine._open_legs."""
@@ -7495,23 +7507,44 @@ class GridBot:
                 if cost_basis_price else 0.0
             )
             if self._store is not None:
-                try:
-                    # level_idx=-1 / cycle_num=-1: sentinel marking this as a
-                    # liquidation fill rather than a normal numbered grid level/cycle.
-                    # is_close=True preserves this method's pre-existing behavior
-                    # exactly (it was always inferred from side=="SELL" before
-                    # record_fill's is_close param existed — this function only
-                    # ever closes/reduces a position, never opens one).
-                    self._store.record_fill(
-                        ts_utc=time.time(), side="SELL", level_idx=-1,
-                        price_usd=fill.avg_price, qty_btc=fill.filled_qty,
-                        fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
-                        is_liquidation=is_liquidation, is_close=True,
+                # level_idx=-1 / cycle_num=-1: sentinel marking this as a
+                # liquidation fill rather than a normal numbered grid level/cycle.
+                # is_close=True preserves this method's pre-existing behavior
+                # exactly (it was always inferred from side=="SELL" before
+                # record_fill's is_close param existed — this function only
+                # ever closes/reduces a position, never opens one).
+                ok, err = self._store.execute_with_retry(lambda: self._store.record_fill(
+                    ts_utc=time.time(), side="SELL", level_idx=-1,
+                    price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                    fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
+                    is_liquidation=is_liquidation, is_close=True,
+                ))
+                if not ok:
+                    # The market SELL already happened for real — this is a
+                    # real, already-executed liquidation. What's at risk is
+                    # purely the audit trail: this fill's grid_fills row and
+                    # its contribution to daily_pnl (and, if is_liquidation,
+                    # the sl_gross_usd/sl_count stop-loss bucket specifically)
+                    # never lands. Loud and distinct rather than the generic
+                    # error this used to be, since a stop-loss silently
+                    # missing from the loss ledger is exactly the kind of
+                    # thing you'd want to know about before trusting the
+                    # accumulated PnL number after an incident.
+                    logger.critical(
+                        f"[GridBot]{tag} PERSISTENT record_fill FAILURE for "
+                        f"liquidation SELL {fill.filled_qty:.4f} @ "
+                        f"{fill.avg_price:.2f} gross={gross_pnl:+.4f} "
+                        f"is_liquidation={is_liquidation} after retries: {err}. "
+                        f"This liquidation ALREADY EXECUTED for real — only its "
+                        f"grid_fills row and daily_pnl/"
+                        f"{'sl_gross_usd' if is_liquidation else 'accumulated'} "
+                        f"contribution are missing.",
+                        exc_info=err,
                     )
-                except Exception as e:
-                    logger.error(
-                        f"[GridBot]{tag} DB record_fill (liquidation) error: {e}",
-                        exc_info=True,
+                    self._alerter.send(
+                        f"⚠️ record_fill DB write failed for liquidation "
+                        f"({reason}) after retries — see log. The trade already "
+                        f"happened; only its PnL record is missing."
                     )
             pnl_note = f" | realized {gross_pnl:+.4f} USD" if cost_basis_price else ""
             self._alerter.send(
@@ -7584,21 +7617,61 @@ class GridBot:
             f"gross={gross_pnl:+.4f} net={net_pnl:+.4f} USD"
         )
         if self._store is not None:
-            try:
-                # level_idx=-1/cycle_num=-1: same sentinel _liquidate_position
-                # uses — this isn't a normal numbered grid level fill.
-                self._store.record_fill(
-                    ts_utc=time.time(), side=close_side, level_idx=-1,
-                    price_usd=fill.avg_price, qty_btc=fill.filled_qty,
-                    fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
-                    is_liquidation=False, leg_id=leg.leg_id,
-                    close_reason=reason, is_close=True,
+            # level_idx=-1/cycle_num=-1: same sentinel _liquidate_position
+            # uses — this isn't a normal numbered grid level fill.
+            ok_rf, err_rf = self._store.execute_with_retry(lambda: self._store.record_fill(
+                ts_utc=time.time(), side=close_side, level_idx=-1,
+                price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
+                is_liquidation=False, leg_id=leg.leg_id,
+                close_reason=reason, is_close=True,
+            ))
+            if not ok_rf:
+                # Same category as _on_fill's record_fill escalation: the
+                # market order already executed for real, so in-memory
+                # accounting (and the close_leg removal below) is what
+                # matters and isn't affected — only this fill's grid_fills
+                # row and daily_pnl contribution are missing.
+                logger.critical(
+                    f"[GridBot]{tag} PERSISTENT record_fill FAILURE for leg "
+                    f"#{leg.leg_id} liquidation {close_side} "
+                    f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f} "
+                    f"gross={gross_pnl:+.4f} after retries: {err_rf}. "
+                    f"AUDIT-TRAIL GAP: leg is correctly closed in memory/DB, "
+                    f"but this fill's grid_fills row and daily_pnl "
+                    f"contribution never landed.",
+                    exc_info=err_rf,
                 )
-                self._store.close_leg(leg.leg_id)
-            except Exception as e:
-                logger.error(
-                    f"[GridBot]{tag} DB record_fill/close_leg error: {e}",
-                    exc_info=True,
+                self._alerter.send(
+                    f"⚠️ record_fill DB write failed for leg #{leg.leg_id} "
+                    f"liquidation ({reason}) after retries — see log. Leg is "
+                    f"correctly closed; only its PnL record is missing."
+                )
+
+            ok_cl, err_cl = self._store.execute_with_retry(
+                lambda: self._store.close_leg(leg.leg_id))
+            if not ok_cl:
+                # Mirrors _on_fill's close_leg escalation exactly — this leg
+                # is about to be popped from _engine._open_legs below
+                # regardless (it's genuinely closed, real market order,
+                # real fill), so the risk is purely that the DB still shows
+                # it open and a future rebuild/restart re-seeds and
+                # double-counts it.
+                logger.critical(
+                    f"[GridBot]{tag} PERSISTENT close_leg FAILURE for leg "
+                    f"#{leg.leg_id} (opened {leg.open_side} {leg.qty:.4f} @ "
+                    f"{leg.open_price:.2f}) after retries: {err_cl}. "
+                    f"GHOST-LEG RISK: closed in memory/grid_fills but the "
+                    f"open_legs row may still exist — if so it will be "
+                    f"re-seeded and its PnL double-counted at the next "
+                    f"rebuild/restart. Manual fix: "
+                    f"DELETE FROM open_legs WHERE leg_id={leg.leg_id};",
+                    exc_info=err_cl,
+                )
+                self._alerter.send(
+                    f"🚨 GHOST-LEG RISK: close_leg DB write failed for leg "
+                    f"#{leg.leg_id} ({reason}) after retries — see log. Manual "
+                    f"DB cleanup recommended before the next rebuild/restart."
                 )
         if self._engine is not None:
             with self._engine._lock:
