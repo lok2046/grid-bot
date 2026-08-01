@@ -223,6 +223,48 @@ GRID_CONFIG: dict = {
     "levels_autotune_neutral_levels": 4,   # NEUTRAL      → 4 levels (balanced)
     "levels_autotune_up_levels":      5,   # UP regime    → 5 levels (tighter, more cycles)
 
+    # ── reconcile_open_legs: trend-risk buffer + confirm-dwell ────────────────
+    # 2026-08-02 01:34 incident: mid ticked ~15pts outside the (wide) live
+    # range while TrendSignal read NEUTRAL (sep=+0.030%, slope=-0.140% —
+    # essentially flat) and raw ATR was only 12.70 (well below the 30pt
+    # floor). should_retune()'s boundary check correctly forced an immediate
+    # reposition (that check protects the 2026-07-09 stop-staleness fix and
+    # must stay unconditional — see _rebuild_grid()'s dead-band block), but
+    # the LOW-volatility effective_atr it produced collapsed the range width
+    # ~50% (366pts -> 183pts), which then made reconcile_open_legs()
+    # force-liquidate two open legs at market/taker fees purely because they
+    # no longer sat inside the newly-narrow range — nothing about the actual
+    # price move justified paying for two round trips. Net loss -8.5688 USD
+    # in one rebuild, on a NEUTRAL, low-volatility tick.
+    #
+    # Fix: reconcile_open_legs() no longer treats "outside [lower,upper]" as
+    # an instant, unconditional liquidate. A misfit leg first gets:
+    #   1. A trend_risk-scaled tolerance buffer (reuses
+    #      StopScoreCalculator.compute_trend_risk() — the same [0,1] score
+    #      already trusted for stop-raise gating). trend_risk≈0 ("looks like
+    #      noise") -> full buffer, tolerate it; trend_risk≈1 ("genuine
+    #      strengthening decline") -> buffer shrinks to 0, evict same as
+    #      today. Buffer is sized in effective_atr units (the SAME
+    #      volatility read the range itself was built from), not a fixed
+    #      price offset, so it scales sensibly across regimes.
+    #   2. A confirm-dwell window (reuses StopLossGuard.check()'s
+    #      candidate-breach-must-hold pattern) for legs that clear a
+    #      direction-correct closing level but still fail the buffered
+    #      range test: they get a TENTATIVE re-anchor rather than an
+    #      immediate market close, and are only force-liquidated once
+    #      they've remained a misfit for reconcile_confirm_s.
+    # A leg with NO direction-correct closing level at all in the new grid
+    # (e.g. a long leg opened well above every level in a grid that has
+    # since dropped) is still liquidated immediately regardless of buffer
+    # or dwell — there is no level to hold it on, so waiting cannot help.
+    "reconcile_buffer_atr_mult": 1.5,    # max tolerance = this × effective_atr, at trend_risk=0
+    "reconcile_confirm_s":       1800.0, # must persist as a misfit this long (across retunes) before forced liquidation
+    # Urgent bypass: trend_risk at/above this skips the confirm-dwell
+    # entirely (mirrors the stop-raise system's own urgent-bypass gate).
+    # Defaults to stop_raise_urgent_trend_risk if not set separately, so a
+    # confirmed genuine decline evicts immediately in both systems at once.
+    "reconcile_urgent_trend_risk": 0.80,
+
     # ── Dead-band stop-raise: risk-adaptive gating ────────────────────────────
     # When a dead-band retune wants to raise the in-place stop (see
     # GridBot._rebuild_grid()), four mechanisms now govern HOW that raise is
@@ -2433,6 +2475,13 @@ class GridParams:
     stop_price: float
     notional_per_level: float
     computed_at: float = field(default_factory=time.time)
+    # The effective_atr this range was built from (post floor-clamp and
+    # recent-range guard — see AutoTuner.compute()). 0.0 for the config
+    # fallback path, where no ATR was available at all. Exposed so
+    # GridEngine.reconcile_open_legs() can size its misfit-tolerance buffer
+    # off the SAME volatility read the range itself used, rather than a
+    # second, possibly-stale ATR computation.
+    effective_atr: float = 0.0
 
     @property
     def level_prices(self) -> List[float]:
@@ -2690,7 +2739,8 @@ class GridAutoTuner:
         )
         return GridParams(lower=lower, upper=upper, levels=levels,
                           spacing=spacing, stop_price=stop,
-                          notional_per_level=notional)
+                          notional_per_level=notional,
+                          effective_atr=effective_atr)
 
     def _from_config(self, mid: float) -> GridParams:
         lower   = self._cfg.get("grid_lower",   mid * 0.92)
@@ -4168,33 +4218,68 @@ class GridEngine:
     def reconcile_open_legs(
         self, exclude_indices: Optional[set] = None,
         already_handled_leg_ids: Optional[set] = None,
-    ) -> Tuple[Dict[int, int], List["OpenLeg"]]:
+        trend_risk: float = 0.0,
+        effective_atr: float = 0.0,
+        pending_since: Optional[Dict[int, float]] = None,
+    ) -> Tuple[Dict[int, int], List["OpenLeg"], set]:
         """
         Decide, for every currently-open leg, whether it still fits the
         just-rebuilt grid.
 
-        - Still within [new lower, new upper]: pick the best-fit level to
+        - Cleanly within [new lower, new upper]: pick the best-fit level to
           host its designated closer (nearest to one new-spacing away in the
           closing direction, among levels not already claimed by another
           leg or excluded by the caller) and reserve it — returned as
           {level_index: leg_id} for the caller to pass into
           start(skip_indices=...), then apply via apply_leg_reassignments()
           once start() has finished placing everything else.
-        - No longer fits (price now outside the new range, or every
-          candidate level on the closing side is already claimed): returned
-          in the second list. This method does NOT liquidate them itself —
-          it only decides; GridBot._rebuild_grid executes the actual market
-          close (real fill, real fee, real fill event in grid_fills) and
-          only then removes the leg from the ledger. A leg that can't be
-          reconciled stays fully tracked and safe until that happens.
+        - Outside [lower,upper] but within a trend_risk-scaled tolerance
+          buffer (see reconcile_buffer_atr_mult), AND a direction-correct
+          closing level still exists: same tentative re-anchor as above, but
+          its leg_id is also added to the third return value (still_pending)
+          so the caller keeps a confirm-dwell timer running rather than
+          treating it as a clean fit.
+        - Outside the buffer too, but STILL flagged pending less than
+          reconcile_confirm_s ago (per the caller-supplied pending_since
+          map): same tentative re-anchor + still_pending, giving it more
+          time to either recover or genuinely confirm before paying for a
+          market close.
+        - No direction-correct closing level exists at all (leg's open
+          price is beyond every level in the required direction), OR it has
+          been flagged pending for >= reconcile_confirm_s and still isn't a
+          clean fit: returned in the second list (to_liquidate). This
+          method does NOT liquidate them itself — it only decides;
+          GridBot._rebuild_grid executes the actual market close (real
+          fill, real fee, real fill event in grid_fills) and only then
+          removes the leg from the ledger. A leg that can't be reconciled
+          stays fully tracked and safe until that happens.
+
+        See the "reconcile_open_legs: trend-risk buffer + confirm-dwell"
+        GRID_CONFIG comment block for the 2026-08-02 incident this
+        replaces: an unconditional in_range check was force-liquidating
+        legs at market/taker fees purely because a low-volatility retune
+        had narrowed the range, with no relation to actual directional risk.
 
         exclude_indices: level indices already spoken for by something else
         (currently: a blue-green handoff's restore_plan) — never a candidate
         here. already_handled_leg_ids: legs already re-attached by that same
         mechanism — skipped entirely rather than double-assigned.
+        trend_risk: [0,1] score from StopScoreCalculator.compute_trend_risk()
+        — same score already used to gate the stop-raise system. 0 ("looks
+        like noise") gives the full tolerance buffer; 1 ("genuine
+        strengthening decline") collapses it to 0, matching pre-fix
+        behaviour exactly.
+        effective_atr: the volatility read the CURRENT rebuild's range was
+        built from (GridParams.effective_atr) — buffer is sized in these
+        units so it scales with the same regime the range itself reacted to.
+        pending_since: {leg_id: first-flagged-ts}, owned and persisted by
+        the caller (GridBot._leg_no_fit_since) across rebuilds, since a new
+        GridEngine/leg set is reseeded from DB on every rebuild and can't
+        hold dwell state itself.
         """
         exclude_indices = exclude_indices or set()
         already_handled_leg_ids = already_handled_leg_ids or set()
+        pending_since = pending_since or {}
         with self._lock:
             legs = [leg for leg in self._open_legs.values()
                     if leg.leg_id not in already_handled_leg_ids]
@@ -4202,9 +4287,9 @@ class GridEngine:
             levels = [lv for lv in all_levels if lv.index not in exclude_indices]
 
         if not legs:
-            return {}, []
+            return {}, [], set()
         if not levels:
-            return {}, list(legs)
+            return {}, list(legs), set()
 
         # lower/upper/spacing describe the REBUILT GRID'S true range, from
         # every level regardless of exclusion — not just the subset left
@@ -4220,45 +4305,134 @@ class GridEngine:
         upper   = all_levels[-1].price
         spacing = (upper - lower) / (len(all_levels) - 1) if len(all_levels) > 1 else 0.0
 
-        assignments:  Dict[int, int] = {}
-        claimed:      set            = set()
-        to_liquidate: List[OpenLeg]  = []
+        max_buffer_mult = self._cfg.get("reconcile_buffer_atr_mult", 1.5)
+        confirm_s       = self._cfg.get("reconcile_confirm_s", 1800.0)
+        # Buffer shrinks to 0 as trend_risk -> 1, so a confirmed genuine
+        # decline evicts exactly as fast as before this change.
+        buffer = (max_buffer_mult * effective_atr * max(0.0, 1.0 - trend_risk)
+                  if effective_atr > 0 else 0.0)
 
-        # Oldest-opened first: whichever position has been waiting longest
-        # gets first pick if two legs' ideal target levels collide.
-        for leg in sorted(legs, key=lambda l: l.opened_ts):
-            in_range = lower <= leg.open_price <= upper
-            if not in_range:
-                to_liquidate.append(leg)
-                continue
+        assignments:   Dict[int, int] = {}
+        claimed:       set            = set()
+        to_liquidate:  List[OpenLeg]  = []
+        still_pending: set            = set()
+        now = time.time()
 
+        def _candidates(leg: "OpenLeg") -> Tuple[float, List["GridLevel"]]:
             if leg.open_side == "BUY":
                 # Long leg closes with a SELL above what it paid — never at
                 # or below, that would be locking in a loss the grid itself
                 # didn't ask for.
-                target = leg.open_price + spacing if spacing > 0 else leg.open_price
-                candidates = [lv for lv in levels
-                              if lv.index not in claimed and lv.price > leg.open_price]
+                tgt = leg.open_price + spacing if spacing > 0 else leg.open_price
+                cands = [lv for lv in levels
+                         if lv.index not in claimed and lv.price > leg.open_price]
             else:
-                target = leg.open_price - spacing if spacing > 0 else leg.open_price
-                candidates = [lv for lv in levels
-                              if lv.index not in claimed and lv.price < leg.open_price]
+                tgt = leg.open_price - spacing if spacing > 0 else leg.open_price
+                cands = [lv for lv in levels
+                         if lv.index not in claimed and lv.price < leg.open_price]
+            return tgt, cands
 
+        # Oldest-opened first within each pass: whichever position has been
+        # waiting longest gets first pick if two legs' ideal target levels
+        # collide. Clean fits are a SEPARATE, earlier pass — a buffered or
+        # still-pending leg must never claim a level ahead of one that
+        # genuinely belongs in the range, or an old out-of-range leg could
+        # starve a newer clean-fit leg of its rightful level (caught by
+        # simulating this exact function against the 2026-08-02 incident
+        # numbers before shipping this change).
+        ordered = sorted(legs, key=lambda l: l.opened_ts)
+        clean_legs = [l for l in ordered if lower <= l.open_price <= upper]
+        other_legs = [l for l in ordered if not (lower <= l.open_price <= upper)]
+
+        for leg in clean_legs:
+            target, candidates = _candidates(leg)
             if not candidates:
+                # Every candidate level on the closing side is already
+                # claimed by another clean-fit leg — unchanged from
+                # pre-existing behaviour.
                 to_liquidate.append(leg)
                 continue
-
             best = min(candidates, key=lambda lv: abs(lv.price - target))
             claimed.add(best.index)
             assignments[best.index] = leg.leg_id
 
+        for leg in other_legs:
+            target, candidates = _candidates(leg)
+            if not candidates:
+                # No level in the required direction exists at any price —
+                # structurally stranded (e.g. a long opened well above a
+                # grid that has since dropped entirely below it), or every
+                # remaining level was already claimed by a clean fit above.
+                # Dwelling cannot produce a level that isn't there;
+                # liquidate now regardless of buffer/confirm state.
+                to_liquidate.append(leg)
+                continue
+
+            buffered_fit = buffer > 0 and (lower - buffer) <= leg.open_price <= (upper + buffer)
+            if buffered_fit:
+                logger.info(
+                    f"[GridEngine] Leg #{leg.leg_id} outside [{lower:.2f},"
+                    f"{upper:.2f}] (open={leg.open_price:.2f}) but within "
+                    f"trend_risk-scaled buffer ({buffer:.2f}, trend_risk="
+                    f"{trend_risk:.2f}) — tolerated, no dwell started"
+                )
+                best = min(candidates, key=lambda lv: abs(lv.price - target))
+                claimed.add(best.index)
+                assignments[best.index] = leg.leg_id
+                continue
+
+            # Urgent bypass — mirrors the stop-raise system's own urgent
+            # gate (mechanism #4): trend_risk at/above this threshold means
+            # strong, real evidence of a genuine move, so skip the
+            # confirm-dwell and evict immediately, same as pre-fix
+            # behaviour. Without this, even a confirmed trend_risk=1.0
+            # decline would get one free cycle of tentative re-anchoring.
+            urgent_threshold = self._cfg.get(
+                "reconcile_urgent_trend_risk",
+                self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+            )
+            if trend_risk >= urgent_threshold:
+                logger.info(
+                    f"[GridEngine] Leg #{leg.leg_id} misfit + urgent "
+                    f"trend_risk={trend_risk:.2f} >= {urgent_threshold:.2f} "
+                    f"— bypassing confirm-dwell, liquidating now"
+                )
+                to_liquidate.append(leg)
+                continue
+
+            # Outside the buffer too. Give it reconcile_confirm_s (tracked
+            # by the caller across rebuilds) before forcing a market close.
+            first_seen = pending_since.get(leg.leg_id)
+            if first_seen is not None and (now - first_seen) >= confirm_s:
+                logger.info(
+                    f"[GridEngine] Leg #{leg.leg_id} confirmed misfit after "
+                    f"{now - first_seen:.0f}s (open={leg.open_price:.2f}, "
+                    f"range=[{lower:.2f},{upper:.2f}], buffer={buffer:.2f}) "
+                    f"— liquidating"
+                )
+                to_liquidate.append(leg)
+                continue
+
+            logger.info(
+                f"[GridEngine] Leg #{leg.leg_id} misfit "
+                f"(open={leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}], "
+                f"buffer={buffer:.2f}) — tentatively re-anchored, holding "
+                f"{confirm_s:.0f}s before liquidating "
+                f"({'new candidate' if first_seen is None else f'{now - first_seen:.0f}s elapsed'})"
+            )
+            best = min(candidates, key=lambda lv: abs(lv.price - target))
+            claimed.add(best.index)
+            assignments[best.index] = leg.leg_id
+            still_pending.add(leg.leg_id)
+
         if assignments or to_liquidate:
             logger.info(
                 f"[GridEngine] reconcile_open_legs: {len(assignments)} leg(s) "
-                f"re-anchored to the rebuilt grid, {len(to_liquidate)} no longer "
-                f"fit (new range=[{lower:.2f},{upper:.2f}]) and need liquidating"
+                f"re-anchored to the rebuilt grid ({len(still_pending)} still "
+                f"pending confirm), {len(to_liquidate)} liquidating "
+                f"(new range=[{lower:.2f},{upper:.2f}])"
             )
-        return assignments, to_liquidate
+        return assignments, to_liquidate, still_pending
 
     def apply_leg_reassignments(self, assignments: Dict[int, int]) -> None:
         """
@@ -5750,6 +5924,15 @@ class GridBot:
         self._stop_raise_ema:  Optional[float] = None  # damped candidate stop
         self._pending_raise_candidate: Optional[float] = None  # stop awaiting confirm
         self._pending_raise_since:     float = 0.0      # when the candidate was first seen
+
+        # ── reconcile_open_legs: confirm-dwell state ──────────────────────────
+        # {leg_id: first-flagged-ts} for legs currently outside the rebuilt
+        # grid's trend-risk buffer. Lives here (not on GridEngine/OpenLeg)
+        # because a new GridEngine — and a fresh set of OpenLeg objects — is
+        # reseeded from DB on every single rebuild; only GridBot survives
+        # across rebuilds to accumulate real wall-clock dwell time. Mirrors
+        # _pending_raise_candidate/_pending_raise_since above.
+        self._leg_no_fit_since: Dict[int, float] = {}
 
         self._oms = OMS(
             api_key      = config.get("api_key", ""),
@@ -8214,10 +8397,35 @@ class GridBot:
             snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
             if snap_lv.get("closes_leg_id") is not None
         }
-        leg_assignments, legs_to_liquidate = self._engine.reconcile_open_legs(
-            exclude_indices=set(restore_plan.keys()),
-            already_handled_leg_ids=already_handled_leg_ids,
+        # Same trend_risk score already used to gate the dead-band stop
+        # raise above — reused here (not recomputed) so a leg's misfit
+        # tolerance and the stop's raise aggressiveness always agree on
+        # "does this look like noise or a genuine move" within one rebuild.
+        reconcile_trend_risk = 0.0
+        if self._stop_scorer is not None:
+            reconcile_trend_risk = self._stop_scorer.compute_trend_risk(
+                mid, self._effective_trend_regime(), self._last_trend_slope_pct
+            )
+        leg_assignments, legs_to_liquidate, still_pending_leg_ids = (
+            self._engine.reconcile_open_legs(
+                exclude_indices=set(restore_plan.keys()),
+                already_handled_leg_ids=already_handled_leg_ids,
+                trend_risk=reconcile_trend_risk,
+                effective_atr=new_params.effective_atr,
+                pending_since=self._leg_no_fit_since,
+            )
         )
+        # Maintain the dwell dict across rebuilds: start the clock the
+        # first time a leg is flagged (never reset it while it stays
+        # pending — that's what confirm_s measures against), and drop any
+        # leg that's no longer pending (either it recovered to a clean fit,
+        # or reconcile_open_legs just confirmed-liquidated it).
+        now_ts = time.time()
+        for leg_id in still_pending_leg_ids:
+            self._leg_no_fit_since.setdefault(leg_id, now_ts)
+        for leg_id in list(self._leg_no_fit_since.keys()):
+            if leg_id not in still_pending_leg_ids:
+                del self._leg_no_fit_since[leg_id]
 
         self._engine.start(
             mid, skip_indices=set(restore_plan.keys()) | set(leg_assignments.keys())
