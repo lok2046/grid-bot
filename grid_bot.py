@@ -1081,6 +1081,8 @@ class AlertManager:
                     ra = resp.json().get("parameters", {}).get("retry_after", 5)
                     time.sleep(ra)
                     continue
+                logger.warning(f"[AlertManager] attempt {attempt} HTTP "
+                                f"{resp.status_code}: {resp.text[:200]}")
             except Exception as e:
                 logger.warning(f"[AlertManager] attempt {attempt} error: "
                                 f"{_redact_secret(str(e), self._token)}")
