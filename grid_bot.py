@@ -7644,9 +7644,28 @@ class GridBot:
             if self._engine:
                 self._engine.check_price_fills(mid)
 
-            # Engine-requested rebuild (e.g. drift-shift detected mid far OOR)
+            # Engine-requested rebuild. Two setters share this one flag:
+            # drift-shift's "far OOR" cascade guard, and the one-sided-grid
+            # detector (see GridEngine.check_price_fills()) — both funnel
+            # through pop_needs_rebuild() here. Neither setter has access to
+            # trend_risk (it's a GridBot/_stop_scorer concept, not something
+            # GridEngine can see), so it's logged here at the one place both
+            # paths pass through instead. No behavior change — visibility
+            # only, so if one of these ever shows up as a real loss source
+            # the way the regime-change trigger did, the evidence is already
+            # in the log instead of needing to be reconstructed after the
+            # fact.
             if self._engine and self._engine.pop_needs_rebuild():
-                logger.info("[GridBot] Engine requested full rebuild (drift far OOR)")
+                engine_rebuild_trend_risk = 0.0
+                if self._stop_scorer is not None:
+                    engine_rebuild_trend_risk = self._stop_scorer.compute_trend_risk(
+                        mid, self._effective_trend_regime(), self._last_trend_slope_pct
+                    )
+                logger.info(
+                    "[GridBot] Engine requested full rebuild "
+                    "(drift far OOR / one-sided grid) "
+                    f"trend_risk={engine_rebuild_trend_risk:.2f}"
+                )
                 self._rebuild_grid()
                 continue
 
