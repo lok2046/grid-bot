@@ -3477,6 +3477,43 @@ class GridEngine:
         # rest of that grid's life. Now runs every tick regardless of mode.
         self._replace_idle_levels()
 
+        # If every currently-active level ended up resting on the same side,
+        # the grid can't self-correct until price travels all the way back
+        # through whichever boundary it's now stuck past -- and if that
+        # boundary is also outside the range GridBot thinks is live, nothing
+        # else touches it until the next retune check. Doesn't require a
+        # drift-shift event: three ordinary fills at one level are enough
+        # (2026-08-01 log — a 2-point grid's bottom level went idle after its
+        # own fill, its designated closer already occupied the only other
+        # level, leaving zero buy-side coverage with no path back except a
+        # full rebuild). _rearm_eligible stops the fee-bleed this used to
+        # cause but doesn't prevent this specific outcome -- it just changes
+        # HOW a level ends up uncovered.
+        #
+        # Excludes the one legitimate false-positive: LevelState.SUPPRESSED
+        # only ever applies to BUY-side levels (the stop-score gate refusing
+        # new exposure near a falling stop — see the SELL-fill counter-order
+        # branch above). Zero buys while sells remain is expected and correct
+        # in that state; forcing a rebuild there would fight the protection
+        # this bot already has in place, not fix anything.
+        with self._lock:
+            open_buys   = sum(1 for lv in self._levels if lv.state == LevelState.BUY_OPEN)
+            open_sells  = sum(1 for lv in self._levels if lv.state == LevelState.SELL_OPEN)
+            suppressed  = sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
+        buys_are_intentionally_paused = (open_buys == 0 and suppressed > 0)
+        if (not buys_are_intentionally_paused
+                and (open_buys + open_sells) >= 1
+                and (open_buys == 0 or open_sells == 0)
+                and not self._needs_rebuild):
+            side = "SELL" if open_buys == 0 else "BUY"
+            logger.warning(
+                f"[GridEngine] Grid has gone fully one-sided (all {side}, "
+                f"buys={open_buys} sells={open_sells}, suppressed={suppressed}) "
+                f"— requesting fast rebuild instead of waiting for the next "
+                f"retune check"
+            )
+            self._needs_rebuild = True
+
         # Trailing checks run after fills so counter-orders are placed first
         self._check_trailing(mid)
 
