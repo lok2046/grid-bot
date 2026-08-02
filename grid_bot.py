@@ -167,8 +167,8 @@ GRID_CONFIG: dict = {
     #
     # Legacy key "notional_per_level" is still accepted as a direct override
     # (skips total_investment logic entirely) for backwards compatibility.
-    "total_investment_usd": 0.0,       # set to 0.0 if using BTC instead
-    "total_investment_btc": 0.000016,  # e.g. 0.03 BTC; 0.0 = use USD above
+    "total_investment_usd": 0.0,    # set to 0.0 if using BTC instead
+    "total_investment_btc": 0.032,  # e.g. 0.03 BTC; 0.0 = use USD above
 
     # ── Auto-tuner ────────────────────────────────────────────────────────────
     "auto_tune_enabled":    True,
