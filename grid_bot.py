@@ -3529,14 +3529,26 @@ class GridEngine:
             open_buys   = sum(1 for lv in self._levels if lv.state == LevelState.BUY_OPEN)
             open_sells  = sum(1 for lv in self._levels if lv.state == LevelState.SELL_OPEN)
             suppressed  = sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
+            # A small grid (e.g. levels=1) legitimately shows zero on one
+            # side between every fill and its cycle-completing counterpart
+            # — that's expected and self-heals on its own now that
+            # _on_fill retags an already-resting order in place instead of
+            # dropping the closer (2026-08-02 fix, see the counter-order
+            # block above). What actually can't self-heal is an open leg
+            # with NO level anywhere tagged to close it — that's the only
+            # state a full rebuild is genuinely needed to escape, so that's
+            # what this now checks instead of raw side counts.
+            tagged_leg_ids = {lv.closes_leg_id for lv in self._levels
+                               if lv.closes_leg_id is not None}
+            orphaned_legs = set(self._open_legs.keys()) - tagged_leg_ids
         buys_are_intentionally_paused = (open_buys == 0 and suppressed > 0)
         if (not buys_are_intentionally_paused
-                and (open_buys + open_sells) >= 1
-                and (open_buys == 0 or open_sells == 0)
+                and orphaned_legs
                 and not self._needs_rebuild):
             side = "SELL" if open_buys == 0 else "BUY"
             logger.warning(
-                f"[GridEngine] Grid has gone fully one-sided (all {side}, "
+                f"[GridEngine] {len(orphaned_legs)} open leg(s) have no "
+                f"assigned closer anywhere on the grid (all {side}, "
                 f"buys={open_buys} sells={open_sells}, suppressed={suppressed}) "
                 f"— requesting fast rebuild instead of waiting for the next "
                 f"retune check"
@@ -4126,6 +4138,29 @@ class GridEngine:
                     candidate = self._levels[sell_idx]
                     if candidate.state == LevelState.IDLE:
                         sell_lv = candidate
+                    elif (new_leg is not None
+                            and candidate.state == LevelState.SELL_OPEN
+                            and candidate.closes_leg_id is None):
+                        # Adjacent level already has a resting SELL — the
+                        # normal case on a 2-point (levels=1) grid, where
+                        # idx+1 IS the other level and is never IDLE except
+                        # right after a rebuild. Previously this leg's
+                        # closer was simply dropped here, leaving it
+                        # orphaned until the next full rebuild's
+                        # reconcile_open_legs bailed it out — the root
+                        # cause of the one-sided-grid rebuild storm at
+                        # levels=1 (2026-08-02 review). Retag the order
+                        # that's already resting there instead: side and
+                        # price are already correct, only the bookkeeping
+                        # (which leg this fill will close) was missing.
+                        # No cancel/replace, no new order placed.
+                        candidate.closes_leg_id = new_leg.leg_id
+                        logger.debug(
+                            f"[GridEngine] SELL [{sell_idx}] retagged in "
+                            f"place as closer for leg #{new_leg.leg_id} "
+                            f"(already resting @ {candidate.price:.2f} "
+                            f"qty={candidate.qty:.4f})"
+                        )
             if sell_lv is not None:
                 if new_leg is not None:
                     self._place_sell(sell_lv, qty_override=new_leg.qty,
@@ -4152,6 +4187,22 @@ class GridEngine:
                             )
                         else:
                             buy_lv = candidate
+                    elif (new_leg is not None
+                            and candidate.state == LevelState.BUY_OPEN
+                            and candidate.closes_leg_id is None):
+                        # Symmetric to the BUY-fill branch above. Not
+                        # gated: the order is already committed and
+                        # resting regardless of what we tag it as — the
+                        # buy-gate only decides whether to place NEW
+                        # exposure, and this isn't new exposure, just
+                        # correcting which leg gets credited when it fills.
+                        candidate.closes_leg_id = new_leg.leg_id
+                        logger.debug(
+                            f"[GridEngine] BUY [{buy_idx}] retagged in "
+                            f"place as closer for leg #{new_leg.leg_id} "
+                            f"(already resting @ {candidate.price:.2f} "
+                            f"qty={candidate.qty:.4f})"
+                        )
             if suppress:
                 self._alerter_send(
                     f"🛡 Buy [{buy_idx}] suppressed — stop-score gate active"
