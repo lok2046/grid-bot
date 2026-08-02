@@ -3409,6 +3409,24 @@ class GridEngine:
             return
         qty = qty_override if qty_override is not None else self._qty(lv.price)
         if qty <= 0:
+            # 2026-08-02 incident: notional_per_level was ~$1 (a
+            # total_investment_btc config value ~2000x smaller than
+            # intended), so _qty()'s floor to 4dp (0.0001 BTC) rounded
+            # every level to exactly 0 — every level silently skipped
+            # placement, for two hours, with zero trace in the log. This
+            # warning would have been the only signal available at the
+            # time it was happening.
+            reason = (f"notional_per_level={self._params.notional_per_level:.4f} "
+                      f"too small at this price (needs >= "
+                      f"~{lv.price * 0.0001:.2f} for a non-zero 0.0001 BTC lot)"
+                      if qty_override is None else
+                      f"qty_override={qty_override} was <= 0 (re-anchoring a "
+                      f"zero/negative-qty leg?)")
+            logger.warning(
+                f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} SKIPPED — "
+                f"qty rounded to {qty} ({reason}). Level stays uncovered "
+                f"until this is fixed."
+            )
             return
         req = OrderRequest.limit_maker(
             side="BUY", qty=qty, price=lv.price,
@@ -3438,6 +3456,17 @@ class GridEngine:
             return
         qty = qty_override if qty_override is not None else self._qty(lv.price)
         if qty <= 0:
+            reason = (f"notional_per_level={self._params.notional_per_level:.4f} "
+                      f"too small at this price (needs >= "
+                      f"~{lv.price * 0.0001:.2f} for a non-zero 0.0001 BTC lot)"
+                      if qty_override is None else
+                      f"qty_override={qty_override} was <= 0 (re-anchoring a "
+                      f"zero/negative-qty leg?)")
+            logger.warning(
+                f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} SKIPPED — "
+                f"qty rounded to {qty} ({reason}). Level stays uncovered "
+                f"until this is fixed."
+            )
             return
         req = OrderRequest.limit_maker(
             side="SELL", qty=qty, price=lv.price,
