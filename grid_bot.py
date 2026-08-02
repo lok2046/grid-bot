@@ -2959,9 +2959,13 @@ class SpacingAutoTuner:
           UP      → 5 levels: more levels in an uptrend captures more chop cycles;
                     the grid is less likely to be swept downward in an uptrend.
 
-        Only triggers a rebuild (via _rebuild_requested flag) when the regime
-        changes — not on every call.  INSUFFICIENT_DATA leaves min_grid_levels
-        unchanged (hold the last known-good value).
+        Only flags the change (via _rebuild_requested — see 2026-08-02
+        deferred-adoption fix at its call site in GridBot._run()) when the
+        regime changes — not on every call. The new min_grid_levels value
+        is live in config immediately either way; the flag no longer forces
+        an out-of-band rebuild, it's picked up whenever a rebuild next
+        happens for an actual, price-driven reason. INSUFFICIENT_DATA
+        leaves min_grid_levels unchanged (hold the last known-good value).
         """
         if not self._cfg.get("levels_autotune_enabled", True):
             return
@@ -3010,9 +3014,14 @@ class SpacingAutoTuner:
     def pop_rebuild_requested(self) -> bool:
         """Return True (and clear the flag) if _evaluate changed min_grid_pct
         or update_levels_from_trend() changed min_grid_levels since the last
-        call.  Called by GridBot._run() immediately after maybe_evaluate() and
-        _evaluate_trend() so the new value takes effect on the next grid build
-        rather than waiting for the next natural retune."""
+        call. As of the 2026-08-02 deferred-adoption fix, GridBot._run() no
+        longer forces an immediate _rebuild_grid() off this — it only logs
+        that a change is pending. The new value is already live in config
+        (set directly by _evaluate()/update_levels_from_trend()) and gets
+        picked up whenever the grid next rebuilds for an actual, price-driven
+        reason (should_retune()'s boundary check or the 24h periodic
+        interval), rather than forcing an extra rebuild purely to adopt a
+        config target with no accompanying price movement."""
         v, self._rebuild_requested = self._rebuild_requested, False
         return v
 
@@ -7642,8 +7651,37 @@ class GridBot:
             # spacing_autotune_enabled and its own interval has elapsed.
             self._spacing_tuner.maybe_evaluate()
             if self._spacing_tuner.pop_rebuild_requested():
-                logger.info("[GridBot] Spacing auto-tune changed min_grid_pct — rebuilding grid")
-                self._rebuild_grid()
+                # DEFERRED ADOPTION (2026-08-02 fix): min_grid_levels /
+                # min_grid_pct were already updated in config the moment
+                # update_levels_from_trend()/_evaluate() decided on a new
+                # value — that's live for AutoTuner.compute() immediately,
+                # regardless of when the grid itself next rebuilds. What we
+                # NO LONGER do is force an out-of-band _rebuild_grid() call
+                # here just to adopt it early.
+                #
+                # 2026-08-02 11:34 incident: mid was comfortably inside the
+                # existing [62453.20,64207.30] range (no boundary breach, no
+                # price-driven urgency at all) when a regime flip alone
+                # forced this rebuild. AutoTuner recomputed against CURRENT
+                # (low) volatility and collapsed a 13-level/~1754pt grid to
+                # 1 level/180pt in one step, stranding 3 legs with no
+                # candidate closing level at all — -26.52 USD, ~84% of that
+                # session's entire rebuild-driven loss, none of it justified
+                # by any actual price movement.
+                #
+                # Safe to defer: the reason a regime change matters at all —
+                # suppressing buys in a confirmed downtrend — is read via
+                # _effective_trend_regime() directly by the buy gate, and
+                # was never gated on whether the GRID has physically
+                # rebuilt. Deferring the level-count/spacing adoption to the
+                # next real trigger (a genuine should_retune() boundary
+                # breach, or the 24h periodic interval) costs nothing there.
+                logger.info(
+                    "[GridBot] Spacing auto-tune changed min_grid_pct/"
+                    "min_grid_levels — deferred to next naturally-triggered "
+                    "rebuild (boundary breach or periodic interval), not "
+                    "forcing one now"
+                )
 
             time.sleep(0.1)
 
