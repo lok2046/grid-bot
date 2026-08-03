@@ -19,10 +19,13 @@ Architecture
 
 Neutral grid logic
 ==================
-  Price range [lower, upper] divided into N equal levels.
-  Levels below mid → BUY limits; levels above mid → SELL limits.
-  BUY fill at level[i]  → place SELL at level[i+1]  (take-profit one level up)
-  SELL fill at level[i] → place BUY  at level[i-1]  (take-profit one level down)
+  Price range [lower, upper] divided into N independent cells (2026-08-03
+  restructure — see GridLevel/GridEngine docstrings for the full rationale).
+  Each cell is a fixed [lower, upper] price pair running its own
+  self-contained 2-phase cycle, never touching a neighboring cell's order:
+    Cell opens BELOW mid → BUY@lower; cell opens AT/ABOVE mid → SELL@upper.
+    BUY  fill at a cell → place that SAME cell's SELL at its own upper.
+    SELL fill at a cell → place that SAME cell's BUY  at its own lower.
   Each completed cycle captures one grid spacing as gross profit.
   Net profit per cycle ≈ spacing/mid - 2 × maker_fee_rate  (fraction of notional)
 
@@ -255,8 +258,39 @@ GRID_CONFIG: dict = {
     #      they've remained a misfit for reconcile_confirm_s.
     # A leg with NO direction-correct closing level at all in the new grid
     # (e.g. a long leg opened well above every level in a grid that has
-    # since dropped) is still liquidated immediately regardless of buffer
-    # or dwell — there is no level to hold it on, so waiting cannot help.
+    # since dropped) has no cell to hold a resting closer on, so it can't
+    # get the buffer/dwell treatment above as-is — see the 2026-08-03
+    # 16:35 incident: leg #323 (opened BUY 62401.35) was liquidated at
+    # market the instant a retune's new upper (62384.50) fell just 16.85
+    # below its open price (one third of one spacing), eating the taker
+    # fee and the loss on that gap. 13 minutes later a routine TRAIL UP
+    # added a cell that would have covered it easily.
+    #
+    # Fix: this leg is no longer forced straight to market. Instead
+    # (unless trend_risk is already urgent — same bypass as above, a
+    # genuinely confirmed move still evicts instantly):
+    #   1. GridBot immediately hands it to the existing stray-leg chase
+    #      (_chase_close_leg — the same POST_ONLY chase trail-drops use)
+    #      for a shot at a decent price within leg_chase_max_attempts ×
+    #      leg_chase_wait_s (~90s by default) — see "Stray-leg chase"
+    #      below.
+    #   2. If that chase exhausts unfilled, the leg is NOT force-liquidated
+    #      on the spot either. It's left fully tracked (still counted in
+    #      _open_legs / exposure / the daily-loss backstop, just with no
+    #      resting protective order — a materially higher-risk wait than
+    #      the buffered/dwelling case above, which always keeps SOME order
+    #      working) and re-checked at every subsequent rebuild: a real
+    #      candidate cell may simply reappear (e.g. the next trail), in
+    #      which case it re-anchors normally. If not, it's only tolerated
+    #      for reconcile_zero_candidate_max_dwell_s, and that cap itself
+    #      shrinks toward 0 as trend_risk climbs toward
+    #      reconcile_urgent_trend_risk (linear) — a leg stranded during a
+    #      strong, confirmed move gets barely any unmanaged wait at all;
+    #      one stranded during flat/noisy conditions gets close to the
+    #      full cap. Whichever trend_risk reading is current at each
+    #      check (rebuild or chase-exhaustion) governs — it is
+    #      deliberately re-read every time, not fixed at the moment the
+    #      leg first went stranded.
     "reconcile_buffer_atr_mult": 1.5,    # max tolerance = this × effective_atr, at trend_risk=0
     "reconcile_confirm_s":       1800.0, # must persist as a misfit this long (across retunes) before forced liquidation
     # Urgent bypass: trend_risk at/above this skips the confirm-dwell
@@ -264,6 +298,30 @@ GRID_CONFIG: dict = {
     # Defaults to stop_raise_urgent_trend_risk if not set separately, so a
     # confirmed genuine decline evicts immediately in both systems at once.
     "reconcile_urgent_trend_risk": 0.80,
+    # Max unmanaged (no resting order) wait for a zero-candidate leg once
+    # its post-rescue chase (below) has exhausted, at trend_risk=0. Kept
+    # well below reconcile_confirm_s on purpose: that dwell always keeps a
+    # real order working somewhere, this one doesn't, so it's tolerated
+    # for less time by default. Scales to 0 at reconcile_urgent_trend_risk
+    # (same pivot as the urgent bypass above), not at trend_risk=1, so the
+    # two thresholds agree exactly on what counts as "confirmed" enough to
+    # stop waiting.
+    "reconcile_zero_candidate_max_dwell_s": 900.0,
+
+    # ── Stray-leg chase (trail-up/trail-down dropped-cell closers) ────────────
+    # A leg whose closing cell gets dropped by _trail_up/_trail_down no longer
+    # maps onto any remaining cell boundary (see GridEngine._trail_up
+    # docstring) — reconcile_open_legs' cell-fit logic isn't the right tool
+    # for it. GridBot._chase_close_leg_worker instead posts POST_ONLY at the
+    # current best bid/ask on the closing side, leaves it resting for
+    # leg_chase_wait_s, and reprices on every unfilled attempt, up to
+    # leg_chase_max_attempts, before falling back to a market close.
+    # wait_s=30 (not longer): if it hasn't filled in 30s it's very unlikely
+    # to fill materially better by just sitting there longer at a now-stale
+    # quote — repricing against a fresh quote on the next attempt does more
+    # for fill odds than a longer wait on the same one.
+    "leg_chase_max_attempts": 3,      # POST_ONLY attempts before market fallback
+    "leg_chase_wait_s":       30.0,   # how long each attempt rests
 
     # ── Dead-band stop-raise: risk-adaptive gating ────────────────────────────
     # When a dead-band retune wants to raise the in-place stop (see
@@ -1324,14 +1382,20 @@ class OrderRequest:
     exec_inst:   List[str]
     purpose:     str
     client_oid:  str = field(default_factory=lambda: str(uuid.uuid4()))
+    # None = use the module default _MAKER_FILL_TIMEOUT (grid-cell orders).
+    # Set explicitly by callers that need a POST_ONLY order to rest longer
+    # (e.g. GridBot._chase_close_leg_worker's 5-minute chase attempts).
+    maker_timeout_s: Optional[float] = None
 
     @classmethod
     def limit_maker(cls, side: str, qty: float, price: float,
-                    instrument: str, purpose: str = "grid") -> "OrderRequest":
+                    instrument: str, purpose: str = "grid",
+                    maker_timeout_s: Optional[float] = None) -> "OrderRequest":
         """POST_ONLY limit — maker fee, rests on book."""
         return cls(side=side, qty=qty, instrument=instrument,
                    order_type="LIMIT", price=price,
-                   exec_inst=["POST_ONLY"], purpose=purpose)
+                   exec_inst=["POST_ONLY"], purpose=purpose,
+                   maker_timeout_s=maker_timeout_s)
 
     @classmethod
     def market(cls, side: str, qty: float,
@@ -1604,7 +1668,8 @@ class OMS:
             self._fill_queues.pop(client_oid, None)
 
     def _maker_timeout_handler(self, client_oid: str, exchange_id: str, req: OrderRequest):
-        deadline = time.time() + _MAKER_FILL_TIMEOUT
+        timeout  = req.maker_timeout_s if req.maker_timeout_s is not None else _MAKER_FILL_TIMEOUT
+        deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(0.5)
             with self._orders_lock:
@@ -3175,20 +3240,56 @@ class OpenLeg:
 
 @dataclass
 class GridLevel:
+    """
+    2026-08-03 restructure: despite the name, this is now a grid CELL — a
+    fixed [lower, upper] price pair — not a single price point. Each cell
+    runs its own fully independent, self-contained 2-phase cycle and never
+    touches a neighboring cell's order:
+
+        OPEN phase:  resting BUY @ lower  (if open_side == 'BUY')
+                  or resting SELL @ upper (if open_side == 'SELL')
+        fills -> opens a new OpenLeg -> places the CLOSER on THIS SAME
+                 cell's OTHER boundary (see GridEngine._on_fill)
+        CLOSE phase: resting order @ the other boundary, closes_leg_id set
+        fills -> realizes PnL -> re-arms OPEN phase, same open_side, same
+                 cell — repeat.
+
+    This replaces the old "N+1 independent price points, counter-order
+    routed to idx±1, retagged in place if that neighbor was occupied"
+    design. That design is what produced the retag/orphan-leg bug class
+    (silently dropped closers on a 2-level grid, forced rebuilds) — cells
+    eliminate it structurally rather than patching around it further, since
+    there's no longer any neighboring slot to collide over.
+
+    price is a derived convenience, not an independent source of truth: it
+    always equals lower (while state == BUY_OPEN) or upper (while state ==
+    SELL_OPEN), kept in sync by _place_buy/_place_sell. open_side is this
+    cell's fixed identity — the side it uses whenever it places a FRESH,
+    untagged order (initial placement, cancel-retry of an opener, or
+    re-arm after its own leg closes). It is set once, at cell creation or
+    when reconcile_open_legs/_apply_handoff_restore repurposes an existing
+    cell for a specific leg, and is deliberately NEVER recomputed against
+    live mid afterward — see _replace_idle_levels for why that would be
+    wrong once a cell is mid-cycle (a short-covering BUY can legitimately
+    rest above mid; recomputing from price-vs-mid would pick the wrong side).
+    """
     index:       int
-    price:       float
+    lower:       float
+    upper:       float
+    open_side:   str        = "BUY"   # 'BUY' | 'SELL' — this cell's fixed identity
     state:       LevelState = LevelState.IDLE
     client_oid:  str        = ""
     exchange_id: str        = ""   # exchange order-id; populated after REST confirm
     qty:         float      = 0.0
+    price:       float      = 0.0  # derived — see docstring above
     placed_at:   float      = 0.0  # epoch time this order was (re)placed;
                                     # used by paper_fill_min_resting_s guard
-    # Set only when this level's resting order is a designated closer for a
+    # Set only when this cell's resting order is a designated closer for a
     # specific OpenLeg (placed by _on_fill's counter-order step, or restored
     # across a rebuild/handoff by reconcile_open_legs / _apply_handoff_restore).
     # None means "this is a fresh open, whatever fills here starts a new leg"
     # — the same role the old _initial_sell_oids set served, generalized to
-    # every level, not just startup sells.
+    # every cell, not just startup sells.
     closes_leg_id: Optional[int] = None
 
 
@@ -3199,6 +3300,15 @@ class GridLevel:
 class GridEngine:
     """
     Manages limit order ladder on BTCUSD-PERP.
+
+    2026-08-03 restructure: self._levels holds N independent CELLS (fixed
+    [lower, upper] price pairs), not N+1 independent price points — see the
+    GridLevel docstring for the full per-cell cycle. This is what removed
+    the retag/orphan-leg bug class from _on_fill's counter-order routing.
+    GridBot._match_handoff_levels/_apply_handoff_restore were updated in
+    the same pass to match a handoff snapshot's orders by (price, side)
+    against the new grid's actual cell boundaries, rather than the old
+    flat N+1-point index — see those methods' docstrings.
 
     Paper-mode fill detection:
       OMS._paper_fill() returns FillEvent instantly when submit() is called.
@@ -3214,7 +3324,8 @@ class GridEngine:
     def __init__(self, params: GridParams, oms: OMS,
                  instrument: str, config: dict,
                  store: Optional["GridStateStore"] = None,
-                 buy_gate_fn: Optional[Callable[[], bool]] = None):
+                 buy_gate_fn: Optional[Callable[[], bool]] = None,
+                 stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = None):
         self._params     = params
         self._oms        = oms
         self._instrument = instrument
@@ -3225,6 +3336,22 @@ class GridEngine:
         # SUPPRESS it (level is set to SUPPRESSED instead of placing an order).
         # None = no gate (legacy behaviour, always allow).
         self._buy_gate_fn: Optional[Callable[[], bool]] = buy_gate_fn
+        # stray_leg_fn: optional callable(leg, reason) -> None. Called by
+        # _trail_up/_trail_down when a dropped cell was holding a leg's
+        # designated closer — see those methods' docstrings for why the
+        # remaining cell grid is structurally the wrong home for it. Set by
+        # GridBot to GridBot._chase_close_leg, which spawns a background
+        # thread and returns immediately; this attribute exists (rather than
+        # hardcoding that call here) so GridEngine has no upward dependency
+        # on GridBot and stays constructible standalone in tests. None =
+        # legacy behaviour (log a warning, rely on the orphan-leg rebuild
+        # safety net).
+        self._stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = stray_leg_fn
+        # Leg ids currently being actively managed by stray_leg_fn (a chase
+        # in progress). check_price_fills()'s orphan-leg detector excludes
+        # these — they're accounted for, just not by a cell — so it doesn't
+        # force a needless rebuild out from under an in-flight chase.
+        self._chasing_leg_ids: set = set()
         self._lock       = threading.Lock()
         self._levels: List[GridLevel] = []
         self._stop_event = threading.Event()
@@ -3282,23 +3409,11 @@ class GridEngine:
 
         # Indices with a fill detected (state already flipped to IDLE) but not
         # yet processed by _on_fill() on the Grid-fills thread. _replace_idle_levels()
-        # must skip these — see its docstring for the same-level wash-trade bug
-        # this prevents (fixed 2026-07-30).
+        # must skip these — see its docstring for the same-cell race this
+        # prevents (fixed 2026-07-30; simplified 2026-08-03 when the cell
+        # restructure retired the separate _rearm_eligible allow-list this
+        # used to work alongside).
         self._pending_fill_indices: set = set()
-
-        # Allow-list of level indices _replace_idle_levels() is permitted to
-        # naively re-arm (2026-08-01 — see _replace_idle_levels() docstring).
-        # A level only belongs here if it's IDLE for a reason OTHER than "its
-        # own order just filled": a cancelled-order re-post, or a residual
-        # unplaced level from _place_initial_orders. It must NOT contain a
-        # level that just filled — that level's re-arm is _on_fill()'s job
-        # (placing an order at the ADJACENT level), and it must sit out until
-        # the adjacent level's own eventual fill cycles back to it. The
-        # OpenLeg ledger (see _on_fill) means a violation of this can no
-        # longer fabricate profit, but it still burns real fees opening and
-        # closing legs at the same stalled price for zero edge — this
-        # allow-list is what actually stops that from happening at all.
-        self._rearm_eligible: set = set()
 
         self._build_levels()
 
@@ -3319,12 +3434,23 @@ class GridEngine:
         return total
 
     def _build_levels(self):
+        """
+        Build one independent GridLevel (cell) per [prices[i], prices[i+1]]
+        pair — N cells from N+1 boundary prices, not N+1 independent
+        points. open_side is decided later, per cell, in
+        _place_initial_orders (or by reconcile_open_legs /
+        _apply_handoff_restore for a cell reassigned to an existing leg) —
+        this method has no mid to decide it with yet.
+        """
         prices = self._params.level_prices
         with self._lock:
-            self._levels = [GridLevel(index=i, price=p) for i, p in enumerate(prices)]
+            self._levels = [
+                GridLevel(index=i, lower=prices[i], upper=prices[i + 1])
+                for i in range(len(prices) - 1)
+            ]
         logger.info(
-            f"[GridEngine] {len(self._levels)} levels: "
-            f"{self._levels[0].price:.2f} … {self._levels[-1].price:.2f}"
+            f"[GridEngine] {len(self._levels)} cells: "
+            f"{self._levels[0].lower:.2f} … {self._levels[-1].upper:.2f}"
         )
 
     def start(self, mid: float, skip_indices: Optional[set] = None):
@@ -3383,14 +3509,20 @@ class GridEngine:
             # getting an order. Placement below almost always succeeds and
             # moves the level off IDLE anyway, so this is a fallback, not
             # the normal path.
-            self._rearm_eligible.add(lv.index)
+            # This cell's fixed identity: rests BUY@lower if its lower
+            # boundary is below current mid (a normal, non-crossing resting
+            # buy); otherwise rests SELL@upper (opens a fresh short — this
+            # bot supports net-short exposure, see OpenLeg). Decided once,
+            # here — never recomputed against live mid again afterward, see
+            # GridLevel.open_side.
             # NOTE: was `elif lv.price > mid`, which silently placed no
             # order at all when lv.price == mid exactly (observed live
             # 2026-07-29 12:38:48 — level [2] never got an order because
             # the AutoTuner-computed level price was bit-for-bit equal to
             # the mid passed in here). `>=` makes the tie an explicit
             # SELL instead of an orphaned level.
-            if lv.price < mid:
+            lv.open_side = "BUY" if lv.lower < mid else "SELL"
+            if lv.open_side == "BUY":
                 self._place_buy(lv)
             else:
                 self._place_sell(lv)
@@ -3407,7 +3539,7 @@ class GridEngine:
         if self._handoff_freeze:
             logger.debug(f"[GridEngine] BUY  [{lv.index}] suppressed — handoff freeze active")
             return
-        qty = qty_override if qty_override is not None else self._qty(lv.price)
+        qty = qty_override if qty_override is not None else self._qty(lv.lower)
         if qty <= 0:
             # 2026-08-02 incident: notional_per_level was ~$1 (a
             # total_investment_btc config value ~2000x smaller than
@@ -3418,23 +3550,24 @@ class GridEngine:
             # time it was happening.
             reason = (f"notional_per_level={self._params.notional_per_level:.4f} "
                       f"too small at this price (needs >= "
-                      f"~{lv.price * 0.0001:.2f} for a non-zero 0.0001 BTC lot)"
+                      f"~{lv.lower * 0.0001:.2f} for a non-zero 0.0001 BTC lot)"
                       if qty_override is None else
                       f"qty_override={qty_override} was <= 0 (re-anchoring a "
                       f"zero/negative-qty leg?)")
             logger.warning(
-                f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} SKIPPED — "
+                f"[GridEngine] BUY  [{lv.index}] @ {lv.lower:.2f} SKIPPED — "
                 f"qty rounded to {qty} ({reason}). Level stays uncovered "
                 f"until this is fixed."
             )
             return
         req = OrderRequest.limit_maker(
-            side="BUY", qty=qty, price=lv.price,
+            side="BUY", qty=qty, price=lv.lower,
             instrument=self._instrument, purpose="grid_buy")
         with self._lock:
             lv.state         = LevelState.BUY_OPEN
             lv.client_oid    = req.client_oid
             lv.qty           = qty
+            lv.price         = lv.lower
             lv.placed_at     = time.time()
             lv.closes_leg_id = closes_leg_id
         if self._oms.live_trading:
@@ -3447,34 +3580,35 @@ class GridEngine:
         # logs a misleading "FILL" line for an order that hasn't actually
         # crossed price yet.
         tag = f" closes_leg={closes_leg_id}" if closes_leg_id is not None else ""
-        logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}{tag}")
+        logger.debug(f"[GridEngine] BUY  [{lv.index}] @ {lv.lower:.2f} qty={qty:.4f}{tag}")
 
     def _place_sell(self, lv: GridLevel, qty_override: Optional[float] = None,
                     closes_leg_id: Optional[int] = None):
         if self._handoff_freeze:
             logger.debug(f"[GridEngine] SELL [{lv.index}] suppressed — handoff freeze active")
             return
-        qty = qty_override if qty_override is not None else self._qty(lv.price)
+        qty = qty_override if qty_override is not None else self._qty(lv.upper)
         if qty <= 0:
             reason = (f"notional_per_level={self._params.notional_per_level:.4f} "
                       f"too small at this price (needs >= "
-                      f"~{lv.price * 0.0001:.2f} for a non-zero 0.0001 BTC lot)"
+                      f"~{lv.upper * 0.0001:.2f} for a non-zero 0.0001 BTC lot)"
                       if qty_override is None else
                       f"qty_override={qty_override} was <= 0 (re-anchoring a "
                       f"zero/negative-qty leg?)")
             logger.warning(
-                f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} SKIPPED — "
+                f"[GridEngine] SELL [{lv.index}] @ {lv.upper:.2f} SKIPPED — "
                 f"qty rounded to {qty} ({reason}). Level stays uncovered "
                 f"until this is fixed."
             )
             return
         req = OrderRequest.limit_maker(
-            side="SELL", qty=qty, price=lv.price,
+            side="SELL", qty=qty, price=lv.upper,
             instrument=self._instrument, purpose="grid_sell")
         with self._lock:
             lv.state         = LevelState.SELL_OPEN
             lv.client_oid    = req.client_oid
             lv.qty           = qty
+            lv.price         = lv.upper
             lv.placed_at     = time.time()
             lv.closes_leg_id = closes_leg_id
         if self._oms.live_trading:
@@ -3482,7 +3616,7 @@ class GridEngine:
         # See _place_buy: paper mode's fill authority is _simulate_paper_fills(),
         # not OMS.submit()/_paper_fill(), so skip it here too.
         tag = f" closes_leg={closes_leg_id}" if closes_leg_id is not None else ""
-        logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.price:.2f} qty={qty:.4f}{tag}")
+        logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.upper:.2f} qty={qty:.4f}{tag}")
 
     # ── Fill detection ────────────────────────────────────────────────────────
 
@@ -3506,18 +3640,16 @@ class GridEngine:
         # rest of that grid's life. Now runs every tick regardless of mode.
         self._replace_idle_levels()
 
-        # If every currently-active level ended up resting on the same side,
-        # the grid can't self-correct until price travels all the way back
-        # through whichever boundary it's now stuck past -- and if that
-        # boundary is also outside the range GridBot thinks is live, nothing
-        # else touches it until the next retune check. Doesn't require a
-        # drift-shift event: three ordinary fills at one level are enough
-        # (2026-08-01 log — a 2-point grid's bottom level went idle after its
-        # own fill, its designated closer already occupied the only other
-        # level, leaving zero buy-side coverage with no path back except a
-        # full rebuild). _rearm_eligible stops the fee-bleed this used to
-        # cause but doesn't prevent this specific outcome -- it just changes
-        # HOW a level ends up uncovered.
+        # Historical note (predates the 2026-08-03 cell restructure): under
+        # the old point-per-level design, every level ending up on the same
+        # side could leave the grid stuck with no path back except a full
+        # rebuild, and _rearm_eligible only changed HOW that happened rather
+        # than preventing it. Under the cell model each cell is a fully
+        # self-contained 2-phase cycle, so this specific failure mode no
+        # longer applies the same way — the check below is kept as a
+        # defense-in-depth safety net for the one thing that genuinely still
+        # needs a rebuild to fix (see next comment), not as the primary fix
+        # for it.
         #
         # Excludes the one legitimate false-positive: LevelState.SUPPRESSED
         # only ever applies to BUY-side levels (the stop-score gate refusing
@@ -3529,18 +3661,18 @@ class GridEngine:
             open_buys   = sum(1 for lv in self._levels if lv.state == LevelState.BUY_OPEN)
             open_sells  = sum(1 for lv in self._levels if lv.state == LevelState.SELL_OPEN)
             suppressed  = sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
-            # A small grid (e.g. levels=1) legitimately shows zero on one
-            # side between every fill and its cycle-completing counterpart
-            # — that's expected and self-heals on its own now that
-            # _on_fill retags an already-resting order in place instead of
-            # dropping the closer (2026-08-02 fix, see the counter-order
-            # block above). What actually can't self-heal is an open leg
-            # with NO level anywhere tagged to close it — that's the only
-            # state a full rebuild is genuinely needed to escape, so that's
-            # what this now checks instead of raw side counts.
+            # Every cell only ever rests one side at a time by construction
+            # now (2026-08-03) — a lopsided buys/sells count across the
+            # whole grid is normal, not a symptom of anything. What actually
+            # can't self-heal is an open leg with NO cell anywhere tagged to
+            # close it (shouldn't happen under the cell model — each cell
+            # only ever tags a leg it opened itself — but kept as a
+            # defensive check for any bug that manages to leave one
+            # untagged).
             tagged_leg_ids = {lv.closes_leg_id for lv in self._levels
                                if lv.closes_leg_id is not None}
-            orphaned_legs = set(self._open_legs.keys()) - tagged_leg_ids
+            orphaned_legs = (set(self._open_legs.keys()) - tagged_leg_ids
+                              - self._chasing_leg_ids)
         buys_are_intentionally_paused = (open_buys == 0 and suppressed > 0)
         if (not buys_are_intentionally_paused
                 and orphaned_legs
@@ -3605,13 +3737,12 @@ class GridEngine:
                 with self._lock:
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
+                    # This cell's own order just filled. _replace_idle_levels()
+                    # must not naively re-arm it out from under _on_fill(),
+                    # which is about to place the correct next order (tagged
+                    # closer or fresh re-arm) on this SAME cell — see
+                    # _pending_fill_indices and _on_fill.
                     self._pending_fill_indices.add(lv.index)
-                    # This level's own order just filled — it must NOT be
-                    # naively re-armed by _replace_idle_levels(). Its
-                    # counter-order belongs at the ADJACENT level (_on_fill()
-                    # places it there); this level waits for THAT level's
-                    # eventual fill to cycle back. See _rearm_eligible.
-                    self._rearm_eligible.discard(lv.index)
                 self._fill_queue.append((lv.index, fill))
                 self._fill_event.set()
 
@@ -3630,111 +3761,77 @@ class GridEngine:
                 if fill.is_filled:
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
-                    self._pending_fill_indices.add(lv.index)
                     # See _simulate_paper_fills' matching comment — this
-                    # level's own fill must NOT make it eligible for
-                    # _replace_idle_levels()'s naive re-arm.
-                    self._rearm_eligible.discard(lv.index)
+                    # cell's own fill must not be naively re-armed by
+                    # _replace_idle_levels(); _on_fill() places the correct
+                    # next order on this same cell.
+                    self._pending_fill_indices.add(lv.index)
                     self._fill_queue.append((lv.index, fill))
                     self._fill_event.set()
                 elif fill.is_cancelled:
-                    # Timeout cancel — re-place same side. Unlike a fill,
-                    # there's no adjacent-level counter-order to wait for
-                    # here, so this level IS eligible for the naive re-arm.
+                    # Timeout cancel — re-place same side/price. Not in
+                    # _pending_fill_indices (no fill happened), so
+                    # _replace_idle_levels() will pick it straight back up.
                     # closes_leg_id is deliberately left untouched (see
                     # _replace_idle_levels' comment) — a cancel means the
                     # closing fill never happened, so the leg it was tagged
                     # to close is still open and still needs a closer.
                     lv.state      = LevelState.IDLE
                     lv.client_oid = ""
-                    self._rearm_eligible.add(lv.index)
                     # Will be re-placed by check_price_fills()'s unconditional
                     # _replace_idle_levels() call right after this returns.
 
     def _replace_idle_levels(self):
-        """Re-place any IDLE levels that should have an order.
+        """Re-place any IDLE cells that should have an order.
         SUPPRESSED levels are intentionally skipped — they are managed by
         GridBot._run() via release_one_suppressed_level() once the stop-score
         recovers, so they must not be re-queued here.
 
-        Only levels in _rearm_eligible are touched. This is an ALLOW-list,
-        not a blacklist, and that distinction is the fix — see the
-        2026-08-01 entry below. Levels in _pending_fill_indices are excluded
-        too, as defense in depth, though membership in the two sets is
-        mutually exclusive by construction.
+        Excludes _pending_fill_indices as the sole guard (2026-08-03: the
+        older _rearm_eligible ALLOW-list is retired — see history below for
+        why it existed and why the cell restructure removes the need for
+        it).  A cell in _pending_fill_indices just filled and is waiting for
+        _on_fill() to process it on the Grid-fills thread; touching it here
+        first would race with _on_fill() placing the correct next order on
+        that same cell and could submit a duplicate.  Every OTHER IDLE cell
+        — a maker-timeout cancel retry, or a residual unplaced cell from
+        _place_initial_orders — is safe to re-arm immediately.
 
         History:
 
-        2026-07-30 (gen00013, level [1] @ 64260.18, 11 wash-trades in ~8min,
-        +256.46 USD/day outlier): _simulate_paper_fills() (and
-        _poll_live_fills()) flip a level's state to IDLE the instant a fill
-        is detected, then hand the fill off to _on_fill() asynchronously via
-        _fill_queue, processed on the separate Grid-fills thread. But
-        check_price_fills() calls this method synchronously, in the same
-        tick, immediately after — with no guarantee _on_fill() has run yet.
-        If mid is still sitting at/through that level's own price at that
-        instant (the same condition that just triggered the fill), the naive
-        `lv.price < mid` check re-arms the level AT ITS OWN PRICE rather than
-        leaving the adjacent-level counter-order (which _on_fill places
-        correctly, at idx+1 for a BUY fill / idx-1 for a SELL fill) to do its
-        job. At the time, each such re-fill still ran the old gross_pnl =
-        (this level's price − the level BELOW's price) × qty calculation,
-        crediting a full spacing width of profit for inventory that was, in
-        reality, bought and sold at the identical price moments apart. The
-        fix at the time was a same-tick blacklist (_pending_fill_indices):
-        skip a level until _on_fill() has processed its fill.
+        2026-07-30 / 2026-08-01 (gen00013/gen00014, wash-trade incidents):
+        under the OLD point-per-level design, a level's counter-order after
+        its own fill belonged at the ADJACENT level, and this method had to
+        be kept from naively re-arming the level that just filled at its
+        OWN price while it waited — sometimes for a long time — for that
+        neighbor's own eventual fill to cycle back around. _rearm_eligible
+        was an allow-list built specifically to enforce that wait.
 
-        2026-08-01 (gen00014, level [2] @ 62666.75, 35+ wash-trades over
-        ~35min in one incident, 84 runs / +383.51 USD phantom gross across
-        the full day — exceeding that day's entire +329.81 USD reported net
-        gain): the 07-30 fix was necessary but not sufficient. It only
-        closes the race for the ONE tick immediately following a fill.
-        _on_fill() places a BUY/SELL at the ADJACENT level ONLY if that
-        adjacent level is currently IDLE; if it's occupied (has its own
-        resting order — the common case once a grid has been running a
-        while), _on_fill() correctly does nothing further, and the
-        just-filled level is left IDLE with _pending_fill_indices already
-        discarded (see _on_fill) — the old blacklist-only logic then
-        considered it fair game again. If mid keeps sitting at that level's
-        own price for many subsequent ticks (a stalled/ranging market, not a
-        one-tick blip), the naive re-arm fired again on EVERY such tick —
-        same-price BUY→SELL→BUY→SELL, indefinitely, for as long as the
-        stall lasted.
+        2026-08-03 restructure: under the cell model, that whole "wait on a
+        neighbor" condition no longer exists — a cell's own re-arm is
+        *always* placed by _on_fill() on that SAME cell, essentially
+        immediately (the only delay is the brief hand-off to the async
+        Grid-fills thread, which _pending_fill_indices alone already
+        guards). There is no other case left where an IDLE cell should stay
+        unplaced, so the allow-list is gone; _pending_fill_indices is the
+        only exclusion needed.
 
-        The OpenLeg ledger (see _on_fill) was added independently around
-        this time and closes the FINANCIAL half of this on its own: a
-        re-armed order comes out of this method with closes_leg_id=None
-        (whatever tag the level had is consumed by _on_fill before this
-        method is ever allowed to touch the index again), so a same-price
-        wash-trade fill now opens a fresh, real leg — gross_pnl=0.0 — rather
-        than fabricating a spacing-width profit. It genuinely cannot inflate
-        PnL anymore. But the re-arm itself was still happening: every cycle
-        is still two real fills, two real fees, a real DB open_leg() write,
-        and zero edge, plus an orphaned leg sitting in _open_legs until some
-        later rebuild's reconcile_open_legs happens to sweep it up. This is
-        what the allow-list below actually stops — not a PnL-integrity fix
-        at this point (OpenLeg already covers that), but a fee-bleed and
-        leg-bookkeeping-bloat fix: a level must be explicitly marked
-        _rearm_eligible for a reason OTHER than "its own order just filled"
-        (a cancelled-order re-post, or a residual unplaced level from
-        _place_initial_orders) before this method will touch it. A level
-        that just filled stays ineligible indefinitely — correctly waiting
-        on the adjacent level's own eventual fill to cycle back to it via
-        _on_fill(), no matter how many ticks that takes."""
-        mid = _price_cache.get_mid()
-        if mid is None:
-            return
+        Side selection: NEVER recomputed from lv.price-vs-mid (that was
+        already only safe under the old design because a level's price was
+        immutable; under the cell model, a cell mid-CLOSE phase can
+        legitimately need to rest on the "wrong" side of live mid — e.g. a
+        short-covering BUY resting above mid — and recomputing from mid
+        would silently retry the wrong side). Instead this always uses the
+        cell's own local, already-correct identity: open_side if this is a
+        fresh/untagged retry, or open_side's opposite if closes_leg_id is
+        set (a cell only ever closes on the side opposite how it opens —
+        see GridLevel docstring)."""
         with self._lock:
             idle = [lv for lv in self._levels
                     if lv.state == LevelState.IDLE          # SUPPRESSED excluded
-                    and lv.index in self._rearm_eligible
                     and lv.index not in self._pending_fill_indices]
         for lv in idle:
-            # See _place_initial_orders for why this is `>=`-via-else rather
-            # than a separate `elif lv.price > mid` — an exact tie must not
-            # silently leave the level unplaced.
-            #
-            # closes_leg_id/qty must be carried through the re-arm. A level
+            # closes_leg_id/qty must be carried through the re-arm. A cell
             # can go IDLE without ever passing through _on_fill — e.g. a
             # maker-timeout cancel in _poll_live_fills, which resets
             # state/client_oid but (correctly) leaves closes_leg_id alone,
@@ -3748,11 +3845,12 @@ class GridEngine:
             # retry of the order that just got cancelled, not a fresh open.
             tag_qty = lv.qty if lv.closes_leg_id is not None else None
             tag_leg = lv.closes_leg_id
-            if lv.price < mid:
+            side = lv.open_side if tag_leg is None else (
+                "SELL" if lv.open_side == "BUY" else "BUY")
+            if side == "BUY":
                 self._place_buy(lv, qty_override=tag_qty, closes_leg_id=tag_leg)
             else:
                 self._place_sell(lv, qty_override=tag_qty, closes_leg_id=tag_leg)
-            self._rearm_eligible.discard(lv.index)
 
     # ── Trailing ──────────────────────────────────────────────────────────────
 
@@ -3776,8 +3874,11 @@ class GridEngine:
         with self._lock:
             if len(self._levels) < 2:
                 return
-            current_lower   = self._levels[0].price
-            current_upper   = self._levels[-1].price
+            # Structural grid boundaries, not the edge cells' transient
+            # .price (which now moves between lower/upper as each cell
+            # cycles through its own open/close phases — see GridLevel).
+            current_lower   = self._levels[0].lower
+            current_upper   = self._levels[-1].upper
             spacing         = self._params.spacing
 
         trail_up   = self._cfg.get("trailing_up_enabled",   False)
@@ -3820,28 +3921,63 @@ class GridEngine:
             f"adding upper={new_upper:.2f}"
         )
 
+        dropped_leg = None
         with self._lock:
-            # Step 1: remove bottom level and cancel its order
+            # Step 1: remove bottom cell and cancel its order
             if not self._levels:
                 return
             bottom = self._levels[0]
             if bottom.state != LevelState.IDLE and bottom.client_oid:
+                if bottom.closes_leg_id is not None:
+                    # This cell was mid-CLOSE-phase, holding a leg's
+                    # designated closer. Its ideal closing price IS the
+                    # boundary being dropped here — every remaining cell
+                    # boundary is a full spacing away from it by
+                    # construction, so reconcile_open_legs' cell-fit logic
+                    # would wedge it into a worse price (or the
+                    # buffer/confirm-dwell path meant for genuine range
+                    # mismatches, not routine trail noise). Hand it to
+                    # stray_leg_fn instead, which manages it independently
+                    # of the cell grid.
+                    dropped_leg = self._open_legs.get(bottom.closes_leg_id)
+                    if dropped_leg is not None:
+                        self._chasing_leg_ids.add(dropped_leg.leg_id)
+                        logger.info(
+                            f"[GridEngine] TRAIL UP dropping bottom cell "
+                            f"[{bottom.index}] while it holds leg "
+                            f"#{dropped_leg.leg_id}'s closer — handing off "
+                            f"to stray-leg chase."
+                        )
+                    else:
+                        # Defensive: closes_leg_id pointing nowhere. Nothing
+                        # to hand off; fall back to the old safety net.
+                        logger.warning(
+                            f"[GridEngine] TRAIL UP dropping bottom cell "
+                            f"[{bottom.index}] tagged closes_leg_id="
+                            f"{bottom.closes_leg_id}, but that leg isn't in "
+                            f"_open_legs — relying on the orphan-leg rebuild "
+                            f"safety net."
+                        )
                 # Mark idle so poll_fills won't try to re-place it
                 bottom.state      = LevelState.IDLE
                 bottom.client_oid = ""
             self._levels.pop(0)
-            # Re-index remaining levels
+            # Re-index remaining cells
             for i, lv in enumerate(self._levels):
                 lv.index = i
 
-            # Step 2: append new SELL level at the top
+            # Step 2: append new cell at the top, opening via SELL (a trail
+            # up always seeds a fresh short as the natural continuation of
+            # the breakout that triggered it — same as the pre-existing
+            # _place_sell(new_lv) call below).
             new_idx = len(self._levels)
-            new_lv  = GridLevel(index=new_idx, price=new_upper)
+            new_lv  = GridLevel(index=new_idx, lower=old_upper, upper=new_upper,
+                                 open_side="SELL")
             self._levels.append(new_lv)
             self._params = GridParams(
-                lower=self._levels[0].price,
+                lower=self._levels[0].lower,
                 upper=new_upper,
-                levels=len(self._levels) - 1,
+                levels=len(self._levels),
                 spacing=spacing,
                 stop_price=self._params.stop_price,
                 notional_per_level=self._params.notional_per_level,
@@ -3849,6 +3985,8 @@ class GridEngine:
 
         # Place the new SELL outside the lock
         self._place_sell(new_lv)
+        if dropped_leg is not None and self._stray_leg_fn is not None:
+            self._stray_leg_fn(dropped_leg, "trail_up")
         self._alerter_send(
             f"⬆️ Grid trailed UP → [{self._params.lower:.0f}, {new_upper:.0f}]"
         )
@@ -3866,25 +4004,50 @@ class GridEngine:
             f"adding lower={new_lower:.2f}"
         )
 
+        dropped_leg = None
         with self._lock:
             if not self._levels:
                 return
             top = self._levels[-1]
             if top.state != LevelState.IDLE and top.client_oid:
+                if top.closes_leg_id is not None:
+                    # See the matching TRAIL UP comment — same handoff,
+                    # mirrored for the top cell.
+                    dropped_leg = self._open_legs.get(top.closes_leg_id)
+                    if dropped_leg is not None:
+                        self._chasing_leg_ids.add(dropped_leg.leg_id)
+                        logger.info(
+                            f"[GridEngine] TRAIL DOWN dropping top cell "
+                            f"[{top.index}] while it holds leg "
+                            f"#{dropped_leg.leg_id}'s closer — handing off "
+                            f"to stray-leg chase."
+                        )
+                    else:
+                        logger.warning(
+                            f"[GridEngine] TRAIL DOWN dropping top cell "
+                            f"[{top.index}] tagged closes_leg_id="
+                            f"{top.closes_leg_id}, but that leg isn't in "
+                            f"_open_legs — relying on the orphan-leg rebuild "
+                            f"safety net."
+                        )
                 top.state      = LevelState.IDLE
                 top.client_oid = ""
             self._levels.pop()
 
-            # Prepend new BUY level at the bottom
-            new_lv = GridLevel(index=0, price=new_lower)
+            # Prepend new cell at the bottom, opening via BUY (a trail down
+            # always seeds a fresh long as the natural continuation of the
+            # breakdown that triggered it — same as the pre-existing
+            # _place_buy(new_lv) call below).
+            new_lv = GridLevel(index=0, lower=new_lower, upper=old_lower,
+                                open_side="BUY")
             self._levels.insert(0, new_lv)
             # Re-index
             for i, lv in enumerate(self._levels):
                 lv.index = i
             self._params = GridParams(
                 lower=new_lower,
-                upper=self._levels[-1].price,
-                levels=len(self._levels) - 1,
+                upper=self._levels[-1].upper,
+                levels=len(self._levels),
                 spacing=spacing,
                 stop_price=self._params.stop_price,
                 notional_per_level=self._params.notional_per_level,
@@ -3892,6 +4055,8 @@ class GridEngine:
 
         # Place the new BUY outside the lock
         self._place_buy(new_lv)
+        if dropped_leg is not None and self._stray_leg_fn is not None:
+            self._stray_leg_fn(dropped_leg, "trail_down")
         self._alerter_send(
             f"⬇️ Grid trailed DOWN → [{new_lower:.0f}, {self._params.upper:.0f}]"
         )
@@ -3939,8 +4104,9 @@ class GridEngine:
                 return
             is_buy = fill.purpose == "grid_buy"
             # Done racing _replace_idle_levels() for this index — from here on
-            # the correct counter-order (placed below, at the adjacent level)
-            # is what should happen next, not a naive re-arm of this level.
+            # the correct counter-order (placed below, on this SAME cell's
+            # other boundary — see the 2026-08-03 cell restructure) is what
+            # should happen next, not a naive re-arm.
             self._pending_fill_indices.discard(idx)
             lv = self._levels[idx]
             closes_leg_id = lv.closes_leg_id
@@ -4121,109 +4287,76 @@ class GridEngine:
                     f"{gross_pnl:+.4f} until backfilled."
                 )
 
-        # ── Counter-order at the adjacent level ─────────────────────────────
-        # Direction is unchanged from before (BUY fill -> counter-SELL one
-        # level up; SELL fill -> counter-BUY one level down, subject to the
-        # buy-gate). What's new: if this fill just opened `new_leg`, the
-        # counter-order is tagged as ITS designated closer and sized to its
-        # exact qty — not the standard per-level notional — so whenever it
-        # fills, it closes exactly this leg and nothing else. If this fill
-        # just closed `leg_closed` instead, the counter-order is a fresh,
-        # untagged opening, same as any normal grid re-entry.
+        # ── Counter-order: SAME cell, other boundary (2026-08-03) ───────────
+        # Every cell is fully self-contained — the order that follows any
+        # fill always belongs to THIS SAME cell (idx unchanged), never a
+        # neighbor. No adjacent-index lookup, no IDLE/occupied branching, no
+        # retag: whichever side just filled, the next order is simply the
+        # opposite side, on this cell's other boundary. This is what
+        # eliminates the old retag/orphan-leg bug class at the data-structure
+        # level (see GridLevel docstring) rather than patching around it
+        # further. If this fill just opened `new_leg`, the counter-order is
+        # tagged as its designated closer and sized to its exact qty. If
+        # this fill just closed `leg_closed` instead, the counter-order is a
+        # fresh, untagged re-arm — same cell, same open_side, next cycle.
+        with self._lock:
+            lv = self._levels[idx]   # same cell — no index arithmetic
+
         if is_buy:
-            sell_lv = None
-            sell_idx = idx + 1
-            with self._lock:
-                if sell_idx < len(self._levels):
-                    candidate = self._levels[sell_idx]
-                    if candidate.state == LevelState.IDLE:
-                        sell_lv = candidate
-                    elif (new_leg is not None
-                            and candidate.state == LevelState.SELL_OPEN
-                            and candidate.closes_leg_id is None):
-                        # Adjacent level already has a resting SELL — the
-                        # normal case on a 2-point (levels=1) grid, where
-                        # idx+1 IS the other level and is never IDLE except
-                        # right after a rebuild. Previously this leg's
-                        # closer was simply dropped here, leaving it
-                        # orphaned until the next full rebuild's
-                        # reconcile_open_legs bailed it out — the root
-                        # cause of the one-sided-grid rebuild storm at
-                        # levels=1 (2026-08-02 review). Retag the order
-                        # that's already resting there instead: side and
-                        # price are already correct, only the bookkeeping
-                        # (which leg this fill will close) was missing.
-                        # No cancel/replace, no new order placed.
-                        candidate.closes_leg_id = new_leg.leg_id
-                        logger.debug(
-                            f"[GridEngine] SELL [{sell_idx}] retagged in "
-                            f"place as closer for leg #{new_leg.leg_id} "
-                            f"(already resting @ {candidate.price:.2f} "
-                            f"qty={candidate.qty:.4f})"
-                        )
-            if sell_lv is not None:
-                if new_leg is not None:
-                    self._place_sell(sell_lv, qty_override=new_leg.qty,
-                                      closes_leg_id=new_leg.leg_id)
-                else:
-                    self._place_sell(sell_lv)
+            # BUY just filled at this cell's lower boundary -> counter is a
+            # SELL at this cell's upper boundary. Not gated: closing
+            # exposure (or opening a short) was never subject to the
+            # buy-gate — only fresh/covering BUYs are (see the else branch).
+            if new_leg is not None:
+                self._place_sell(lv, qty_override=new_leg.qty,
+                                  closes_leg_id=new_leg.leg_id)
+            else:
+                self._place_sell(lv)
         else:
-            # Snapshot counter-level under lock, then place outside lock
-            buy_lv = None
+            # SELL just filled at this cell's upper boundary -> counter is a
+            # BUY at this cell's lower boundary, subject to the buy-gate
+            # (same protection as before: it exists to withhold NEW buy-side
+            # exposure while a stop-score risk signal is active, whether
+            # that BUY is opening a fresh long or covering a short).
             suppress = False
-            buy_idx = idx - 1
-            with self._lock:
-                if buy_idx >= 0:
-                    candidate = self._levels[buy_idx]
-                    if candidate.state == LevelState.IDLE:
-                        # Run the buy gate before committing to place the order.
-                        # Gate returns True = allow, False = suppress.
-                        if self._buy_gate_fn is not None and not self._buy_gate_fn():
-                            candidate.state = LevelState.SUPPRESSED
-                            suppress = True
-                            logger.info(
-                                f"[GridEngine] BUY [{buy_idx}] suppressed by stop-score gate "
-                                f"(sell fill at [{idx}] @ {fill.avg_price:.2f})"
-                            )
-                        else:
-                            buy_lv = candidate
-                    elif (new_leg is not None
-                            and candidate.state == LevelState.BUY_OPEN
-                            and candidate.closes_leg_id is None):
-                        # Symmetric to the BUY-fill branch above. Not
-                        # gated: the order is already committed and
-                        # resting regardless of what we tag it as — the
-                        # buy-gate only decides whether to place NEW
-                        # exposure, and this isn't new exposure, just
-                        # correcting which leg gets credited when it fills.
-                        candidate.closes_leg_id = new_leg.leg_id
-                        logger.debug(
-                            f"[GridEngine] BUY [{buy_idx}] retagged in "
-                            f"place as closer for leg #{new_leg.leg_id} "
-                            f"(already resting @ {candidate.price:.2f} "
-                            f"qty={candidate.qty:.4f})"
-                        )
+            if self._buy_gate_fn is not None and not self._buy_gate_fn():
+                with self._lock:
+                    lv.state         = LevelState.SUPPRESSED
+                    # Preserve the tag/qty this BUY would have carried, so
+                    # release_one_suppressed_level() can restore it exactly
+                    # rather than silently placing a generic fresh order in
+                    # its place once the gate reopens.
+                    lv.closes_leg_id = new_leg.leg_id if new_leg is not None else None
+                    lv.qty           = new_leg.qty if new_leg is not None else 0.0
+                suppress = True
+                logger.info(
+                    f"[GridEngine] BUY [{idx}] suppressed by stop-score gate "
+                    f"(sell fill at [{idx}] @ {fill.avg_price:.2f})"
+                )
             if suppress:
                 self._alerter_send(
-                    f"🛡 Buy [{buy_idx}] suppressed — stop-score gate active"
+                    f"🛡 Buy [{idx}] suppressed — stop-score gate active"
                 )
-            elif buy_lv is not None:
+            else:
                 if new_leg is not None:
-                    self._place_buy(buy_lv, qty_override=new_leg.qty,
+                    self._place_buy(lv, qty_override=new_leg.qty,
                                      closes_leg_id=new_leg.leg_id)
                 else:
-                    self._place_buy(buy_lv)
+                    self._place_buy(lv)
 
-            # ── Drift-shift: top-level sell → shift range up one spacing ──────
-            # If this fill was the top-level SELL, price has drifted above the
+            # ── Drift-shift: top-cell sell → shift range up one spacing ──────
+            # If this fill was the top-cell SELL, price has drifted above the
             # grid.  Shift the whole range up immediately via _trail_up so the
             # grid stays centred on price rather than accumulating all-long
             # exposure as the lower bound creeps toward the stop.
             if self._cfg.get("drift_shift_on_top_sell", True):
                 with self._lock:
                     is_top        = len(self._levels) > 0 and idx == len(self._levels) - 1
-                    current_lower = self._levels[0].price  if self._levels else 0.0
-                    current_upper = self._levels[-1].price if self._levels else 0.0
+                    # Structural grid boundaries — the fixed lower/upper of
+                    # the edge cells, NOT their transient .price (which now
+                    # moves between lower/upper as each cell cycles).
+                    current_lower = self._levels[0].lower  if self._levels else 0.0
+                    current_upper = self._levels[-1].upper if self._levels else 0.0
                     spacing       = self._params.spacing
                 if is_top:
                     min_interval = self._cfg.get("drift_shift_min_interval_s", 60)
@@ -4281,12 +4414,17 @@ class GridEngine:
             if target is None:
                 return False
             # Reset to IDLE before releasing the lock — _place_buy() will
-            # re-acquire the lock to set it to BUY_OPEN.
+            # re-acquire the lock to set it to BUY_OPEN. closes_leg_id/qty
+            # were preserved at suppression time (see _on_fill) — carry them
+            # through so a suppressed CLOSER is restored exactly, not
+            # silently replaced by a generic fresh-open order.
             target.state = LevelState.IDLE
+            tag_qty = target.qty if target.closes_leg_id is not None else None
+            tag_leg = target.closes_leg_id
 
-        self._place_buy(target)
+        self._place_buy(target, qty_override=tag_qty, closes_leg_id=tag_leg)
         logger.info(
-            f"[GridEngine] BUY [{target.index}] @ {target.price:.2f} "
+            f"[GridEngine] BUY [{target.index}] @ {target.lower:.2f} "
             f"released from SUPPRESSED (stop-score recovered)"
         )
         return True
@@ -4347,7 +4485,8 @@ class GridEngine:
         trend_risk: float = 0.0,
         effective_atr: float = 0.0,
         pending_since: Optional[Dict[int, float]] = None,
-    ) -> Tuple[Dict[int, int], List["OpenLeg"], set]:
+        zero_candidate_since: Optional[Dict[int, float]] = None,
+    ) -> Tuple[Dict[int, int], List["OpenLeg"], set, List["OpenLeg"]]:
         """
         Decide, for every currently-open leg, whether it still fits the
         just-rebuilt grid.
@@ -4371,8 +4510,21 @@ class GridEngine:
           time to either recover or genuinely confirm before paying for a
           market close.
         - No direction-correct closing level exists at all (leg's open
-          price is beyond every level in the required direction), OR it has
-          been flagged pending for >= reconcile_confirm_s and still isn't a
+          price is beyond every level in the required direction): this
+          leg has no cell to rest a closer on at all, so it can't be
+          assigned or held pending the way the cases above are. Unless
+          trend_risk is already urgent (immediate to_liquidate, same as a
+          confirmed-misfit clean/buffered leg), it's returned in the
+          fourth list (zero_candidate_pending) — this method still does
+          NOT act on it (no chase, no liquidation): GridBot._rebuild_grid
+          owns kicking off the stray-leg chase the first time a leg
+          appears here, and owns force-liquidating it once
+          zero_candidate_since shows it's been stranded for
+          >= reconcile_zero_candidate_max_dwell_s (that cap itself
+          shrinking toward 0 as trend_risk climbs toward
+          reconcile_urgent_trend_risk). See the "2026-08-03 16:35
+          incident" GRID_CONFIG comment block.
+        - Flagged pending (either kind) for too long and still not a
           clean fit: returned in the second list (to_liquidate). This
           method does NOT liquidate them itself — it only decides;
           GridBot._rebuild_grid executes the actual market close (real
@@ -4402,10 +4554,17 @@ class GridEngine:
         the caller (GridBot._leg_no_fit_since) across rebuilds, since a new
         GridEngine/leg set is reseeded from DB on every rebuild and can't
         hold dwell state itself.
+        zero_candidate_since: {leg_id: first-flagged-ts} for the zero-candidate
+        case specifically — owned and persisted by the caller
+        (GridBot._leg_zero_candidate_since), same reasoning as pending_since.
+        Kept as a separate map (not merged into pending_since) since the two
+        cases mean different things operationally: pending_since always has
+        a resting order in place while it waits; this one never does.
         """
         exclude_indices = exclude_indices or set()
         already_handled_leg_ids = already_handled_leg_ids or set()
         pending_since = pending_since or {}
+        zero_candidate_since = zero_candidate_since or {}
         with self._lock:
             legs = [leg for leg in self._open_legs.values()
                     if leg.leg_id not in already_handled_leg_ids]
@@ -4427,9 +4586,12 @@ class GridEngine:
         # a needless market liquidation. `levels` (filtered) is still what
         # candidate-selection below draws from, since those ARE the only
         # slots actually available to host a new closer.
-        lower   = all_levels[0].price
-        upper   = all_levels[-1].price
-        spacing = (upper - lower) / (len(all_levels) - 1) if len(all_levels) > 1 else 0.0
+        # Structural boundaries: fixed lower/upper of the edge cells, not
+        # their transient .price. len(all_levels) is now the CELL count
+        # directly (one spacing per cell, not per-point), so no -1.
+        lower   = all_levels[0].lower
+        upper   = all_levels[-1].upper
+        spacing = (upper - lower) / len(all_levels) if all_levels else 0.0
 
         max_buffer_mult = self._cfg.get("reconcile_buffer_atr_mult", 1.5)
         confirm_s       = self._cfg.get("reconcile_confirm_s", 1800.0)
@@ -4438,11 +4600,37 @@ class GridEngine:
         buffer = (max_buffer_mult * effective_atr * max(0.0, 1.0 - trend_risk)
                   if effective_atr > 0 else 0.0)
 
+        # Urgent bypass — mirrors the stop-raise system's own urgent gate:
+        # trend_risk at/above this is strong, real evidence of a genuine
+        # move, so skip any dwell/wait and evict immediately. Computed once
+        # up front since both the buffered-fit case below and the
+        # zero-candidate case use the exact same threshold.
+        urgent_threshold = self._cfg.get(
+            "reconcile_urgent_trend_risk",
+            self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+        )
+        # Zero-candidate dwell cap: full reconcile_zero_candidate_max_dwell_s
+        # at trend_risk=0, linearly down to 0 at urgent_threshold — a leg
+        # stranded during a strong, confirmed move gets barely any
+        # unmanaged wait; one stranded during flat/noisy conditions gets
+        # close to the full cap. See the "2026-08-03 16:35 incident"
+        # GRID_CONFIG comment block.
+        zc_max_dwell = self._cfg.get("reconcile_zero_candidate_max_dwell_s", 900.0)
+        zc_dwell_cap = (zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
+                        if urgent_threshold > 0 else 0.0)
+
         assignments:   Dict[int, int] = {}
         claimed:       set            = set()
         to_liquidate:  List[OpenLeg]  = []
         still_pending: set            = set()
+        zero_candidate_pending: List[OpenLeg] = []
         now = time.time()
+
+        def _closer_price(lv: "GridLevel", leg: "OpenLeg") -> float:
+            # The price THIS cell would actually place the leg's closer at
+            # — its upper boundary for a BUY-opened leg (closes via SELL),
+            # its lower boundary for a SELL-opened leg (closes via BUY).
+            return lv.upper if leg.open_side == "BUY" else lv.lower
 
         def _candidates(leg: "OpenLeg") -> Tuple[float, List["GridLevel"]]:
             if leg.open_side == "BUY":
@@ -4451,11 +4639,11 @@ class GridEngine:
                 # didn't ask for.
                 tgt = leg.open_price + spacing if spacing > 0 else leg.open_price
                 cands = [lv for lv in levels
-                         if lv.index not in claimed and lv.price > leg.open_price]
+                         if lv.index not in claimed and lv.upper > leg.open_price]
             else:
                 tgt = leg.open_price - spacing if spacing > 0 else leg.open_price
                 cands = [lv for lv in levels
-                         if lv.index not in claimed and lv.price < leg.open_price]
+                         if lv.index not in claimed and lv.lower < leg.open_price]
             return tgt, cands
 
         # Oldest-opened first within each pass: whichever position has been
@@ -4478,7 +4666,7 @@ class GridEngine:
                 # pre-existing behaviour.
                 to_liquidate.append(leg)
                 continue
-            best = min(candidates, key=lambda lv: abs(lv.price - target))
+            best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
             claimed.add(best.index)
             assignments[best.index] = leg.leg_id
 
@@ -4489,9 +4677,38 @@ class GridEngine:
                 # structurally stranded (e.g. a long opened well above a
                 # grid that has since dropped entirely below it), or every
                 # remaining level was already claimed by a clean fit above.
-                # Dwelling cannot produce a level that isn't there;
-                # liquidate now regardless of buffer/confirm state.
-                to_liquidate.append(leg)
+                # There's no cell to hold a resting closer on regardless of
+                # trend_risk, so this can never be a clean/buffered
+                # assignment — but unless trend_risk is already urgent, it
+                # no longer means an instant market close either. See the
+                # "2026-08-03 16:35 incident" GRID_CONFIG comment block.
+                if trend_risk >= urgent_threshold:
+                    logger.info(
+                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate + "
+                        f"urgent trend_risk={trend_risk:.2f} >= "
+                        f"{urgent_threshold:.2f} — liquidating now"
+                    )
+                    to_liquidate.append(leg)
+                    continue
+
+                first_zc = zero_candidate_since.get(leg.leg_id)
+                if first_zc is not None and (now - first_zc) >= zc_dwell_cap:
+                    logger.info(
+                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate for "
+                        f"{now - first_zc:.0f}s >= dwell cap {zc_dwell_cap:.0f}s "
+                        f"(trend_risk={trend_risk:.2f}) — liquidating"
+                    )
+                    to_liquidate.append(leg)
+                    continue
+
+                logger.info(
+                    f"[GridEngine] Leg #{leg.leg_id} zero-candidate "
+                    f"(open={leg.open_price:.2f}, range=[{lower:.2f},"
+                    f"{upper:.2f}]) — no cell to hold a closer on, "
+                    f"trend_risk={trend_risk:.2f}, dwell cap {zc_dwell_cap:.0f}s "
+                    f"({'starting now' if first_zc is None else f'{now - first_zc:.0f}s elapsed'})"
+                )
+                zero_candidate_pending.append(leg)
                 continue
 
             buffered_fit = buffer > 0 and (lower - buffer) <= leg.open_price <= (upper + buffer)
@@ -4502,21 +4719,11 @@ class GridEngine:
                     f"trend_risk-scaled buffer ({buffer:.2f}, trend_risk="
                     f"{trend_risk:.2f}) — tolerated, no dwell started"
                 )
-                best = min(candidates, key=lambda lv: abs(lv.price - target))
+                best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
                 claimed.add(best.index)
                 assignments[best.index] = leg.leg_id
                 continue
 
-            # Urgent bypass — mirrors the stop-raise system's own urgent
-            # gate (mechanism #4): trend_risk at/above this threshold means
-            # strong, real evidence of a genuine move, so skip the
-            # confirm-dwell and evict immediately, same as pre-fix
-            # behaviour. Without this, even a confirmed trend_risk=1.0
-            # decline would get one free cycle of tentative re-anchoring.
-            urgent_threshold = self._cfg.get(
-                "reconcile_urgent_trend_risk",
-                self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
-            )
             if trend_risk >= urgent_threshold:
                 logger.info(
                     f"[GridEngine] Leg #{leg.leg_id} misfit + urgent "
@@ -4546,19 +4753,20 @@ class GridEngine:
                 f"{confirm_s:.0f}s before liquidating "
                 f"({'new candidate' if first_seen is None else f'{now - first_seen:.0f}s elapsed'})"
             )
-            best = min(candidates, key=lambda lv: abs(lv.price - target))
+            best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
             claimed.add(best.index)
             assignments[best.index] = leg.leg_id
             still_pending.add(leg.leg_id)
 
-        if assignments or to_liquidate:
+        if assignments or to_liquidate or zero_candidate_pending:
             logger.info(
                 f"[GridEngine] reconcile_open_legs: {len(assignments)} leg(s) "
                 f"re-anchored to the rebuilt grid ({len(still_pending)} still "
-                f"pending confirm), {len(to_liquidate)} liquidating "
+                f"pending confirm), {len(to_liquidate)} liquidating, "
+                f"{len(zero_candidate_pending)} zero-candidate pending "
                 f"(new range=[{lower:.2f},{upper:.2f}])"
             )
-        return assignments, to_liquidate, still_pending
+        return assignments, to_liquidate, still_pending, zero_candidate_pending
 
     def apply_leg_reassignments(self, assignments: Dict[int, int]) -> None:
         """
@@ -4580,6 +4788,11 @@ class GridEngine:
                     f"untargeted until the next rebuild's reconciliation."
                 )
                 continue
+            # This cell is being repurposed to host leg's closer — its
+            # future identity (what it re-opens as, once this leg's closer
+            # fills) now follows the leg, not whatever it might have been
+            # before reconciliation.
+            lv.open_side = leg.open_side
             if leg.open_side == "BUY":
                 self._place_sell(lv, qty_override=leg.qty, closes_leg_id=leg.leg_id)
             else:
@@ -5511,6 +5724,23 @@ class GridStateStore:
             self._conn.execute("DELETE FROM open_legs WHERE leg_id = ?", (leg_id,))
             self._conn.commit()
 
+    def reduce_leg_qty(self, leg_id: int, new_qty: float) -> None:
+        """
+        Persist a partial close in place: shrink an open leg's remaining
+        qty rather than deleting it. Used when a leg is being closed
+        across multiple partial fills (see
+        GridBot._chase_close_leg_worker's chase-attempt partial-fill
+        handling) — the leg is still open, just for less than it
+        originally was, so a plain process restart re-seeding
+        GridEngine._open_legs from this table must see the reduced
+        amount, not the pre-partial original (which would overstate
+        actual exposure and mis-size the next closing order).
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE open_legs SET qty = ? WHERE leg_id = ?", (new_qty, leg_id))
+            self._conn.commit()
+
     def rollback(self) -> None:
         """
         Discard any uncommitted statements on the shared connection.
@@ -6059,6 +6289,11 @@ class GridBot:
         # across rebuilds to accumulate real wall-clock dwell time. Mirrors
         # _pending_raise_candidate/_pending_raise_since above.
         self._leg_no_fit_since: Dict[int, float] = {}
+        # Same idea, separate map, for the zero-candidate case (no cell to
+        # rest a closer on at all — see reconcile_open_legs). Kept apart
+        # from _leg_no_fit_since since the two dwell caps and the
+        # first-time-seen bookkeeping (kick off a chase) differ.
+        self._leg_zero_candidate_since: Dict[int, float] = {}
 
         self._oms = OMS(
             api_key      = config.get("api_key", ""),
@@ -7405,6 +7640,13 @@ class GridBot:
                     "exchange_id":      exchange_id,
                     "qty":              lv.qty,
                     "placed_at":        lv.placed_at,
+                    # This cell's fixed identity (2026-08-03 cell restructure)
+                    # — see GridLevel.open_side. Older snapshots won't have
+                    # this key; _apply_handoff_restore derives it from
+                    # state+closes_leg_id when absent, so it's included here
+                    # for explicitness/debuggability, not because restore
+                    # strictly depends on it.
+                    "open_side":        lv.open_side,
                     # Needed so a restored order's eventual fill still closes
                     # the SAME OpenLeg it was the designated closer for — see
                     # GridEngine._on_fill and GridBot._apply_handoff_restore.
@@ -7505,19 +7747,31 @@ class GridBot:
         """
         Decide which of a pending handoff snapshot's open orders can be kept
         in place on the grid we're about to build, vs which no longer
-        correspond to any level in it and must be treated as orphans
+        correspond to any cell in it and must be treated as orphans
         (cancelled, replaced by a fresh order instead).
 
-        Matching is done by PRICE, not by index. If the auto-tuner's freshly
-        computed lower/upper/spacing shift the level count at either edge
-        (e.g. one extra level because the range widened slightly), index-based
-        matching would misalign every single level even though most of the
-        actual price points are unchanged. Matching by price keeps as much of
-        the previous grid — and as many of the peer's still-live orders — as
-        possible; only levels whose price genuinely no longer exists in the
-        newly computed grid get cancelled and recreated fresh. This directly
-        implements "keep the previous grid as much as possible, but rebuild
-        whatever the new params actually changed."
+        2026-08-03: matches by (price, SIDE), not price alone. Under the
+        cell restructure a BUY always rests at a cell's lower boundary and
+        a SELL always at its upper (see GridLevel docstring) — so a BUY
+        snapshot entry is matched against {cell.lower: cell.index} and a
+        SELL entry against {cell.upper: cell.index}, using the cell
+        boundaries new_params would build (mirrors GridEngine._build_levels'
+        own pairing of consecutive level_prices, without needing a live
+        engine yet — this runs before the new GridEngine is constructed).
+        Side disambiguation matters because adjacent cells legitimately
+        share a boundary price with opposite-side orders resting there at
+        once (cell k-1's SELL-closer and cell k's own BUY-opener, say) —
+        collapsing both onto one flat price->index map, as the pre-cell-
+        restructure version of this method did, would let one silently
+        clobber the other's slot in `claimed`.
+
+        Matching is done by price (not the snapshot's old point-based
+        index), for the same reason as before: if the auto-tuner's freshly
+        computed lower/upper/spacing shift the grid at either edge, price
+        matching keeps as much of the previous grid — and as many of the
+        peer's still-live orders — as possible, while index matching would
+        misalign everything even though most actual price points are
+        unchanged.
 
         Called from _rebuild_grid() BEFORE the new GridEngine/its orders are
         created, so the result can tell GridEngine.start() which indices to
@@ -7526,9 +7780,15 @@ class GridBot:
         snap = self._pending_handoff_snapshot
         assert snap is not None
 
-        new_prices = new_params.level_prices  # index-aligned
-        price_to_new_idx: Dict[str, int] = {
-            f"{p:.2f}": i for i, p in enumerate(new_prices)
+        new_prices = new_params.level_prices   # N+1 boundary points
+        n_cells    = len(new_prices) - 1
+        # A BUY always rests at a cell's LOWER boundary (new_prices[i]); a
+        # SELL always at a cell's UPPER boundary (new_prices[i+1]).
+        buy_price_to_cell:  Dict[str, int] = {
+            f"{new_prices[i]:.2f}": i for i in range(n_cells)
+        }
+        sell_price_to_cell: Dict[str, int] = {
+            f"{new_prices[i + 1]:.2f}": i for i in range(n_cells)
         }
 
         restore_plan: Dict[int, dict] = {}
@@ -7540,7 +7800,8 @@ class GridBot:
             if state_str not in ("BUY_OPEN", "SELL_OPEN"):
                 continue  # nothing to restore or orphan for an idle snapshot level
 
-            new_idx = price_to_new_idx.get(f"{snap_lv['price']:.2f}")
+            lookup  = buy_price_to_cell if state_str == "BUY_OPEN" else sell_price_to_cell
+            new_idx = lookup.get(f"{snap_lv['price']:.2f}")
             if new_idx is None or new_idx in claimed:
                 orphans.append(snap_lv)
                 continue
@@ -7589,8 +7850,22 @@ class GridBot:
                 lv.state         = LevelState(state_str)
                 lv.client_oid    = snap_lv["client_oid"]
                 lv.qty           = snap_lv["qty"]
+                lv.price         = snap_lv["price"]
                 lv.placed_at     = snap_lv.get("placed_at", time.time())
                 lv.closes_leg_id = snap_lv.get("closes_leg_id")
+                # This cell's fixed identity (see GridLevel.open_side).
+                # Explicit in snapshots from this version onward; for an
+                # older snapshot without the key, derive it: a cell only
+                # ever closes on the side OPPOSITE how it opens, so an
+                # untagged restored order IS its own open_side, and a
+                # tagged one is the opposite of whatever side it's
+                # currently resting.
+                open_side = snap_lv.get("open_side")
+                if open_side is None:
+                    resting_side = "BUY" if state_str == "BUY_OPEN" else "SELL"
+                    open_side = (resting_side if lv.closes_leg_id is None
+                                 else ("SELL" if resting_side == "BUY" else "BUY"))
+                lv.open_side = open_side
 
             restored_long_qty = self._engine._long_qty
 
@@ -7960,8 +8235,35 @@ class GridBot:
                 f"{leg.qty:.4f} BTC ({leg.open_side} @ {leg.open_price:.2f}) "
                 f"may still be open. MANUAL CHECK RECOMMENDED."
             )
+            # Release from _chasing_leg_ids (a harmless no-op if this leg
+            # never went through the chase path — e.g. reconcile's own
+            # rebuild-reprice caller). If it DID come via
+            # _chase_close_leg_worker's exhausted-attempts fallback, this
+            # is the one path where a fully-failed close would otherwise
+            # sit invisible to both the chase (which already gave up) and
+            # the orphan-leg rebuild safety net (suppressed while
+            # "chasing") forever. Let the safety net see it again.
+            if self._engine is not None:
+                with self._engine._lock:
+                    self._engine._chasing_leg_ids.discard(leg.leg_id)
             return False
 
+        self._finalize_leg_close(leg, fill, close_side, reason,
+                                  log_verb="liquidated",
+                                  alert_label="Leg closed at rebuild")
+        return True
+
+    def _finalize_leg_close(self, leg: "OpenLeg", fill: "FillEvent",
+                             close_side: str, reason: str,
+                             log_verb: str = "closed",
+                             alert_label: str = "Leg closed") -> None:
+        """
+        Shared bookkeeping for a leg-closing fill, regardless of how the
+        closing order was worked (market liquidation vs a chased
+        POST_ONLY fill): PnL calc, record_fill, close_leg, pop from
+        _open_legs, alert. Caller has already confirmed fill.is_filled.
+        """
+        tag = f"[{reason}]"
         if leg.open_side == "BUY":
             gross_pnl = (fill.avg_price - leg.open_price) * fill.filled_qty
         else:
@@ -7969,7 +8271,7 @@ class GridBot:
         net_pnl = gross_pnl - fill.fee
 
         logger.warning(
-            f"[GridBot]{tag} Leg #{leg.leg_id} liquidated: {close_side} "
+            f"[GridBot]{tag} Leg #{leg.leg_id} {log_verb}: {close_side} "
             f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f} | "
             f"gross={gross_pnl:+.4f} net={net_pnl:+.4f} USD"
         )
@@ -7985,13 +8287,13 @@ class GridBot:
             ))
             if not ok_rf:
                 # Same category as _on_fill's record_fill escalation: the
-                # market order already executed for real, so in-memory
-                # accounting (and the close_leg removal below) is what
-                # matters and isn't affected — only this fill's grid_fills
-                # row and daily_pnl contribution are missing.
+                # order already executed for real, so in-memory accounting
+                # (and the close_leg removal below) is what matters and
+                # isn't affected — only this fill's grid_fills row and
+                # daily_pnl contribution are missing.
                 logger.critical(
                     f"[GridBot]{tag} PERSISTENT record_fill FAILURE for leg "
-                    f"#{leg.leg_id} liquidation {close_side} "
+                    f"#{leg.leg_id} {log_verb} {close_side} "
                     f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f} "
                     f"gross={gross_pnl:+.4f} after retries: {err_rf}. "
                     f"AUDIT-TRAIL GAP: leg is correctly closed in memory/DB, "
@@ -8001,7 +8303,7 @@ class GridBot:
                 )
                 self._alerter.send(
                     f"⚠️ record_fill DB write failed for leg #{leg.leg_id} "
-                    f"liquidation ({reason}) after retries — see log. Leg is "
+                    f"{log_verb} ({reason}) after retries — see log. Leg is "
                     f"correctly closed; only its PnL record is missing."
                 )
 
@@ -8010,9 +8312,9 @@ class GridBot:
             if not ok_cl:
                 # Mirrors _on_fill's close_leg escalation exactly — this leg
                 # is about to be popped from _engine._open_legs below
-                # regardless (it's genuinely closed, real market order,
-                # real fill), so the risk is purely that the DB still shows
-                # it open and a future rebuild/restart re-seeds and
+                # regardless (it's genuinely closed, real order, real
+                # fill), so the risk is purely that the DB still shows it
+                # open and a future rebuild/restart re-seeds and
                 # double-counts it.
                 logger.critical(
                     f"[GridBot]{tag} PERSISTENT close_leg FAILURE for leg "
@@ -8033,14 +8335,270 @@ class GridBot:
         if self._engine is not None:
             with self._engine._lock:
                 self._engine._open_legs.pop(leg.leg_id, None)
+                self._engine._chasing_leg_ids.discard(leg.leg_id)
 
         self._alerter.send(
-            f"🔁 Leg closed at rebuild ({reason})\n"
+            f"🔁 {alert_label} ({reason})\n"
             f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
             f"(opened {leg.open_side} @ {leg.open_price:.2f}) | "
             f"realized {gross_pnl:+.4f} USD"
         )
-        return True
+
+    def _record_partial_leg_close(self, leg: "OpenLeg", fill: "FillEvent",
+                                   close_side: str, reason: str) -> None:
+        """
+        Persist one partial-fill chunk of an in-progress chase close (an
+        attempt that filled some but not all of its qty before its
+        maker-timeout cancelled the rest — see _handle_order_update's
+        CANCELED branch, which reports the real filled_qty/avg_price/fee
+        for that chunk).
+
+        This chunk's PnL is real and permanent regardless of what
+        happens to the rest, so it's recorded the same way a full close
+        is — via record_fill — but leg is NOT closed/popped here: it
+        stays in _open_legs/DB, just for less qty. leg.qty is shrunk in
+        place (both the in-memory OpenLeg and the DB row via
+        reduce_leg_qty) so every downstream consumer of "how much of
+        this leg is still open" — the next chase attempt's order size,
+        the eventual market-fallback qty, _long_qty/stats, and a
+        mid-chase process restart re-seeding from DB — sees only what's
+        actually left, not the pre-partial original.
+        """
+        tag = f"[{reason}]"
+        if leg.open_side == "BUY":
+            gross_pnl = (fill.avg_price - leg.open_price) * fill.filled_qty
+        else:
+            gross_pnl = (leg.open_price - fill.avg_price) * fill.filled_qty
+
+        if self._store is not None:
+            ok, err = self._store.execute_with_retry(lambda: self._store.record_fill(
+                ts_utc=time.time(), side=close_side, level_idx=-1,
+                price_usd=fill.avg_price, qty_btc=fill.filled_qty,
+                fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
+                is_liquidation=False, leg_id=leg.leg_id,
+                close_reason=reason,
+                # is_close=False: this chunk does NOT close the leg — it
+                # stays in _open_legs/DB with qty shrunk (see below), so it
+                # must not add to daily_pnl.cycle_count. Whichever call
+                # actually finishes the leg (_finalize_leg_close, reached
+                # via a full chase fill or the market fallback) is the one
+                # is_close=True call for this leg, so the leg contributes
+                # exactly one cycle in total no matter how many partial
+                # chunks it took to close it. gross_pnl_usd/fees_usd/
+                # fill_count aren't gated on is_close, so this chunk's real
+                # PnL and fee are still counted here as before.
+                is_close=False,
+            ))
+            if not ok:
+                logger.critical(
+                    f"[GridBot]{tag} PERSISTENT record_fill FAILURE for leg "
+                    f"#{leg.leg_id} PARTIAL chase-close {fill.filled_qty:.4f} "
+                    f"@ {fill.avg_price:.2f} gross={gross_pnl:+.4f} after "
+                    f"retries: {err}. This chunk already executed for real "
+                    f"— only its grid_fills row and daily_pnl contribution "
+                    f"are missing.",
+                    exc_info=err,
+                )
+                self._alerter.send(
+                    f"⚠️ record_fill DB write failed for leg #{leg.leg_id} "
+                    f"partial chase-close ({reason}) after retries — see log."
+                )
+
+        leg.qty = max(0.0, leg.qty - fill.filled_qty)
+        if self._store is not None:
+            ok_r, err_r = self._store.execute_with_retry(
+                lambda: self._store.reduce_leg_qty(leg.leg_id, leg.qty))
+            if not ok_r:
+                logger.critical(
+                    f"[GridBot]{tag} PERSISTENT reduce_leg_qty FAILURE for "
+                    f"leg #{leg.leg_id} after retries: {err_r}. In-memory "
+                    f"qty is correct ({leg.qty:.4f} BTC remaining) but the "
+                    f"open_legs DB row still shows the pre-partial amount — "
+                    f"a restart before this is fixed would re-seed the "
+                    f"stale, larger qty.",
+                    exc_info=err_r,
+                )
+                self._alerter.send(
+                    f"🚨 reduce_leg_qty DB write failed for leg #{leg.leg_id} "
+                    f"({reason}) after retries — see log. Restart risk: a "
+                    f"stale, larger qty would be re-seeded."
+                )
+
+        self._alerter.send(
+            f"🔁 Leg partially closed via chase ({reason})\n"
+            f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
+            f"(opened {leg.open_side} @ {leg.open_price:.2f}) | "
+            f"realized {gross_pnl:+.4f} USD | {leg.qty:.4f} BTC remaining"
+        )
+
+    def _chase_close_leg(self, leg: "OpenLeg", reason: str) -> None:
+        """
+        stray_leg_fn — called by GridEngine (from _trail_up/_trail_down,
+        inside its tick path) when trailing drops a cell that was holding
+        leg's designated closer. Must return immediately: it only spawns
+        the worker thread and does no I/O itself, since the caller's tick
+        loop (and every other level's fill processing behind it) is
+        waiting on this call to return.
+        """
+        threading.Thread(
+            target=self._chase_close_leg_worker, args=(leg, reason),
+            name=f"LegChase-{leg.leg_id}", daemon=True).start()
+
+    def _chase_close_leg_worker(self, leg: "OpenLeg", reason: str) -> None:
+        """
+        Close a leg that trailing dropped from the cell grid, without
+        paying the market/taker cost immediately — trailing is routine
+        drift, not an emergency, so it doesn't warrant one (unlike
+        _emergency_halt's stop-loss liquidation).
+
+        Repeats up to leg_chase_max_attempts times: POST_ONLY at the
+        current best bid/ask on the closing side (joining the touch,
+        not resting back at the old cell boundary — price has already
+        trailed away from that boundary, that's WHY this leg is here),
+        left resting for leg_chase_wait_s via OrderRequest.maker_timeout_s
+        (overriding OMS's default 30s grid-cell maker timeout — see
+        OrderRequest.maker_timeout_s; currently the two happen to match,
+        but this stays explicit since they're conceptually independent
+        knobs). Each unfilled attempt reprices against a fresh quote
+        before retrying. Falls back to a market close via
+        _liquidate_leg_at_market once the attempt budget is exhausted —
+        EXCEPT for reason="rebuild_reprice_pending" (a zero-candidate leg
+        from reconcile_open_legs, see GridBot._rebuild_grid and the
+        "2026-08-03 16:35 incident" GRID_CONFIG comment block): that case
+        re-checks trend_risk and the zero-candidate dwell cap first, and
+        only liquidates if either has actually run out — otherwise it's
+        released back into the unmanaged wait for the next rebuild to
+        re-evaluate.
+
+        leg.qty IS the remaining-to-close amount throughout — a partial
+        fill on any attempt (delivered as a CANCELLED FillEvent carrying
+        the real filled_qty when that attempt's maker timeout cancels
+        the unfilled rest — see _handle_order_update) shrinks it in
+        place via _record_partial_leg_close, durably, before the next
+        attempt or the market fallback ever reads it. Nothing here
+        reposts more than what's actually still open.
+        """
+        close_side    = "SELL" if leg.open_side == "BUY" else "BUY"
+        max_attempts  = int(self._cfg.get("leg_chase_max_attempts", 3))
+        wait_s        = float(self._cfg.get("leg_chase_wait_s", 30.0))
+        tag           = f"[{reason}]"
+
+        for attempt in range(1, max_attempts + 1):
+            if leg.qty <= 0:
+                # A prior attempt's partial fill already closed it in full.
+                logger.info(
+                    f"[GridBot]{tag} Leg #{leg.leg_id} fully closed via "
+                    f"accumulated chase partials — nothing left to chase"
+                )
+                return
+
+            bid, ask, _mid = _price_cache.get_l1()
+            if bid is None or ask is None:
+                logger.warning(
+                    f"[GridBot]{tag} Leg #{leg.leg_id} chase attempt "
+                    f"{attempt}/{max_attempts}: no live L1 quote — retrying shortly"
+                )
+                time.sleep(min(wait_s, 5.0))
+                continue
+
+            # Join the touch on the closing side — never cross (POST_ONLY
+            # would reject/requote if it did).
+            price = bid if close_side == "BUY" else ask
+            qty   = leg.qty   # snapshot: what's still open right now
+            req = OrderRequest.limit_maker(
+                side=close_side, qty=qty, price=price,
+                instrument=INSTRUMENT, purpose="leg_chase",
+                maker_timeout_s=wait_s)
+            logger.info(
+                f"[GridBot]{tag} Leg #{leg.leg_id} chase attempt "
+                f"{attempt}/{max_attempts}: POST_ONLY {close_side} "
+                f"{qty:.4f} @ {price:.2f}, resting up to {wait_s:.0f}s"
+            )
+            self._oms.submit(req)
+            fill = self._oms.wait_fill(req.client_oid, timeout=wait_s + 10.0)
+
+            if fill and fill.is_filled:
+                self._finalize_leg_close(leg, fill, close_side, reason,
+                                          log_verb="chase-filled",
+                                          alert_label="Leg closed via chase")
+                return
+
+            if fill and fill.filled_qty > 0:
+                # Cancelled at the maker timeout, but part of it filled
+                # first — shrink leg.qty by exactly that much before the
+                # next attempt sizes its order.
+                self._record_partial_leg_close(leg, fill, close_side, reason)
+                logger.info(
+                    f"[GridBot]{tag} Leg #{leg.leg_id} chase attempt "
+                    f"{attempt} partially filled {fill.filled_qty:.4f} @ "
+                    f"{fill.avg_price:.2f} — {leg.qty:.4f} BTC remaining, "
+                    f"repricing and retrying"
+                )
+                continue
+
+            logger.info(
+                f"[GridBot]{tag} Leg #{leg.leg_id} chase attempt "
+                f"{attempt}/{max_attempts} unfilled — repricing and retrying"
+            )
+
+        if leg.qty <= 0:
+            return  # closed in full across partials during the loop above
+
+        if reason == "rebuild_reprice_pending":
+            urgent_threshold = self._cfg.get(
+                "reconcile_urgent_trend_risk",
+                self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+            )
+            zc_max_dwell = self._cfg.get("reconcile_zero_candidate_max_dwell_s", 900.0)
+            trend_risk = 0.0
+            if self._stop_scorer is not None:
+                _bid, _ask, mid = _price_cache.get_l1()
+                if mid is not None:
+                    trend_risk = self._stop_scorer.compute_trend_risk(
+                        mid, self._effective_trend_regime(), self._last_trend_slope_pct
+                    )
+            zc_dwell_cap = (zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
+                            if urgent_threshold > 0 else 0.0)
+            started = self._leg_zero_candidate_since.get(leg.leg_id, time.time())
+            elapsed = time.time() - started
+
+            if trend_risk < urgent_threshold and elapsed < zc_dwell_cap:
+                # Neither the trend nor the dwell cap has actually run out
+                # — release it back into the unmanaged wait rather than
+                # paying for a market close. It stays fully tracked in
+                # _open_legs with no resting order; the next rebuild's
+                # reconcile_open_legs re-checks it (a real candidate cell
+                # may simply reappear by then) and re-applies the same
+                # cap check against the current trend_risk.
+                with self._engine._lock:
+                    self._engine._chasing_leg_ids.discard(leg.leg_id)
+                logger.info(
+                    f"[GridBot]{tag} Leg #{leg.leg_id} chase exhausted "
+                    f"({max_attempts} attempts, {wait_s:.0f}s each) but "
+                    f"trend_risk={trend_risk:.2f} < {urgent_threshold:.2f} "
+                    f"and only {elapsed:.0f}s/{zc_dwell_cap:.0f}s of the "
+                    f"dwell cap used — holding with no resting order, "
+                    f"re-evaluated at the next rebuild"
+                )
+                return
+
+            logger.warning(
+                f"[GridBot]{tag} Leg #{leg.leg_id} chase exhausted AND "
+                f"(trend_risk={trend_risk:.2f} >= {urgent_threshold:.2f} "
+                f"or dwell cap {zc_dwell_cap:.0f}s used up after "
+                f"{elapsed:.0f}s) — falling back to a market close for "
+                f"the {leg.qty:.4f} BTC remaining"
+            )
+            self._liquidate_leg_at_market(leg, reason=f"{reason}_chase_exhausted")
+            return
+
+        logger.warning(
+            f"[GridBot]{tag} Leg #{leg.leg_id} not filled after "
+            f"{max_attempts} POST_ONLY attempt(s) ({wait_s:.0f}s each) — "
+            f"falling back to a market close for the {leg.qty:.4f} BTC "
+            f"remaining"
+        )
+        self._liquidate_leg_at_market(leg, reason=f"{reason}_chase_exhausted")
 
     def _update_pending_raise(self, candidate_stop: float, noise_tolerance: float = 0.0) -> bool:
         """
@@ -8554,11 +9112,50 @@ class GridBot:
 
             restore_plan, orphans = self._match_handoff_levels(new_params)
 
+        # Carry chasing-leg protection across the engine-instance swap.
+        # A stray-leg chase (_chase_close_leg_worker) runs in its own
+        # background thread and does NOT pause for a rebuild — it can still
+        # be in flight against the OLD engine when THIS rebuild fires for a
+        # completely unrelated reason (boundary breach, regime change,
+        # one-sided detector, periodic interval; none of those wait on a
+        # chase either). Without this, the new GridEngine() below starts
+        # with an empty _chasing_leg_ids and has no way to know a leg it's
+        # about to reconcile is already being independently worked by that
+        # live thread — reconcile_open_legs would assign it a fresh closer
+        # cell (or liquidate it) right out from under the chase, and
+        # whichever one fills second finds the leg already gone: a genuine
+        # double-close / untracked-position race. Read under the OLD
+        # engine's own lock since _chasing_leg_ids is mutated from other
+        # threads too (chase completion in _finalize_leg_close /
+        # _liquidate_leg_at_market, which always act on whatever
+        # self._engine currently is — safe on their own, since the
+        # underlying ledger is the shared DB, not this specific instance;
+        # it's only reconcile's fresh-assignment side that needed this fix).
+        carried_chasing_leg_ids: set = set()
+        if self._engine is not None:
+            with self._engine._lock:
+                carried_chasing_leg_ids = set(self._engine._chasing_leg_ids)
+
         self._engine = GridEngine(
             params=new_params, oms=self._oms,
             instrument=INSTRUMENT, config=self._cfg,
             store=self._store,
-            buy_gate_fn=_buy_gate)
+            buy_gate_fn=_buy_gate,
+            stray_leg_fn=self._chase_close_leg)
+        if carried_chasing_leg_ids:
+            # update(), not assignment — defensive against a concurrent
+            # chase-completion discard landing in this same window; never
+            # clobber, only add. Under the lock for the same reason as the
+            # capture above.
+            with self._engine._lock:
+                self._engine._chasing_leg_ids.update(carried_chasing_leg_ids)
+            logger.info(
+                f"[GridBot] Carried {len(carried_chasing_leg_ids)} in-flight "
+                f"chase(s) across rebuild: leg(s) "
+                f"{sorted(carried_chasing_leg_ids)} — excluded from this "
+                f"rebuild's reconciliation and the new engine's one-sided "
+                f"detector until their chase finishes."
+            )
 
         # ── Reconcile every still-open leg against the grid we just built ────
         # _open_legs was just seeded from DB inside GridEngine.__init__ above,
@@ -8566,11 +9163,14 @@ class GridBot:
         # was tracking a moment ago) and, incidentally, a plain process
         # restart (since the ledger lives in the DB, not memory). Legs a
         # handoff snapshot already re-attached (restore_plan) are excluded —
-        # see _apply_handoff_restore's closes_leg_id restoration below.
+        # see _apply_handoff_restore's closes_leg_id restoration below. Legs
+        # under an in-flight stray-leg chase are excluded too (see
+        # carried_chasing_leg_ids above) — reconcile is not the right tool
+        # for something _chase_close_leg_worker is already actively closing.
         already_handled_leg_ids = {
             snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
             if snap_lv.get("closes_leg_id") is not None
-        }
+        } | carried_chasing_leg_ids
         # Same trend_risk score already used to gate the dead-band stop
         # raise above — reused here (not recomputed) so a leg's misfit
         # tolerance and the stop's raise aggressiveness always agree on
@@ -8580,13 +9180,14 @@ class GridBot:
             reconcile_trend_risk = self._stop_scorer.compute_trend_risk(
                 mid, self._effective_trend_regime(), self._last_trend_slope_pct
             )
-        leg_assignments, legs_to_liquidate, still_pending_leg_ids = (
+        leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs = (
             self._engine.reconcile_open_legs(
                 exclude_indices=set(restore_plan.keys()),
                 already_handled_leg_ids=already_handled_leg_ids,
                 trend_risk=reconcile_trend_risk,
                 effective_atr=new_params.effective_atr,
                 pending_since=self._leg_no_fit_since,
+                zero_candidate_since=self._leg_zero_candidate_since,
             )
         )
         # Maintain the dwell dict across rebuilds: start the clock the
@@ -8600,6 +9201,51 @@ class GridBot:
         for leg_id in list(self._leg_no_fit_since.keys()):
             if leg_id not in still_pending_leg_ids:
                 del self._leg_no_fit_since[leg_id]
+
+        # Same bookkeeping for the zero-candidate dwell map, plus: the
+        # very first time a leg shows up here, kick off the stray-leg
+        # chase for it (a shot at a decent price before it settles into
+        # the unmanaged wait) — mirrors exactly how _trail_up/_trail_down
+        # hand a dropped leg to the same chase mechanism. Guarded on
+        # "not already chasing" so a leg that recovers, goes stranded
+        # again, and is still mid-chase from the first time doesn't get a
+        # second chase spawned on top of the first.
+        zero_candidate_ids = {leg.leg_id for leg in zero_candidate_legs}
+        for leg in zero_candidate_legs:
+            if leg.leg_id in self._leg_zero_candidate_since:
+                continue  # already dwelling from a prior rebuild
+            self._leg_zero_candidate_since[leg.leg_id] = now_ts
+            with self._engine._lock:
+                already_chasing = leg.leg_id in self._engine._chasing_leg_ids
+                if not already_chasing:
+                    self._engine._chasing_leg_ids.add(leg.leg_id)
+            if not already_chasing:
+                logger.info(
+                    f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
+                    f"rebuild (open={leg.open_price:.2f}) — handing off to "
+                    f"stray-leg chase for a shot at a decent price before "
+                    f"settling into the unmanaged wait."
+                )
+                self._chase_close_leg(leg, reason="rebuild_reprice_pending")
+        for leg_id in list(self._leg_zero_candidate_since.keys()):
+            if leg_id in zero_candidate_ids:
+                continue  # still dwelling, reported again this rebuild
+            with self._engine._lock:
+                still_chasing = leg_id in self._engine._chasing_leg_ids
+            if still_chasing:
+                # Excluded from THIS reconcile call via already_handled_leg_ids
+                # (or carried_chasing_leg_ids on the next one) purely because
+                # its chase is in flight — not because it resolved. Keep the
+                # dwell-start time so the chase worker's own exhaustion check
+                # (and reconcile, once the chase ends) measure from when it
+                # first went stranded, not from whenever the chase happens
+                # to finish.
+                continue
+            # Neither zero-candidate this rebuild nor mid-chase: it
+            # genuinely resolved — recovered to a clean/buffered fit, or
+            # was already confirmed-liquidated (by reconcile's cap-expiry
+            # branch, or by the chase worker's own exhaustion fallback).
+            del self._leg_zero_candidate_since[leg_id]
 
         self._engine.start(
             mid, skip_indices=set(restore_plan.keys()) | set(leg_assignments.keys())
