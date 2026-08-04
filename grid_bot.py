@@ -1650,7 +1650,22 @@ class OMS:
             return
         req.qty = qty
         if not self.live_trading:
-            self._paper_fill(req)
+            if req.maker_timeout_s is not None and req.exec_inst:
+                # An explicit maker_timeout_s means the caller actually
+                # needs the resting-order wait simulated (currently only
+                # GridBot._chase_close_leg_worker's leg-chase orders) —
+                # _paper_fill's instant fill doesn't apply here. Runs on
+                # its own thread, not this one, since it can legitimately
+                # take up to maker_timeout_s and this is the shared
+                # OMS-worker thread every other order (including ordinary
+                # grid cell fills) is queued behind. See
+                # _paper_maker_fill_with_timeout()'s docstring.
+                threading.Thread(
+                    target=self._paper_maker_fill_with_timeout, args=(req,),
+                    name=f"paper-maker-timeout-{req.client_oid[:8]}",
+                    daemon=True).start()
+            else:
+                self._paper_fill(req)
         else:
             self._live_fill(req)
 
@@ -1664,6 +1679,13 @@ class OMS:
         just waits until price crosses its level, which the GridEngine tracks
         via live price ticks.  Fee: maker for limit, taker for market.
         Market orders (price=None) fill at the current live mid price.
+
+        Does NOT handle orders with an explicit req.maker_timeout_s — those
+        are submitted at the CURRENT touch (not a level price crossed
+        already) and genuinely need to rest and wait for the market to move
+        back through it, which _process_order routes to
+        _paper_maker_fill_with_timeout() instead. See that method's
+        docstring for why "instant" stopped being accurate for that case.
         """
         if req.price is not None:
             fill_price = req.price
@@ -1687,6 +1709,99 @@ class OMS:
             filled_qty=req.qty,
             avg_price=fill_price,
             fee=fee,
+            purpose=req.purpose,
+        ))
+
+    # ── Paper fill: resting order with a real maker-timeout wait ───────────────
+
+    def _paper_maker_fill_with_timeout(self, req: OrderRequest):
+        """
+        Paper-mode counterpart to _maker_timeout_handler() for orders that
+        need a realistic resting-order simulation instead of _paper_fill's
+        instant fill — currently only GridBot._chase_close_leg_worker's
+        leg-chase closes (see OrderRequest.maker_timeout_s).
+
+        _paper_fill's instant-fill simplification is valid for grid cell
+        orders specifically because _simulate_paper_fills() never submits
+        one until price has already reached that exact level — by the time
+        it reaches _paper_fill, "instant" is accurate. A leg-chase order is
+        different: it's POST_ONLY at the CURRENT touch, explicitly meant to
+        rest for up to maker_timeout_s waiting for the market to move back
+        through that price, exactly like a real exchange order would.
+        _paper_fill filled that too, unconditionally and instantly, at the
+        current touch — every chase attempt 1/3 always filled on attempt 1,
+        so the reprice/retry loop and the exhaustion→market-fallback branch
+        in _chase_close_leg_worker (both already correctly written to
+        handle a real timeout) were never actually exercised in paper mode.
+        See the 2026-08-04 "8 legs closed via chase" incident.
+
+        Polls _price_cache.get_l1() for a genuinely NEW tick (an L1 reading
+        distinct from the previous poll) that has crossed the resting
+        price on the correct side — ask <= price for a BUY, bid >= price
+        for a SELL, the same direction a real resting POST_ONLY order would
+        need the market to move for it to be marketable. FILLED at
+        req.price if that happens within maker_timeout_s (module default
+        _MAKER_FILL_TIMEOUT if unset); otherwise CANCELLED, all-or-nothing
+        (filled_qty=0) — no partial-fill simulation, since there's no order
+        book queue position to partially consume in paper mode.
+        _chase_close_leg_worker already treats a zero-fill CANCELLED the
+        same as an unfilled timeout (reprice and retry), so this is a
+        faithful stand-in for "the maker order never got hit."
+
+        Runs on its own thread (see _process_order), not the shared
+        OMS-worker thread — otherwise a single resting leg-chase order
+        would stall every other queued order, including ordinary grid
+        fills, for up to maker_timeout_s. NOTE: live mode has this same
+        shape of problem today — _live_fill() calls
+        _maker_timeout_handler() synchronously on OMS-worker — that's a
+        separate, more consequential issue and is deliberately not touched
+        here.
+        """
+        timeout  = req.maker_timeout_s if req.maker_timeout_s is not None else _MAKER_FILL_TIMEOUT
+        deadline = time.time() + timeout
+        is_buy   = req.side == "BUY"
+        last_l1  = _price_cache.get_l1()
+
+        while time.time() < deadline:
+            time.sleep(0.5)
+            l1 = _price_cache.get_l1()
+            if l1 == last_l1:
+                continue
+            last_l1 = l1
+            bid, ask, _mid = l1
+            crossed = (ask is not None and ask <= req.price) if is_buy \
+                else (bid is not None and bid >= req.price)
+            if crossed:
+                maker_fee = self._cfg.get("maker_fee_rate", 0.0001)
+                fee = req.price * req.qty * maker_fee
+                logger.debug(
+                    f"[OMS][PAPER] Resting fill {req.purpose} {req.side} "
+                    f"{req.qty:.4f} @ {req.price:.2f} — market crossed back "
+                    f"fee={fee:+.6f} (maker) [{req.client_oid[:8]}]"
+                )
+                self._deliver_fill(FillEvent(
+                    client_oid=req.client_oid,
+                    order_id=f"paper-{req.client_oid[:8]}",
+                    status=OrderStatus.FILLED,
+                    filled_qty=req.qty,
+                    avg_price=req.price,
+                    fee=fee,
+                    purpose=req.purpose,
+                ))
+                return
+
+        logger.debug(
+            f"[OMS][PAPER] Resting order timeout {req.purpose} {req.side} "
+            f"{req.qty:.4f} @ {req.price:.2f} after {timeout:.0f}s — "
+            f"cancelling [{req.client_oid[:8]}]"
+        )
+        self._deliver_fill(FillEvent(
+            client_oid=req.client_oid,
+            order_id=f"paper-{req.client_oid[:8]}",
+            status=OrderStatus.CANCELLED,
+            filled_qty=0.0,
+            avg_price=0.0,
+            fee=0.0,
             purpose=req.purpose,
         ))
 
@@ -1716,7 +1831,25 @@ class OMS:
         )
 
         if req.exec_inst:
-            self._maker_timeout_handler(req.client_oid, exchange_id, req)
+            # Off the OMS-worker thread — _maker_timeout_handler polls
+            # every 0.5s for up to maker_timeout_s (30s default), and
+            # req.exec_inst is set for EVERY POST_ONLY order, not just
+            # leg-chase (see OrderRequest.limit_maker) — so calling it
+            # synchronously here, on the same single worker thread every
+            # other queued order (including ordinary grid cell orders)
+            # waits behind, stalled the entire OMS for up to that long on
+            # every resting maker order. Same shape of bug as the
+            # paper-mode leg-chase issue fixed in _paper_maker_fill_with_
+            # timeout() — see that method's docstring — just present here
+            # unconditionally instead of only for leg-chase, and masked in
+            # practice because live trading hasn't been exercised as
+            # heavily as paper mode. See the 2026-08-04 "8 legs closed via
+            # chase" incident thread.
+            threading.Thread(
+                target=self._maker_timeout_handler_safe,
+                args=(req.client_oid, exchange_id, req),
+                name=f"maker-timeout-{req.client_oid[:8]}",
+                daemon=True).start()
 
     def get_exchange_id(self, client_oid: str) -> str:
         """Return the exchange order-id for a given client_oid, or '' if not known."""
@@ -1772,6 +1905,35 @@ class OMS:
                 self._exid_to_coid.pop(order.exchange_id, None)
         with self._fill_queues_lock:
             self._fill_queues.pop(client_oid, None)
+
+    def _maker_timeout_handler_safe(self, client_oid: str, exchange_id: str, req: OrderRequest):
+        """
+        Thread entry point for _maker_timeout_handler() (see _live_fill()'s
+        submission comment for why this now runs off OMS-worker instead of
+        inline). Previously an exception here was caught by _worker_loop's
+        try/except around the whole synchronous _process_order call, which
+        delivered a REJECTED fallback fill so the order never dangled.
+        Running on its own thread loses that safety net — an unhandled
+        exception in a thread just logs a traceback and the thread dies,
+        nothing resolves the order — so it's rebuilt here instead: same
+        cleanup _rest_cancel_order's caller does (drop from _orders/
+        _exid_to_coid) plus the same REJECTED fallback, so wait_fill()
+        callers still get a result instead of running out their own
+        timeout with the order silently leaked in self._orders.
+        """
+        try:
+            self._maker_timeout_handler(client_oid, exchange_id, req)
+        except Exception as e:
+            logger.error(
+                f"[OMS] maker-timeout handler error {client_oid[:8]}: {e}",
+                exc_info=True)
+            with self._orders_lock:
+                order = self._orders.pop(client_oid, None)
+                if order and order.exchange_id:
+                    self._exid_to_coid.pop(order.exchange_id, None)
+            self._deliver_fill(FillEvent(
+                client_oid=client_oid, order_id=exchange_id,
+                status=OrderStatus.REJECTED, purpose=req.purpose))
 
     def _maker_timeout_handler(self, client_oid: str, exchange_id: str, req: OrderRequest):
         timeout  = req.maker_timeout_s if req.maker_timeout_s is not None else _MAKER_FILL_TIMEOUT
@@ -4874,9 +5036,9 @@ class GridEngine:
             levels = [lv for lv in all_levels if lv.index not in exclude_indices]
 
         if not legs:
-            return {}, [], set()
+            return {}, [], set(), []
         if not levels:
-            return {}, list(legs), set()
+            return {}, list(legs), set(), []
 
         # lower/upper/spacing describe the REBUILT GRID'S true range, from
         # every level regardless of exclusion — not just the subset left
@@ -7377,6 +7539,14 @@ class GridBot:
         self._spacing_tuner.load_persisted()
         self._spacing_tuner.load_persisted_levels()
 
+        # Restore the zero-candidate dwell map before anything reads it —
+        # both _restore_halt_state() below (irrelevant if it returns True,
+        # since no grid gets built this call) and, on the normal path,
+        # _rebuild_grid()'s own bookkeeping, which needs this populated
+        # BEFORE it runs its "already dwelling from a prior rebuild" check.
+        # See _restore_leg_zero_candidate_since() docstring.
+        self._restore_leg_zero_candidate_since()
+
         # Restore a halt (stop-loss cooldown/recovery-floor wait, or a
         # daily-loss circuit-breaker halt) from a previous session before
         # deciding whether to build a fresh grid. See _restore_halt_state()
@@ -9665,6 +9835,11 @@ class GridBot:
             # branch, or by the chase worker's own exhaustion fallback).
             del self._leg_zero_candidate_since[leg_id]
 
+        # Persist right after this block finishes mutating the dict (both
+        # the additions above and the deletions just above) — see
+        # _persist_leg_zero_candidate_since() docstring.
+        self._persist_leg_zero_candidate_since()
+
         self._engine.start(
             mid, skip_indices=set(restore_plan.keys()) | set(leg_assignments.keys())
         )
@@ -9931,6 +10106,76 @@ class GridBot:
                "Auto-restart checks resuming from where they left off.\n")
         )
         return True
+
+    # ── Zero-candidate dwell persistence (survives restart) ──────────────────
+
+    def _persist_leg_zero_candidate_since(self) -> None:
+        """
+        Persist `_leg_zero_candidate_since` to SQLite so the zero-candidate
+        dwell clock survives a process restart instead of restarting from
+        "just discovered" for every currently-stranded leg.
+
+        Previously this lived only in memory, populated fresh on every
+        process start (see __init__). _rebuild_grid()'s zero-candidate
+        bookkeeping treats "not yet in this dict" as "first time seen —
+        kick off a chase attempt", so a cold restart with N stranded legs
+        made ALL N look brand new simultaneously and fire one chase
+        attempt each, all within the same rebuild — regardless of how
+        much dwell budget any of them had already used up before the
+        restart. The restart itself was the trigger, not any market
+        event. See the 2026-08-04 "8 legs closed via chase" incident.
+
+        Called once per _rebuild_grid() call, right after that method's
+        zero-candidate bookkeeping block finishes mutating the dict (both
+        the additions and the deletions) — mirrors _persist_halt_state()'s
+        "persist right after the state changes" placement.
+        """
+        if self._store is None:
+            return
+        self._store.set_meta(
+            "leg_zero_candidate_since",
+            json.dumps({str(k): v for k, v in self._leg_zero_candidate_since.items()}),
+        )
+
+    def _restore_leg_zero_candidate_since(self) -> None:
+        """
+        Restore `_leg_zero_candidate_since` persisted by
+        _persist_leg_zero_candidate_since(). Called once from start(),
+        before the first _rebuild_grid() call (same timing as
+        _restore_halt_state(), and for the same reason — this dict has to
+        be populated before _rebuild_grid()'s bookkeeping runs its
+        "already dwelling from a prior rebuild" check, or the restore is
+        a no-op).
+
+        A leg_id persisted here that no longer exists in the DB ledger
+        (e.g. it was force-liquidated by a previous session, or
+        reset_state wiped the open-leg ledger but happened to leave this
+        key behind) is harmless — reconcile_open_legs only ever looks up
+        zero_candidate_since for legs it currently has open; a stale key
+        with no matching leg is simply never read and gets pruned the
+        next time _rebuild_grid()'s bookkeeping loop runs (any leg_id in
+        the dict but not in zero_candidate_ids that rebuild is deleted).
+        """
+        if self._store is None:
+            return
+        raw = self._store.get_meta("leg_zero_candidate_since")
+        if not raw:
+            return
+        try:
+            restored = json.loads(raw)
+        except Exception as e:
+            logger.error(
+                f"[GridBot] Failed to parse persisted leg_zero_candidate_since "
+                f"— starting with an empty dwell map: {e}"
+            )
+            return
+        self._leg_zero_candidate_since = {int(k): float(v) for k, v in restored.items()}
+        if self._leg_zero_candidate_since:
+            logger.info(
+                f"[GridBot] Restored zero-candidate dwell state for "
+                f"{len(self._leg_zero_candidate_since)} leg(s) from previous "
+                f"session: {sorted(self._leg_zero_candidate_since.keys())}"
+            )
 
     # ── Auto-restart ──────────────────────────────────────────────────────────
 
