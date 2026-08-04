@@ -422,6 +422,47 @@ GRID_CONFIG: dict = {
     "drift_shift_on_top_sell":    True,
     "drift_shift_min_interval_s": 60,   # minimum seconds between consecutive shifts
 
+    # ── Confirmed-trend catch-up (2026-08-04) ─────────────────────────────────
+    # A single drift-shift is a fine reaction to routine drift, but it's
+    # always exactly one spacing behind price by construction — the top-sell
+    # only fires once price has already cleared the previous top by a full
+    # spacing. During a genuinely sustained move this compounds: the 2026-08-03
+    # 17:46-17:56 incident saw THREE separate legs (#327-#329) each opened as
+    # a fresh short near a then-current top, then evicted (chase-closed at a
+    # loss averaging -1.28 USD) a few minutes later as the very next
+    # drift-shift dropped their closer. By the time of the FIRST of those
+    # three evictions (17:46), FIVE consecutive same-direction drift-shifts
+    # had already fired over the prior 58 minutes — strong, direct,
+    # already-logged evidence this was a sustained rally, not noise.
+    #
+    # Fix: track how many top-sell-triggered up-shifts have fired within
+    # drift_shift_trend_lookback_s. Once that count reaches
+    # drift_shift_trend_confirm_count, the *next* shift catches the range up
+    # by drift_shift_trend_catchup_extra additional spacings in the same
+    # event, instead of waiting for price to grind further away first and
+    # triggering yet another isolated one-spacing shift later. This evicts
+    # whatever's sitting on the bottom sooner — closer to its own open price,
+    # so usually for less — rather than later, once price has drifted
+    # further still.
+    #
+    # The real tradeoff, stated plainly: this is a genuine bet that a
+    # confirmed pattern continues. If price reverses right after catch-up
+    # fires, a leg (or several, in one burst) will have been evicted that
+    # might otherwise have recovered on its own. There's no version of this
+    # that removes that risk — only evidence-gating which side of it you're
+    # more willing to take. Set drift_shift_trend_confirm_count higher (or
+    # catchup_extra to 0) to make this more conservative; 0 disables catch-up
+    # entirely and restores the exact pre-2026-08-04 behaviour.
+    #
+    # This only applies to the top-sell → trail_up path today — there is no
+    # fill-triggered mirror of drift-shift on the bottom-buy → trail_down
+    # side to extend (see trailing_down_enabled above, a different,
+    # periodic-retune-driven mechanism instead).
+    "drift_shift_trend_lookback_s":    1800.0, # window for counting prior same-direction shifts
+    "drift_shift_trend_confirm_count": 2,      # prior shifts within the window needed to call it confirmed
+    "drift_shift_trend_catchup_extra": 1,      # extra trail_up calls (beyond the usual 1) once confirmed
+
+
     # ── Stop-loss ─────────────────────────────────────────────────────────────
     "stop_loss_enabled": True,
     # Confirmation window (2026-07-30): mid must stay continuously below
@@ -726,6 +767,40 @@ GRID_CONFIG: dict = {
     "stop_score_weight_proximity":  0.40,
     "stop_score_weight_velocity":   0.35,
     "stop_score_weight_volatility": 0.25,
+
+    # ── SellGate (2026-08-04) ──────────────────────────────────────────────────
+    # Mirror of the TrendSignal-gate half of BuyGate above, for the opposite
+    # side: BuyGate withholds new buy-side exposure during a confirmed DOWN
+    # move; nothing symmetric withheld new short-side exposure during a
+    # confirmed UP move. The 2026-08-03 17:46-17:56 incident is a direct
+    # consequence — legs #327-#330 were all opened as fresh shorts directly
+    # into the same sustained rally that went on to chase-close each of them
+    # at a loss. SellGate closes that specific gap.
+    #
+    # It deliberately does NOT reuse StopScoreCalculator's score/threshold —
+    # that score (and its velocity term especially) is explicitly a
+    # downtrend-strengthening measure (see compute_trend_risk's docstring):
+    # velocity is `max(0.0, prev_mid - mid)`, hard-clamped to 0 on every
+    # up-tick. Reusing it here wouldn't gate a rally at all, it would just
+    # silently under-react to one. Instead SellGate uses two independently
+    # justified, already-available signals:
+    #   1. OUTSIDE_RANGE block — exact mirror of BuyGate's DOWN + below-lower
+    #      block: TrendSignal UP + mid already above the grid's whole upper
+    #      bound (fully short, most exposed to a continued rise) blocks ALL
+    #      new sell-side orders — both a fresh short open and a covering/
+    #      closing sell on an existing long — same "let a confirmed move run
+    #      before rushing to act against or into it" logic BuyGate already
+    #      applies on the down side.
+    #   2. Confirmed-uptrend block — reuses the SAME empirical
+    #      drift_shift_trend_* evidence above (real, already-observed
+    #      repeated shifts) rather than a second new asymmetric score.
+    # Like BuyGate, a suppressed sell is marked SUPPRESSED and released later
+    # by release_one_suppressed_level() once conditions clear — nothing is
+    # abandoned, just delayed.
+    "sell_gate_enabled":                    True,
+    "trend_gate_outside_range_block_on_up": True,  # block ALL sells when UP + OUTSIDE_RANGE (above upper)
+    "sell_gate_block_on_confirmed_uptrend": True,  # also suppress once drift_shift_trend_confirm_count is met
+
     # ── BuyGate auto-calibration ──────────────────────────────────────────────
     # After each stop-loss event, _calibrate_threshold() records the peak
     # score observed in the N seconds before the halt and uses it to nudge
@@ -3291,6 +3366,17 @@ class GridLevel:
     # — the same role the old _initial_sell_oids set served, generalized to
     # every cell, not just startup sells.
     closes_leg_id: Optional[int] = None
+    # Set only while state == SUPPRESSED, to whichever side ("BUY" or
+    # "SELL") the counter-order actually was at the moment of suppression —
+    # see _on_fill's two gate branches. Needed because a suppressed level's
+    # correct side is NOT open_side (that's this cell's fixed *opening*
+    # identity, never the counter/closing side — see the class docstring
+    # above); before SellGate (2026-08-04) existed, every suppression was
+    # BuyGate's and therefore always "BUY", so release_one_suppressed_level()
+    # could hardcode _place_buy(). Now that SellGate can also suppress a
+    # level (a covering/closing SELL, or a fresh short open), release must
+    # place whichever side was actually withheld.
+    suppressed_side: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3325,6 +3411,8 @@ class GridEngine:
                  instrument: str, config: dict,
                  store: Optional["GridStateStore"] = None,
                  buy_gate_fn: Optional[Callable[[], bool]] = None,
+                 sell_gate_fn: Optional[Callable[[], bool]] = None,
+                 trend_confirm_fn: Optional[Callable[[], int]] = None,
                  stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = None):
         self._params     = params
         self._oms        = oms
@@ -3336,6 +3424,25 @@ class GridEngine:
         # SUPPRESS it (level is set to SUPPRESSED instead of placing an order).
         # None = no gate (legacy behaviour, always allow).
         self._buy_gate_fn: Optional[Callable[[], bool]] = buy_gate_fn
+        # sell_gate_fn (2026-08-04): same shape and calling convention as
+        # buy_gate_fn, mirrored for the counter-SELL placed after a BUY
+        # fill — see GridBot._sell_gate. None = no gate (always allow),
+        # same legacy-safe default as buy_gate_fn.
+        self._sell_gate_fn: Optional[Callable[[], bool]] = sell_gate_fn
+        # trend_confirm_fn (2026-08-04): optional callable → int. Called
+        # once per top-sell-triggered drift-shift decision, right before
+        # _trail_up would otherwise fire exactly once. Returns how many
+        # EXTRA shifts (beyond the usual 1) to perform in this same event —
+        # 0 preserves the exact legacy single-shift behaviour. The callable
+        # is also responsible for recording this event as evidence for its
+        # own next call (see GridBot._trend_confirm) — GridEngine only
+        # reports "a shift is about to happen", it doesn't track history
+        # itself, since a full rebuild replaces this engine instance
+        # entirely and would silently reset any history kept here (the
+        # same reason leg-dwell state lives on GridBot, not GridEngine —
+        # see reconcile_open_legs' pending_since docs). None = no catch-up
+        # (legacy behaviour).
+        self._trend_confirm_fn: Optional[Callable[[], int]] = trend_confirm_fn
         # stray_leg_fn: optional callable(leg, reason) -> None. Called by
         # _trail_up/_trail_down when a dropped cell was holding a leg's
         # designated closer — see those methods' docstrings for why the
@@ -3784,8 +3891,10 @@ class GridEngine:
     def _replace_idle_levels(self):
         """Re-place any IDLE cells that should have an order.
         SUPPRESSED levels are intentionally skipped — they are managed by
-        GridBot._run() via release_one_suppressed_level() once the stop-score
-        recovers, so they must not be re-queued here.
+        GridBot._run() via release_one_suppressed_level(), once either the
+        stop-score recovers (BuyGate-suppressed) or the sell-gate condition
+        clears (SellGate-suppressed, 2026-08-04) — so they must not be
+        re-queued here.
 
         Excludes _pending_fill_indices as the sole guard (2026-08-03: the
         older _rearm_eligible ALLOW-list is retired — see history below for
@@ -3927,6 +4036,39 @@ class GridEngine:
             if not self._levels:
                 return
             bottom = self._levels[0]
+            if bottom.index in self._pending_fill_indices:
+                # Its fill was JUST detected this same tick (mid crossing
+                # bottom.upper implies mid also clears current_upper+spacing,
+                # since current_upper >= bottom.upper — the trail-up trigger
+                # and this cell's own fill are never independent events).
+                # _on_fill() hasn't processed it yet. Dropping the cell now
+                # would pop it out from under that still-queued fill event —
+                # the async Grid-fills thread would then apply it to
+                # whatever cell reindexing shifts into this slot instead
+                # (wrong leg, wrong PnL) — AND, just as importantly, this
+                # cell's own state is still IDLE at this instant, so the
+                # closes_leg_id check below would be skipped entirely: the
+                # leg would silently miss the stray-leg-chase handoff below
+                # too, not just the old orphan-rebuild fallback. Defer one
+                # tick instead; _check_trailing() re-evaluates next tick
+                # once _on_fill() has placed this cell's correct next order.
+                #
+                # (2026-08-03: this guard has now been dropped twice across
+                # two separate uploads when this method was independently
+                # regenerated for the stray-leg-chase / zero-candidate
+                # features — see test_trail_defers_while_fill_pending and
+                # test_trail_defers_then_hands_off_to_chase in
+                # test_cell_model.py, which exist specifically to catch
+                # this if it happens again.)
+                logger.debug(
+                    f"[GridEngine] TRAIL UP deferred one tick — bottom cell "
+                    f"[{bottom.index}]'s fill is still pending processing"
+                )
+                return
+            logger.info(
+                f"[GridEngine] TRAIL UP: dropping lower={old_lower:.2f}, "
+                f"adding upper={new_upper:.2f}"
+            )
             if bottom.state != LevelState.IDLE and bottom.client_oid:
                 if bottom.closes_leg_id is not None:
                     # This cell was mid-CLOSE-phase, holding a leg's
@@ -4009,6 +4151,19 @@ class GridEngine:
             if not self._levels:
                 return
             top = self._levels[-1]
+            if top.index in self._pending_fill_indices:
+                # See the matching TRAIL UP comment — same same-tick race,
+                # mirrored for the top cell (mid <= current_lower - spacing
+                # implies mid has also already cleared top.lower).
+                logger.debug(
+                    f"[GridEngine] TRAIL DOWN deferred one tick — top cell "
+                    f"[{top.index}]'s fill is still pending processing"
+                )
+                return
+            logger.info(
+                f"[GridEngine] TRAIL DOWN: dropping upper={old_upper:.2f}, "
+                f"adding lower={new_lower:.2f}"
+            )
             if top.state != LevelState.IDLE and top.client_oid:
                 if top.closes_leg_id is not None:
                     # See the matching TRAIL UP comment — same handoff,
@@ -4304,14 +4459,39 @@ class GridEngine:
 
         if is_buy:
             # BUY just filled at this cell's lower boundary -> counter is a
-            # SELL at this cell's upper boundary. Not gated: closing
-            # exposure (or opening a short) was never subject to the
-            # buy-gate — only fresh/covering BUYs are (see the else branch).
-            if new_leg is not None:
-                self._place_sell(lv, qty_override=new_leg.qty,
-                                  closes_leg_id=new_leg.leg_id)
+            # SELL at this cell's upper boundary, subject to the sell-gate
+            # (2026-08-04 — mirror of the buy-gate below: withholds NEW
+            # sell-side exposure while a confirmed-uptrend signal is active,
+            # whether that SELL is opening a fresh short or covering/closing
+            # a long — same "let a confirmed move run before rushing to act
+            # against or into it" logic as the buy-gate already applies on
+            # the down side. See GridBot._sell_gate).
+            suppress = False
+            if self._sell_gate_fn is not None and not self._sell_gate_fn():
+                with self._lock:
+                    lv.state         = LevelState.SUPPRESSED
+                    lv.suppressed_side = "SELL"
+                    # Preserve the tag/qty this SELL would have carried, so
+                    # release_one_suppressed_level() can restore it exactly
+                    # rather than silently placing a generic fresh order in
+                    # its place once the gate reopens.
+                    lv.closes_leg_id = new_leg.leg_id if new_leg is not None else None
+                    lv.qty           = new_leg.qty if new_leg is not None else 0.0
+                suppress = True
+                logger.info(
+                    f"[GridEngine] SELL [{idx}] suppressed by sell-gate "
+                    f"(buy fill at [{idx}] @ {fill.avg_price:.2f})"
+                )
+            if suppress:
+                self._alerter_send(
+                    f"🛡 Sell [{idx}] suppressed — sell-gate active"
+                )
             else:
-                self._place_sell(lv)
+                if new_leg is not None:
+                    self._place_sell(lv, qty_override=new_leg.qty,
+                                      closes_leg_id=new_leg.leg_id)
+                else:
+                    self._place_sell(lv)
         else:
             # SELL just filled at this cell's upper boundary -> counter is a
             # BUY at this cell's lower boundary, subject to the buy-gate
@@ -4322,6 +4502,7 @@ class GridEngine:
             if self._buy_gate_fn is not None and not self._buy_gate_fn():
                 with self._lock:
                     lv.state         = LevelState.SUPPRESSED
+                    lv.suppressed_side = "BUY"
                     # Preserve the tag/qty this BUY would have carried, so
                     # release_one_suppressed_level() can restore it exactly
                     # rather than silently placing a generic fresh order in
@@ -4362,31 +4543,89 @@ class GridEngine:
                     min_interval = self._cfg.get("drift_shift_min_interval_s", 60)
                     now_t = time.time()
                     if now_t - self._last_drift_shift >= min_interval:
-                        # Guard: if mid is already above the price where the new
-                        # SELL level would be placed (current_upper + spacing),
-                        # the trail step would immediately fill the new level in
-                        # paper mode — and if mid is multiple spacings above, this
-                        # cascades into several instant fills and a phantom-negative
-                        # long_qty.  Request a full rebuild instead so the grid
-                        # re-centres cleanly on the current price.
-                        mid_now   = _price_cache.get_mid() or current_upper
-                        new_upper = current_upper + spacing
-                        far_oor   = mid_now > new_upper
+                        # Confirmed-trend catch-up (2026-08-04): ask how many
+                        # EXTRA shifts (beyond the usual 1) this event should
+                        # perform. trend_confirm_fn both records this event
+                        # as evidence and returns the decision in one call —
+                        # see GridBot._trend_confirm and the
+                        # drift_shift_trend_* GRID_CONFIG comment block.
+                        # None / no callable = 0 extra = exact legacy
+                        # single-shift behaviour.
+                        extra_shifts = 0
+                        if self._trend_confirm_fn is not None:
+                            try:
+                                extra_shifts = max(0, int(self._trend_confirm_fn()))
+                            except Exception:
+                                logger.exception(
+                                    "[GridEngine] trend_confirm_fn raised — "
+                                    "treating this event as 0 extra shifts"
+                                )
+                                extra_shifts = 0
+                        shifts_to_do = 1 + extra_shifts
+
+                        # Guard: if mid is already above the price where the
+                        # FINAL new SELL level (after all shifts_to_do shifts)
+                        # would be placed, even the accelerated catch-up can't
+                        # keep up — the trail step would immediately fill the
+                        # new level in paper mode, and if mid is further above
+                        # still, this cascades into several instant fills and
+                        # a phantom-negative long_qty. Request a full rebuild
+                        # instead so the grid re-centres cleanly on the
+                        # current price. (This is the same guard as before
+                        # catch-up existed, just sized to shifts_to_do instead
+                        # of a hardcoded 1.)
+                        mid_now         = _price_cache.get_mid() or current_upper
+                        new_upper_final = current_upper + shifts_to_do * spacing
+                        far_oor         = mid_now > new_upper_final
                         if far_oor:
                             logger.info(
                                 f"[GridEngine] Top-sell fill at [{idx}] — "
-                                f"mid={mid_now:.2f} already above new-upper={new_upper:.2f} "
-                                f"→ requesting full rebuild instead of drift-shift"
+                                f"mid={mid_now:.2f} already above new-upper="
+                                f"{new_upper_final:.2f} (after {shifts_to_do} "
+                                f"planned shift(s)) → requesting full rebuild "
+                                f"instead of drift-shift"
                             )
                             self._needs_rebuild = True
                         else:
                             self._last_drift_shift = now_t
-                            logger.info(
-                                f"[GridEngine] Top-sell fill at [{idx}] → "
-                                f"drift-shift UP: [{current_lower:.2f},{current_upper:.2f}] "
-                                f"+{spacing:.2f}"
-                            )
-                            self._trail_up(current_lower, current_upper, spacing)
+                            if extra_shifts > 0:
+                                logger.info(
+                                    f"[GridEngine] Top-sell fill at [{idx}] → "
+                                    f"CONFIRMED uptrend catch-up: performing "
+                                    f"{shifts_to_do} shift(s) ({extra_shifts} "
+                                    f"extra beyond the usual 1) in this event"
+                                )
+                            for i in range(shifts_to_do):
+                                with self._lock:
+                                    cur_lower = self._levels[0].lower  if self._levels else 0.0
+                                    cur_upper = self._levels[-1].upper if self._levels else 0.0
+                                logger.info(
+                                    f"[GridEngine] Top-sell fill at [{idx}] → "
+                                    f"drift-shift UP ({i + 1}/{shifts_to_do}): "
+                                    f"[{cur_lower:.2f},{cur_upper:.2f}] "
+                                    f"+{spacing:.2f}"
+                                )
+                                self._trail_up(cur_lower, cur_upper, spacing)
+                                with self._lock:
+                                    applied = (
+                                        len(self._levels) > 0
+                                        and self._levels[-1].upper > cur_upper + 1e-9
+                                    )
+                                if not applied:
+                                    # _trail_up deferred one tick (its own
+                                    # pending_fill_indices guard — see that
+                                    # method) rather than force further
+                                    # shifts through a stale/racing state.
+                                    # _check_trailing() picks this up again
+                                    # next tick, same as the non-catch-up
+                                    # path already relies on.
+                                    logger.info(
+                                        f"[GridEngine] Top-sell fill at "
+                                        f"[{idx}] — catch-up stopped after "
+                                        f"{i + 1}/{shifts_to_do} (TRAIL UP "
+                                        f"deferred one tick)"
+                                    )
+                                    break
                     else:
                         logger.info(
                             f"[GridEngine] Top-sell fill at [{idx}] — drift-shift "
@@ -4394,45 +4633,77 @@ class GridEngine:
                             f"{min_interval}s interval)"
                         )
 
-    def release_one_suppressed_level(self) -> bool:
+    def release_one_suppressed_level(self, eligible_side: Optional[str] = None) -> bool:
         """
         Release the highest-index SUPPRESSED level (closest to mid, least
-        exposed) by placing its BUY order.  Returns True if a level was
-        released, False if none were suppressed.
+        exposed) by placing whichever side (BUY or SELL) was actually
+        withheld — see GridLevel.suppressed_side. If eligible_side is given
+        ("BUY" or "SELL"), only a level suppressed on that side is
+        considered — so BuyGate's stop-score-recovered release and
+        SellGate's uptrend-cleared release (2026-08-04) each only ever
+        touch levels their own gate suppressed, never each other's.
+        Returns True if a level was released, False if none matched.
 
-        Called by GridBot._run() once per tick when stop-score has recovered
-        below the resume threshold, so position rebuilds gradually rather than
+        Called by GridBot._run() once per tick when the corresponding gate's
+        release condition is met, so position rebuilds gradually rather than
         all at once.
         """
         with self._lock:
             # Find the highest-index SUPPRESSED level (closest to mid)
+            # matching eligible_side (or any, if eligible_side is None).
             target = None
             for lv in reversed(self._levels):
-                if lv.state == LevelState.SUPPRESSED:
-                    target = lv
-                    break
+                if lv.state != LevelState.SUPPRESSED:
+                    continue
+                if eligible_side is not None and lv.suppressed_side != eligible_side:
+                    continue
+                target = lv
+                break
             if target is None:
                 return False
-            # Reset to IDLE before releasing the lock — _place_buy() will
-            # re-acquire the lock to set it to BUY_OPEN. closes_leg_id/qty
-            # were preserved at suppression time (see _on_fill) — carry them
-            # through so a suppressed CLOSER is restored exactly, not
-            # silently replaced by a generic fresh-open order.
+            # Reset to IDLE before releasing the lock — _place_buy()/
+            # _place_sell() will re-acquire the lock to set it to
+            # BUY_OPEN/SELL_OPEN. closes_leg_id/qty were preserved at
+            # suppression time (see _on_fill) — carry them through so a
+            # suppressed CLOSER is restored exactly, not silently replaced
+            # by a generic fresh-open order.
             target.state = LevelState.IDLE
-            tag_qty = target.qty if target.closes_leg_id is not None else None
-            tag_leg = target.closes_leg_id
+            tag_qty  = target.qty if target.closes_leg_id is not None else None
+            tag_leg  = target.closes_leg_id
+            # Default to "BUY" for defensiveness (matches every
+            # suppression before SellGate existed, so any level that
+            # somehow predates this field — e.g. across a hot-reload mid
+            # rollout — still releases exactly as it always did).
+            release_side = target.suppressed_side or "BUY"
+            target.suppressed_side = None
 
-        self._place_buy(target, qty_override=tag_qty, closes_leg_id=tag_leg)
-        logger.info(
-            f"[GridEngine] BUY [{target.index}] @ {target.lower:.2f} "
-            f"released from SUPPRESSED (stop-score recovered)"
-        )
+        if release_side == "SELL":
+            self._place_sell(target, qty_override=tag_qty, closes_leg_id=tag_leg)
+            logger.info(
+                f"[GridEngine] SELL [{target.index}] @ {target.upper:.2f} "
+                f"released from SUPPRESSED (sell-gate cleared)"
+            )
+        else:
+            self._place_buy(target, qty_override=tag_qty, closes_leg_id=tag_leg)
+            logger.info(
+                f"[GridEngine] BUY [{target.index}] @ {target.lower:.2f} "
+                f"released from SUPPRESSED (stop-score recovered)"
+            )
         return True
 
-    def count_suppressed(self) -> int:
-        """Return number of levels currently in SUPPRESSED state."""
+    def count_suppressed(self, side: Optional[str] = None) -> int:
+        """
+        Return number of levels currently in SUPPRESSED state. If side is
+        given ("BUY" or "SELL"), count only levels suppressed on that side
+        (see GridLevel.suppressed_side) — used to drive BuyGate's and
+        SellGate's independent release conditions in GridBot._run() without
+        either one seeing (and prematurely releasing) the other's.
+        """
         with self._lock:
-            return sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
+            if side is None:
+                return sum(1 for lv in self._levels if lv.state == LevelState.SUPPRESSED)
+            return sum(1 for lv in self._levels
+                       if lv.state == LevelState.SUPPRESSED and lv.suppressed_side == side)
 
     def pop_needs_rebuild(self) -> bool:
         """
@@ -6295,6 +6566,16 @@ class GridBot:
         # first-time-seen bookkeeping (kick off a chase) differ.
         self._leg_zero_candidate_since: Dict[int, float] = {}
 
+        # ── Confirmed-trend catch-up + SellGate state (2026-08-04) ────────────
+        # Timestamps of top-sell-triggered up-shifts, pruned to
+        # drift_shift_trend_lookback_s. Lives here (not on GridEngine) for
+        # the same reason _leg_no_fit_since does: a full rebuild replaces
+        # the engine instance entirely, and this evidence needs to survive
+        # that. Written by _trend_confirm (called from GridEngine right
+        # before a drift-shift), read by _uptrend_confirmed_now (used by
+        # both _sell_gate and its release condition in _run()).
+        self._recent_up_shifts: List[float] = []
+
         self._oms = OMS(
             api_key      = config.get("api_key", ""),
             api_secret   = config.get("api_secret", ""),
@@ -7981,18 +8262,51 @@ class GridBot:
 
             # Stop-score tick — update velocity EMA on every price tick so the
             # score stays fresh even between fills.  Also drives gradual release
-            # of SUPPRESSED levels when the score recovers.
+            # of BuyGate-SUPPRESSED levels when the score recovers.
             if self._stop_scorer is not None and self._params is not None:
                 score = self._stop_scorer.compute(mid, self._params.stop_price)
                 resume_thr = self._cfg.get("stop_score_resume_threshold", 0.35)
                 if (score <= resume_thr
                         and self._engine is not None
-                        and self._engine.count_suppressed() > 0):
-                    released = self._engine.release_one_suppressed_level()
+                        and self._engine.count_suppressed("BUY") > 0):
+                    released = self._engine.release_one_suppressed_level("BUY")
                     if released:
                         logger.info(
-                            f"[GridBot] Released one suppressed level "
+                            f"[GridBot] Released one BUY-suppressed level "
                             f"(score={score:.4f} ≤ resume={resume_thr})"
+                        )
+
+            # SellGate release (2026-08-04) — independent of the stop-score
+            # above (that score is explicitly downtrend-only, see
+            # compute_trend_risk's docstring, so it says nothing about
+            # whether the uptrend that caused a SellGate suppression has
+            # actually eased). Mirrors _sell_gate's own two conditions
+            # directly rather than reusing a resume-threshold gap the way
+            # BuyGate does, since neither SellGate condition is a
+            # continuous score — OUTSIDE_RANGE-above clears the instant mid
+            # is back at/below the upper bound, and the confirmed-uptrend
+            # condition already has its own built-in hysteresis: it only
+            # eases as old shifts age out of drift_shift_trend_lookback_s,
+            # not on every tick.
+            if self._engine is not None and self._engine.count_suppressed("SELL") > 0:
+                sell_gate_still_blocking = False
+                if (self._cfg.get("sell_gate_enabled", True)
+                        and self._cfg.get("trend_gate_enabled", True)):
+                    if self._effective_trend_regime() == TrendSignal.REGIME_UP:
+                        if (self._params is not None
+                                and self._cfg.get("trend_gate_outside_range_block_on_up", True)
+                                and mid > self._params.upper):
+                            sell_gate_still_blocking = True
+                        if (not sell_gate_still_blocking
+                                and self._cfg.get("sell_gate_block_on_confirmed_uptrend", True)
+                                and self._uptrend_confirmed_now()):
+                            sell_gate_still_blocking = True
+                if not sell_gate_still_blocking:
+                    released = self._engine.release_one_suppressed_level("SELL")
+                    if released:
+                        logger.info(
+                            "[GridBot] Released one SELL-suppressed level "
+                            "(sell-gate cleared)"
                         )
 
             # Fill detection
@@ -9035,6 +9349,59 @@ class GridBot:
             )
             return allow
 
+        def _sell_gate() -> bool:
+            """
+            Return True (allow sell) or False (suppress sell). Mirror of
+            _buy_gate above for the opposite side (2026-08-04) — see the
+            SellGate GRID_CONFIG comment block for why this deliberately
+            does NOT carry a score/threshold component the way _buy_gate
+            does (no symmetric upside score exists, and reusing the
+            downtrend-only one would silently under-react to a rally).
+            """
+            if not _bot_ref._cfg.get("sell_gate_enabled", True):
+                return True
+            if not _bot_ref._cfg.get("trend_gate_enabled", True):
+                return True
+
+            mid_now = _price_cache.get_mid()
+            if mid_now is None:
+                return True
+
+            effective_regime = _bot_ref._effective_trend_regime()
+            is_up = (effective_regime == TrendSignal.REGIME_UP)
+            if not is_up:
+                return True
+
+            # Protection 1: OUTSIDE_RANGE-above block — mirrors _buy_gate's
+            # DOWN + below-lower block: UP regime + mid already above the
+            # grid's whole upper bound (fully short, most exposed to a
+            # continued rise) blocks ALL new sell-side orders regardless
+            # of anything else.
+            params = _bot_ref._params
+            if (params is not None
+                    and _bot_ref._cfg.get("trend_gate_outside_range_block_on_up", True)
+                    and mid_now > params.upper):
+                logger.info(
+                    f"[SellGate] SUPPRESS (TrendSignal UP + OUTSIDE_RANGE: "
+                    f"mid={mid_now:.2f} > upper={params.upper:.2f})"
+                )
+                return False
+
+            # Protection 2: confirmed-uptrend block — reuses the SAME
+            # empirical drift_shift_trend_* evidence the catch-up feature
+            # uses, rather than a second new asymmetric score. See
+            # GridBot._uptrend_confirmed_now.
+            if (_bot_ref._cfg.get("sell_gate_block_on_confirmed_uptrend", True)
+                    and _bot_ref._uptrend_confirmed_now()):
+                logger.info(
+                    "[SellGate] SUPPRESS (TrendSignal UP + confirmed-uptrend "
+                    "shift pattern)"
+                )
+                return False
+
+            logger.info(f"[SellGate] mid={mid_now:.2f} → ALLOW")
+            return True
+
         # ── Blue-green: match any pending handoff snapshot against the grid
         # we're about to build, BEFORE placing a single order ─────────────────
         # This has to happen here (using new_params, not self._pending_handoff_snapshot's
@@ -9141,6 +9508,8 @@ class GridBot:
             instrument=INSTRUMENT, config=self._cfg,
             store=self._store,
             buy_gate_fn=_buy_gate,
+            sell_gate_fn=_sell_gate,
+            trend_confirm_fn=self._trend_confirm,
             stray_leg_fn=self._chase_close_leg)
         if carried_chasing_leg_ids:
             # update(), not assignment — defensive against a concurrent
@@ -10264,6 +10633,7 @@ class GridBot:
         downtrend that caused the gap in the first place:
 
           - _buy_gate()'s OUTSIDE_RANGE block and threshold multiplier
+          - _sell_gate()'s OUTSIDE_RANGE-above block (2026-08-04)
           - GridAutoTuner.compute()'s ATR-widen skip-on-downtrend
           - StopScoreCalculator.compute_trend_risk()'s regime-risk component
 
@@ -10276,6 +10646,72 @@ class GridBot:
         if self._last_trend_regime == TrendSignal.REGIME_NODATA:
             return self._last_confirmed_trend_regime
         return self._last_trend_regime
+
+    def _trend_confirm(self) -> int:
+        """
+        trend_confirm_fn passed to GridEngine (see its __init__ docstring).
+        Called once per top-sell-triggered drift-shift decision, right
+        before GridEngine would otherwise perform exactly one _trail_up.
+
+        Records this event (a timestamp, pruned to
+        drift_shift_trend_lookback_s) as evidence, then returns how many
+        EXTRA shifts (beyond the usual 1) this event should perform, based
+        on how many same-direction shifts already preceded it within that
+        window. See the drift_shift_trend_* GRID_CONFIG comment block and
+        the 2026-08-03 17:46-17:56 incident it documents: by the time of
+        the FIRST forced chase-close eviction that day, FIVE consecutive
+        top-sell-triggered shifts had already fired over the prior 58
+        minutes — direct, already-logged evidence of a sustained move, not
+        a one-off blip.
+
+        This is the ONLY place _recent_up_shifts gains a new entry —
+        _uptrend_confirmed_now() below reads the same list but never adds
+        to it, so ticks that merely check gate status don't get counted as
+        shifts themselves.
+        """
+        now = time.time()
+        lookback = self._cfg.get("drift_shift_trend_lookback_s", 1800.0)
+        self._recent_up_shifts = [t for t in self._recent_up_shifts if now - t <= lookback]
+        prior_count = len(self._recent_up_shifts)
+        self._recent_up_shifts.append(now)
+
+        confirm_count = self._cfg.get("drift_shift_trend_confirm_count", 2)
+        if prior_count >= confirm_count:
+            extra = self._cfg.get("drift_shift_trend_catchup_extra", 1)
+            logger.info(
+                f"[GridBot] Confirmed uptrend: {prior_count} prior "
+                f"same-direction shift(s) within {lookback:.0f}s (>= "
+                f"{confirm_count}) — catching up {extra} extra shift(s) "
+                f"this event"
+            )
+            return extra
+        return 0
+
+    def _uptrend_confirmed_now(self) -> bool:
+        """
+        Read-only check: is the drift_shift_trend_* confirmed-uptrend
+        condition currently active, based purely on shifts _trend_confirm
+        has already recorded? Never adds to _recent_up_shifts itself —
+        safe to call every tick. Used by both _sell_gate (to decide whether
+        to suppress) and its release condition in _run() (to decide when
+        to stop suppressing) — the SAME check both places, so a suppressed
+        level is never released just because a different signal happened
+        to look fine.
+
+        Note this uses a slightly different count than _trend_confirm's
+        own "prior_count >= confirm_count" test (that one deliberately
+        excludes the shift currently being decided, since it's asking
+        "should THIS shift accelerate"; this one includes everything
+        currently on record, since it's asking "is the trend confirmed
+        right now") — both intentionally share the same lookback/
+        confirm_count knobs, just applied for slightly different
+        purposes.
+        """
+        now = time.time()
+        lookback = self._cfg.get("drift_shift_trend_lookback_s", 1800.0)
+        recent = [t for t in self._recent_up_shifts if now - t <= lookback]
+        confirm_count = self._cfg.get("drift_shift_trend_confirm_count", 2)
+        return len(recent) >= confirm_count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
