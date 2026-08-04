@@ -1193,6 +1193,37 @@ def _redact_secret(text: str, *secrets: str) -> str:
     return text
 
 
+def _md_escape(text: str) -> str:
+    """
+    Escape Telegram legacy-Markdown special characters (_ * ` [) in a
+    free-form identifier before it's interpolated into an AlertManager
+    message sent with parse_mode="Markdown".
+
+    2026-08-03 fix: close_reason-style identifiers like "rebuild_reprice"
+    or "trail_up" carry an odd number of unescaped underscores, which
+    Telegram's legacy Markdown parser reads as an opening italic marker
+    with no matching close — the whole message is then rejected with
+    HTTP 400 "can't parse entities". AlertManager._post() already catches
+    that and retries as plain text, so no alert was ever silently lost,
+    but every rebuild-reprice/trail-up/trail-down leg closure paid for a
+    wasted round trip and a warning log line. Escaping the identifier
+    before it goes into the Markdown-mode text avoids that entirely.
+
+    Also covers newer reason values from the zero-candidate dwell system
+    (e.g. "rebuild_reprice_pending", "rebuild_reprice_chase_exhausted")
+    the same way — this is a general parser-safety fix, not tied to any
+    one specific identifier string.
+
+    Not applied to log lines (only real risk there is readability) or to
+    values written to the DB (grid_fills.close_reason etc. must stay the
+    exact, unescaped identifier) — only to the copy of the string that
+    goes into a Markdown-parsed Telegram message.
+    """
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Telegram AlertManager  (copied from funding_arb/alerting.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6314,17 +6345,31 @@ class GridStateStore:
 
     def reset_state(self, backup: bool = True) -> Optional[str]:
         """
-        Wipe all persisted fills, daily PnL, and meta rows so the bot behaves
-        as if this is the very first startup.
+        Wipe all persisted fills, daily PnL, meta rows, and open legs so the
+        bot behaves as if this is the very first startup.
 
         Does NOT touch anything on the exchange — open orders/positions are
         always independently handled by OMS.reconcile_on_startup() on every
         launch, reset or not, so a stale live position is still detected and
         liquidated exactly as before.
 
+        open_legs is included in the wipe (2026-08-03 fix): a normal
+        stop()/_liquidate_position() closes the net position with one
+        aggregate market order but — by design, see _liquidate_position's
+        docstring — never calls close_leg() on the individual rows that made
+        up that net, so they silently survive even a clean shutdown. Left
+        alone, GridEngine.__init__ unconditionally reseeds _open_legs from
+        these stale rows on the next launch regardless of this flag,
+        resurrecting a phantom position (and, post-refactor, leg rows whose
+        opened_level_idx was assigned under the old level model) into a
+        supposedly fresh process. Discovered during the grid-cells fresh-
+        start deploy: a liquidated 0.016 BTC net position left two open_legs
+        rows (a 0.032 BUY + a 0.016 SELL) behind after a clean stop.
+
         If backup=True (default), the WAL is checkpointed and the db file is
         copied to "<db_path>.bak-<timestamp>" before anything is wiped, so
-        pre-reset history is never silently lost.
+        pre-reset history (including the pre-reset open_legs rows) is never
+        silently lost.
 
         Returns the backup file path, or None if backup=False.
         """
@@ -6344,6 +6389,7 @@ class GridStateStore:
             self._conn.execute("DELETE FROM grid_fills")
             self._conn.execute("DELETE FROM daily_pnl")
             self._conn.execute("DELETE FROM meta")
+            self._conn.execute("DELETE FROM open_legs")
             # candle_cache is intentionally preserved across reset_state:
             # it contains price history used for TrendSignal warm-up, which
             # has nothing to do with fill accounting.  Clearing it would just
@@ -6359,8 +6405,8 @@ class GridStateStore:
                 logger.warning(f"[GridStateStore] VACUUM after reset skipped: {e}")
 
         logger.warning(
-            "[GridStateStore] STATE RESET — all fills, daily PnL, and "
-            "accumulated PnL cleared. " +
+            "[GridStateStore] STATE RESET — all fills, daily PnL, "
+            "accumulated PnL, and open legs cleared. " +
             (f"Pre-reset backup saved to {os.path.abspath(backup_path)}"
              if backup_path else "No backup taken.")
         )
@@ -6607,19 +6653,22 @@ class GridBot:
 
         if reset_state:
             # Fresh-start requested via --reset-state: wipe fill history, daily
-            # PnL, and accumulated PnL so /status reports as if this is the
-            # very first launch. A pre-reset backup of the db is kept on disk.
-            # Note: this only clears local bookkeeping — it does NOT touch the
-            # exchange. Any real open orders/position are still independently
-            # detected and liquidated by OMS.reconcile_on_startup() below, same
-            # as on every normal launch.
+            # PnL, accumulated PnL, and open legs so /status reports as if this
+            # is the very first launch and GridEngine.__init__ (below, via
+            # _rebuild_grid()) seeds an empty _open_legs instead of resurrecting
+            # whatever a previous process's net-position liquidation left
+            # behind in the ledger. A pre-reset backup of the db is kept on
+            # disk. Note: this only clears local bookkeeping — it does NOT
+            # touch the exchange. Any real open orders/position are still
+            # independently detected and liquidated by
+            # OMS.reconcile_on_startup() below, same as on every normal launch.
             backup_path = self._store.reset_state()
             note = (f" (backup: {os.path.abspath(backup_path)})"
                     if backup_path else " (no backup — see log)")
-            logger.warning(f"[GridBot] --reset-state: persisted PnL/fill history cleared{note}")
+            logger.warning(f"[GridBot] --reset-state: persisted PnL/fill history/open legs cleared{note}")
             self._alerter.send_sync(
-                f"🧹 State reset requested — fill history, daily PnL, and "
-                f"accumulated PnL cleared{note}.\nBot starting fresh."
+                f"🧹 State reset requested — fill history, daily PnL, "
+                f"accumulated PnL, and open legs cleared{note}.\nBot starting fresh."
             )
 
         # ── Telegram command poller ────────────────────────────────────────────
@@ -8489,12 +8538,12 @@ class GridBot:
                     )
                     self._alerter.send(
                         f"⚠️ record_fill DB write failed for liquidation "
-                        f"({reason}) after retries — see log. The trade already "
+                        f"({_md_escape(reason)}) after retries — see log. The trade already "
                         f"happened; only its PnL record is missing."
                     )
             pnl_note = f" | realized {gross_pnl:+.4f} USD" if cost_basis_price else ""
             self._alerter.send(
-                f"🔴 Position closed ({reason})\n"
+                f"🔴 Position closed ({_md_escape(reason)})\n"
                 f"Sold {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}{pnl_note}"
             )
         else:
@@ -8503,7 +8552,7 @@ class GridBot:
                 f"{qty:.4f} BTC may still be open. MANUAL INTERVENTION REQUIRED."
             )
             self._alerter.send(
-                f"🚨 Liquidation TIMED OUT ({reason})\n"
+                f"🚨 Liquidation TIMED OUT ({_md_escape(reason)})\n"
                 f"{qty:.4f} BTC position may still be open.\n"
                 f"MANUAL INTERVENTION REQUIRED"
             )
@@ -8545,7 +8594,7 @@ class GridBot:
                 f"still be open. Leaving it tracked; MANUAL CHECK RECOMMENDED."
             )
             self._alerter.send(
-                f"🚨 Leg #{leg.leg_id} liquidation TIMED OUT ({reason})\n"
+                f"🚨 Leg #{leg.leg_id} liquidation TIMED OUT ({_md_escape(reason)})\n"
                 f"{leg.qty:.4f} BTC ({leg.open_side} @ {leg.open_price:.2f}) "
                 f"may still be open. MANUAL CHECK RECOMMENDED."
             )
@@ -8617,7 +8666,7 @@ class GridBot:
                 )
                 self._alerter.send(
                     f"⚠️ record_fill DB write failed for leg #{leg.leg_id} "
-                    f"{log_verb} ({reason}) after retries — see log. Leg is "
+                    f"{log_verb} ({_md_escape(reason)}) after retries — see log. Leg is "
                     f"correctly closed; only its PnL record is missing."
                 )
 
@@ -8643,7 +8692,7 @@ class GridBot:
                 )
                 self._alerter.send(
                     f"🚨 GHOST-LEG RISK: close_leg DB write failed for leg "
-                    f"#{leg.leg_id} ({reason}) after retries — see log. Manual "
+                    f"#{leg.leg_id} ({_md_escape(reason)}) after retries — see log. Manual "
                     f"DB cleanup recommended before the next rebuild/restart."
                 )
         if self._engine is not None:
@@ -8652,7 +8701,7 @@ class GridBot:
                 self._engine._chasing_leg_ids.discard(leg.leg_id)
 
         self._alerter.send(
-            f"🔁 {alert_label} ({reason})\n"
+            f"🔁 {_md_escape(alert_label)} ({_md_escape(reason)})\n"
             f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
             f"(opened {leg.open_side} @ {leg.open_price:.2f}) | "
             f"realized {gross_pnl:+.4f} USD"
@@ -8715,7 +8764,7 @@ class GridBot:
                 )
                 self._alerter.send(
                     f"⚠️ record_fill DB write failed for leg #{leg.leg_id} "
-                    f"partial chase-close ({reason}) after retries — see log."
+                    f"partial chase-close ({_md_escape(reason)}) after retries — see log."
                 )
 
         leg.qty = max(0.0, leg.qty - fill.filled_qty)
@@ -8734,12 +8783,12 @@ class GridBot:
                 )
                 self._alerter.send(
                     f"🚨 reduce_leg_qty DB write failed for leg #{leg.leg_id} "
-                    f"({reason}) after retries — see log. Restart risk: a "
+                    f"({_md_escape(reason)}) after retries — see log. Restart risk: a "
                     f"stale, larger qty would be re-seeded."
                 )
 
         self._alerter.send(
-            f"🔁 Leg partially closed via chase ({reason})\n"
+            f"🔁 Leg partially closed via chase ({_md_escape(reason)})\n"
             f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
             f"(opened {leg.open_side} @ {leg.open_price:.2f}) | "
             f"realized {gross_pnl:+.4f} USD | {leg.qty:.4f} BTC remaining"
@@ -10723,13 +10772,13 @@ def _parse_args():
     parser.add_argument(
         "--reset-state", action="store_true",
         help=(
-            "Wipe persisted fill history, daily PnL, and accumulated PnL "
-            "(grid_fills/daily_pnl/meta tables) so the bot starts fresh, "
-            "as if this were the very first launch. A timestamped backup "
-            "of the db file is taken automatically before wiping. This does "
-            "NOT close or affect any real position/orders on the exchange — "
-            "those are independently reconciled on every startup regardless "
-            "of this flag."
+            "Wipe persisted fill history, daily PnL, accumulated PnL, and "
+            "open legs (grid_fills/daily_pnl/meta/open_legs tables) so the "
+            "bot starts fresh, as if this were the very first launch. A "
+            "timestamped backup of the db file is taken automatically "
+            "before wiping. This does NOT close or affect any real "
+            "position/orders on the exchange — those are independently "
+            "reconciled on every startup regardless of this flag."
         ),
     )
     parser.add_argument(
@@ -10774,7 +10823,8 @@ def main():
         warning = (
             "\n" + "=" * 70 +
             "\n⚠️  --reset-state: this will PERMANENTLY clear all persisted\n"
-            "   fill history, daily PnL, and accumulated PnL for this bot.\n"
+            "   fill history, daily PnL, accumulated PnL, and open legs\n"
+            "   for this bot.\n"
             "   (A backup of the db file is taken automatically first.)\n"
             "   Live exchange orders/positions are NOT affected.\n" +
             "=" * 70
