@@ -1661,7 +1661,7 @@ class OMS:
                 # grid cell fills) is queued behind. See
                 # _paper_maker_fill_with_timeout()'s docstring.
                 threading.Thread(
-                    target=self._paper_maker_fill_with_timeout, args=(req,),
+                    target=self._paper_maker_fill_with_timeout_safe, args=(req,),
                     name=f"paper-maker-timeout-{req.client_oid[:8]}",
                     daemon=True).start()
             else:
@@ -1751,16 +1751,26 @@ class OMS:
         Runs on its own thread (see _process_order), not the shared
         OMS-worker thread — otherwise a single resting leg-chase order
         would stall every other queued order, including ordinary grid
-        fills, for up to maker_timeout_s. NOTE: live mode has this same
-        shape of problem today — _live_fill() calls
-        _maker_timeout_handler() synchronously on OMS-worker — that's a
-        separate, more consequential issue and is deliberately not touched
-        here.
+        fills, for up to maker_timeout_s. Live mode had this same shape
+        of problem, and worse: _live_fill() called _maker_timeout_handler()
+        synchronously on OMS-worker for every POST_ONLY order, not just
+        leg-chase, so it stalled the whole pipeline behind any ordinary
+        resting grid-cell maker order too — fixed alongside this, see
+        _maker_timeout_handler_safe.
         """
         timeout  = req.maker_timeout_s if req.maker_timeout_s is not None else _MAKER_FILL_TIMEOUT
         deadline = time.time() + timeout
         is_buy   = req.side == "BUY"
-        last_l1  = _price_cache.get_l1()
+        # None, not an actual get_l1() reading: if it started as a real
+        # snapshot, a market that was ALREADY crossed at that exact instant
+        # (a narrow but real window — this thread's first read happens
+        # slightly after the price the calling chase attempt priced off
+        # of) would never get evaluated, since only READINGS THAT DIFFER
+        # FROM last_l1 get checked below — and in a quiet/frozen market
+        # that already-crossed state could persist for the whole timeout
+        # unevaluated. None guarantees the first real reading always
+        # differs from it, so it's always checked.
+        last_l1  = None
 
         while time.time() < deadline:
             time.sleep(0.5)
@@ -1804,6 +1814,34 @@ class OMS:
             fee=0.0,
             purpose=req.purpose,
         ))
+
+    def _paper_maker_fill_with_timeout_safe(self, req: OrderRequest):
+        """
+        Thread entry point for _paper_maker_fill_with_timeout() (see
+        _process_order's submission comment for why this runs off
+        OMS-worker). Same reasoning as _maker_timeout_handler_safe for the
+        live-mode path: this now runs on its own daemon thread instead of
+        inline behind _worker_loop's try/except, so an unhandled exception
+        here would otherwise just log a traceback and let the thread die —
+        no FillEvent ever delivered, and the caller's wait_fill() would
+        time out looking identical to an ordinary "never got hit" chase
+        attempt (INFO log), silently hiding whatever actually broke.
+
+        Unlike the live-mode wrapper, there's no self._orders/_exid_to_coid
+        bookkeeping to unwind — paper mode never registers an order there
+        in the first place (see _paper_fill) — so this only needs the
+        error log and the REJECTED fallback delivery.
+        """
+        try:
+            self._paper_maker_fill_with_timeout(req)
+        except Exception as e:
+            logger.error(
+                f"[OMS][PAPER] resting-order simulation error "
+                f"{req.client_oid[:8]}: {e}", exc_info=True)
+            self._deliver_fill(FillEvent(
+                client_oid=req.client_oid,
+                order_id=f"paper-{req.client_oid[:8]}",
+                status=OrderStatus.REJECTED, purpose=req.purpose))
 
     # ── Live fill (REST + WS) ─────────────────────────────────────────────────
 
@@ -3504,6 +3542,18 @@ class OpenLeg:
     qty:              float
     opened_ts:        float
     opened_level_idx: int      # diagnostics only; the leg outlives any one level
+    open_fee:         float = 0.0  # the opening fill's fee. Mutable: shrinks in
+    # lockstep with qty as partial closes each claim their proportional share
+    # (see GridBot._record_partial_leg_close) so it always represents "the fee
+    # attributable to whatever's still open," and the leg's final close
+    # attributes exactly whatever share remains — summing to the full original
+    # opening fee across however many chunks the leg took to close, no matter
+    # how many. 2026-08-05 fix: previously untracked, so every closing-fill
+    # log line's net= silently omitted the opening leg's fee entirely and
+    # only subtracted the closing fill's own — cosmetic (record_fill's own
+    # fee_usd/gross_pnl, and therefore daily_pnl/cumulative_net/status/
+    # alerts, were never affected, since each fill's fee is independently
+    # summed there regardless of open/close), but wrong on the log line.
 
 
 @dataclass
@@ -3694,6 +3744,7 @@ class GridEngine:
                     leg_id=row["leg_id"], open_side=row["open_side"],
                     open_price=row["open_price"], qty=row["qty"],
                     opened_ts=row["opened_ts"], opened_level_idx=row["opened_level_idx"],
+                    open_fee=row.get("open_fee", 0.0),
                 )
                 self._open_legs[leg.leg_id] = leg
             if self._open_legs:
@@ -4218,10 +4269,6 @@ class GridEngine:
           3. Append a new SELL level at old_upper + spacing.
         """
         new_upper = round(old_upper + spacing, 2)
-        logger.info(
-            f"[GridEngine] TRAIL UP: dropping lower={old_lower:.2f}, "
-            f"adding upper={new_upper:.2f}"
-        )
 
         dropped_leg = None
         with self._lock:
@@ -4334,10 +4381,6 @@ class GridEngine:
           3. Prepend a new BUY level at old_lower - spacing.
         """
         new_lower = round(old_lower - spacing, 2)
-        logger.info(
-            f"[GridEngine] TRAIL DOWN: dropping upper={old_upper:.2f}, "
-            f"adding lower={new_lower:.2f}"
-        )
 
         dropped_leg = None
         with self._lock:
@@ -4488,7 +4531,23 @@ class GridEngine:
                 gross_pnl = (leg_closed.open_price - fill.avg_price) * fill.filled_qty
             self._realized_pnl += gross_pnl
             self._cycle_count  += 1
-            net_pnl = gross_pnl - fill.fee
+            # Proportional share of the OPENING fill's fee attributable to
+            # the qty closed by THIS fill — see OpenLeg.open_fee docstring.
+            # leg_closed.qty here is still its pre-this-close value (this
+            # branch doesn't mutate it), and _on_fill's closing path is
+            # always a full close (a grid cell's counter-order is sized to
+            # the leg's exact remaining qty; partial fills only happen via
+            # the leg-chase path, which routes through
+            # GridBot._finalize_leg_close instead — see that method's own
+            # comment), so this reduces to the leg's whole open_fee in
+            # practice. The proportional form is used anyway for
+            # correctness rather than assuming, and so the two closing
+            # paths compute net_pnl identically.
+            open_fee_share = (
+                leg_closed.open_fee * (fill.filled_qty / leg_closed.qty)
+                if leg_closed.qty > 0 else leg_closed.open_fee
+            )
+            net_pnl = gross_pnl - fill.fee - open_fee_share
             if self._store is not None:
                 ok, err = self._retry_db_write(
                     lambda: self._store.close_leg(leg_closed.leg_id))
@@ -4541,6 +4600,7 @@ class GridEngine:
                 ok, result = self._retry_db_write(lambda: self._store.open_leg(
                     open_side=side_str, open_price=fill.avg_price,
                     qty=fill.filled_qty, opened_ts=now, opened_level_idx=idx,
+                    open_fee=fill.fee,
                 ))
                 if ok:
                     leg_id = result
@@ -4582,7 +4642,8 @@ class GridEngine:
                     )
             new_leg = OpenLeg(leg_id=leg_id, open_side=side_str,
                               open_price=fill.avg_price, qty=fill.filled_qty,
-                              opened_ts=now, opened_level_idx=idx)
+                              opened_ts=now, opened_level_idx=idx,
+                              open_fee=fill.fee)
             with self._lock:
                 self._open_legs[leg_id] = new_leg
             net = self._long_qty
@@ -5839,7 +5900,7 @@ class TrendSignal:
 
 import sqlite3 as _sqlite3
 
-_GRID_DB_SCHEMA_VERSION = 8
+_GRID_DB_SCHEMA_VERSION = 10
 
 _GRID_DB_DDL = """
 -- Every grid fill: permanent, append-only audit log.
@@ -5877,7 +5938,8 @@ CREATE TABLE IF NOT EXISTS open_legs (
     open_price        REAL    NOT NULL,
     qty               REAL    NOT NULL,
     opened_ts         REAL    NOT NULL,
-    opened_level_idx  INTEGER NOT NULL
+    opened_level_idx  INTEGER NOT NULL,
+    open_fee          REAL    NOT NULL DEFAULT 0.0  -- see OpenLeg.open_fee docstring
 );
 
 -- Pre-aggregated daily PnL (HKT date); updated atomically with each fill.
@@ -5892,7 +5954,17 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
     fill_count    INTEGER NOT NULL DEFAULT 0,
     cycle_count   INTEGER NOT NULL DEFAULT 0,
     sl_gross_usd  REAL NOT NULL DEFAULT 0.0,  -- stop-loss gross PnL (always ≤ 0)
-    sl_count      INTEGER NOT NULL DEFAULT 0   -- number of stop-loss liquidation events
+    sl_count      INTEGER NOT NULL DEFAULT 0,  -- number of stop-loss liquidation events
+    -- Forced-close gross PnL/count: legs closed via _finalize_leg_close /
+    -- _record_partial_leg_close — rebuild_reprice, rebuild_reprice_pending,
+    -- trail_up, trail_down, and their *_chase_exhausted market-fallback
+    -- variants (see record_fill's is_reprice_loss param). A different risk
+    -- category from sl_*: these are individual legs cut loose by the grid
+    -- range moving away from them, not a whole-grid stop-loss halt — kept
+    -- as a separate bucket rather than folded into sl_* so /status can show
+    -- each distinctly instead of one number conflating two different causes.
+    reprice_gross_usd REAL NOT NULL DEFAULT 0.0,
+    reprice_count     INTEGER NOT NULL DEFAULT 0
 );
 
 -- Key/value metadata store.
@@ -6086,6 +6158,63 @@ class GridStateStore:
                         "real per-leg cost basis replacing the adjacent-level-"
                         "price assumption)"
                     )
+                # v8->v9: reprice_gross_usd + reprice_count columns added to
+                # daily_pnl — mirrors v2->v3's sl_gross_usd/sl_count, but for
+                # forced-close legs (rebuild_reprice, rebuild_reprice_pending,
+                # trail_up, trail_down) rather than stop-loss. Previously
+                # these losses were already correctly included in
+                # gross_pnl_usd/net_pnl_usd (record_fill's cycles_delta and
+                # sl_* logic aside, every fill contributes to the plain
+                # totals regardless of reason) but were invisible as a
+                # distinct category in /status, and were miscounted into
+                # cycle_count as if they were completed grid cycles rather
+                # than forced early exits. See the 2026-08-04 status-report
+                # request this fixes.
+                if db_ver < 9:
+                    for col, typedef in [
+                        ("reprice_gross_usd", "REAL NOT NULL DEFAULT 0.0"),
+                        ("reprice_count",     "INTEGER NOT NULL DEFAULT 0"),
+                    ]:
+                        try:
+                            self._conn.execute(
+                                f"ALTER TABLE daily_pnl ADD COLUMN {col} {typedef}"
+                            )
+                        except Exception:
+                            pass  # column already exists (idempotent)
+                    logger.info(
+                        "[GridStateStore] schema migrated -> v9 "
+                        "(daily_pnl reprice_gross_usd/reprice_count columns)"
+                    )
+                # v9->v10: open_fee column added to open_legs, so a leg's
+                # opening fill's fee survives alongside it (see OpenLeg.
+                # open_fee docstring) instead of only ever being visible at
+                # the moment the opening fill itself was logged. Fixes the
+                # closing-fill log line's net= (in GridEngine._on_fill and
+                # GridBot._finalize_leg_close), which previously subtracted
+                # only the closing fill's own fee — cosmetic only, since
+                # record_fill's persisted fee_usd/gross_pnl (and therefore
+                # daily_pnl/cumulative_net/status/alerts) already correctly
+                # summed every fill's fee independently regardless of
+                # open/close. Any leg already open at migration time has no
+                # recorded opening fee to backfill (that fill already
+                # happened and its fee is only preserved in grid_fills, not
+                # linked back to this specific still-open leg row) — its
+                # own open_fee defaults to 0.0, so its eventual closing log
+                # line will still undercount the same way it did before
+                # this fix, exactly once, until it closes. Every leg opened
+                # after this migration is fully correct from the start.
+                if db_ver < 10:
+                    try:
+                        self._conn.execute(
+                            "ALTER TABLE open_legs ADD COLUMN open_fee "
+                            "REAL NOT NULL DEFAULT 0.0"
+                        )
+                    except Exception:
+                        pass  # column already exists (idempotent)
+                    logger.info(
+                        "[GridStateStore] schema migrated -> v10 "
+                        "(open_legs.open_fee column)"
+                    )
                 if db_ver < _GRID_DB_SCHEMA_VERSION:
                     self._conn.execute(
                         "UPDATE meta SET value=? WHERE key='schema_version'",
@@ -6106,6 +6235,7 @@ class GridStateStore:
         gross_pnl:      float,     # 0.0 for an opening fill
         cycle_num:      int,
         is_liquidation: bool = False,  # True for stop-loss / shutdown liquidations
+        is_reprice_loss: bool = False,  # True for rebuild_reprice(_pending)/trail_up/trail_down closes
         leg_id:         Optional[int] = None,   # open_legs.leg_id this fill opened/closed
         close_reason:   Optional[str] = None,   # e.g. 'rebuild_reprice'; NULL = normal cycle
         is_close:       bool = False,           # True if this fill closed a leg (real PnL)
@@ -6126,10 +6256,24 @@ class GridStateStore:
         undercount cycle_count/fill_count for daily_pnl whenever a short is
         involved, while gross_pnl_usd/net_pnl_usd stayed correct — a visible
         inconsistency between the dollar totals and the cycle tally.
+
+        is_liquidation and is_reprice_loss are mutually exclusive in
+        practice (the former only ever comes from _liquidate_position's own
+        stop-loss caller, the latter only from _finalize_leg_close /
+        _record_partial_leg_close) and both mean the same thing for
+        gross_pnl_usd/net_pnl_usd/cycle_count purposes: this wasn't a leg
+        reaching its own designed grid-cell price, so it's excluded from
+        cycle_count the same way, just tallied into a different bucket
+        (sl_* vs reprice_*) for /status to report separately — different
+        risk categories (a whole-grid stop-loss halt vs. an individual leg
+        cut loose by range drift), so kept visually distinct rather than
+        combined into one "not a real cycle" number.
         """
         hkt_date = _db_hkt_date(ts_utc)
-        # Liquidation SELLs (stop-loss) are not completed grid cycles.
-        cycles_delta = 1 if is_close and not is_liquidation else 0
+        # Liquidation SELLs (stop-loss) and forced repricing/trail closes are
+        # not completed grid cycles.
+        not_a_cycle  = is_liquidation or is_reprice_loss
+        cycles_delta = 1 if is_close and not not_a_cycle else 0
 
         with self._lock:
             self._conn.execute(
@@ -6141,23 +6285,27 @@ class GridStateStore:
                  qty_btc, fee_usd, gross_pnl, cycle_num, leg_id, close_reason),
             )
             # Update daily bucket — fees stored as negative (cost subtracted from net)
-            sl_gross = gross_pnl if is_liquidation else 0.0
-            sl_delta = 1         if is_liquidation else 0
+            sl_gross      = gross_pnl if is_liquidation  else 0.0
+            sl_delta      = 1         if is_liquidation  else 0
+            reprice_gross = gross_pnl if is_reprice_loss else 0.0
+            reprice_delta = 1         if is_reprice_loss else 0
             self._conn.execute(
                 """INSERT INTO daily_pnl
                    (hkt_date, gross_pnl_usd, fees_usd, net_pnl_usd, fill_count, cycle_count,
-                    sl_gross_usd, sl_count)
-                   VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    sl_gross_usd, sl_count, reprice_gross_usd, reprice_count)
+                   VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                    ON CONFLICT(hkt_date) DO UPDATE SET
-                       gross_pnl_usd = gross_pnl_usd + excluded.gross_pnl_usd,
-                       fees_usd      = fees_usd      + excluded.fees_usd,
-                       net_pnl_usd   = net_pnl_usd   + excluded.gross_pnl_usd + excluded.fees_usd,
-                       fill_count    = fill_count    + 1,
-                       cycle_count   = cycle_count   + excluded.cycle_count,
-                       sl_gross_usd  = sl_gross_usd  + excluded.sl_gross_usd,
-                       sl_count      = sl_count      + excluded.sl_count""",
+                       gross_pnl_usd     = gross_pnl_usd     + excluded.gross_pnl_usd,
+                       fees_usd          = fees_usd          + excluded.fees_usd,
+                       net_pnl_usd       = net_pnl_usd       + excluded.gross_pnl_usd + excluded.fees_usd,
+                       fill_count        = fill_count        + 1,
+                       cycle_count       = cycle_count       + excluded.cycle_count,
+                       sl_gross_usd      = sl_gross_usd      + excluded.sl_gross_usd,
+                       sl_count          = sl_count          + excluded.sl_count,
+                       reprice_gross_usd = reprice_gross_usd + excluded.reprice_gross_usd,
+                       reprice_count     = reprice_count     + excluded.reprice_count""",
                 (hkt_date, gross_pnl, -fee_usd, gross_pnl - fee_usd, cycles_delta,
-                 sl_gross, sl_delta),
+                 sl_gross, sl_delta, reprice_gross, reprice_delta),
             )
             self._conn.commit()
 
@@ -6170,14 +6318,15 @@ class GridStateStore:
     # get_accumulated() today.
 
     def open_leg(self, open_side: str, open_price: float, qty: float,
-                 opened_ts: float, opened_level_idx: int) -> int:
+                 opened_ts: float, opened_level_idx: int,
+                 open_fee: float = 0.0) -> int:
         """Insert a new open leg row. Returns its leg_id."""
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO open_legs
-                   (open_side, open_price, qty, opened_ts, opened_level_idx)
-                   VALUES (?,?,?,?,?)""",
-                (open_side, open_price, qty, opened_ts, opened_level_idx),
+                   (open_side, open_price, qty, opened_ts, opened_level_idx, open_fee)
+                   VALUES (?,?,?,?,?,?)""",
+                (open_side, open_price, qty, opened_ts, opened_level_idx, open_fee),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -6188,7 +6337,8 @@ class GridStateStore:
             self._conn.execute("DELETE FROM open_legs WHERE leg_id = ?", (leg_id,))
             self._conn.commit()
 
-    def reduce_leg_qty(self, leg_id: int, new_qty: float) -> None:
+    def reduce_leg_qty(self, leg_id: int, new_qty: float,
+                        new_open_fee: Optional[float] = None) -> None:
         """
         Persist a partial close in place: shrink an open leg's remaining
         qty rather than deleting it. Used when a leg is being closed
@@ -6199,10 +6349,24 @@ class GridStateStore:
         GridEngine._open_legs from this table must see the reduced
         amount, not the pre-partial original (which would overstate
         actual exposure and mis-size the next closing order).
+
+        new_open_fee mirrors the same reasoning for open_fee (see OpenLeg.
+        open_fee docstring): each partial chunk claims its proportional
+        share of the leg's opening fee, so the DB row's remaining share
+        must shrink in lockstep with qty — otherwise a restart mid-chase
+        would re-seed the pre-partial (too large) open_fee, and the leg's
+        eventual final close would double-count the share partial chunks
+        already claimed. None (default) leaves open_fee untouched, for any
+        future caller that only ever needs to adjust qty.
         """
         with self._lock:
-            self._conn.execute(
-                "UPDATE open_legs SET qty = ? WHERE leg_id = ?", (new_qty, leg_id))
+            if new_open_fee is not None:
+                self._conn.execute(
+                    "UPDATE open_legs SET qty = ?, open_fee = ? WHERE leg_id = ?",
+                    (new_qty, new_open_fee, leg_id))
+            else:
+                self._conn.execute(
+                    "UPDATE open_legs SET qty = ? WHERE leg_id = ?", (new_qty, leg_id))
             self._conn.commit()
 
     def rollback(self) -> None:
@@ -6268,7 +6432,8 @@ class GridStateStore:
         """All currently-open legs — used to seed GridEngine._open_legs."""
         with self._lock:
             rows = self._conn.execute(
-                """SELECT leg_id, open_side, open_price, qty, opened_ts, opened_level_idx
+                """SELECT leg_id, open_side, open_price, qty, opened_ts,
+                          opened_level_idx, open_fee
                    FROM open_legs"""
             ).fetchall()
         return [dict(r) for r in rows]
@@ -6286,13 +6451,16 @@ class GridStateStore:
                        COALESCE(SUM(fill_count),     0)   AS fill_count,
                        COALESCE(SUM(cycle_count),    0)   AS cycle_count,
                        COALESCE(SUM(sl_gross_usd),  0.0) AS sl_gross,
-                       COALESCE(SUM(sl_count),       0)   AS sl_count
+                       COALESCE(SUM(sl_count),       0)   AS sl_count,
+                       COALESCE(SUM(reprice_gross_usd), 0.0) AS reprice_gross,
+                       COALESCE(SUM(reprice_count),      0)   AS reprice_count
                    FROM daily_pnl"""
             ).fetchone()
         return dict(row) if row else {
             "gross_pnl": 0.0, "fees": 0.0, "net_pnl": 0.0,
             "fill_count": 0,  "cycle_count": 0,
             "sl_gross": 0.0,  "sl_count": 0,
+            "reprice_gross": 0.0, "reprice_count": 0,
         }
 
     # ── Daily PnL ─────────────────────────────────────────────────────────────
@@ -6311,6 +6479,7 @@ class GridStateStore:
             "hkt_date": hkt_date, "gross_pnl_usd": 0.0, "fees_usd": 0.0,
             "net_pnl_usd": 0.0, "fill_count": 0, "cycle_count": 0,
             "sl_gross_usd": 0.0, "sl_count": 0,
+            "reprice_gross_usd": 0.0, "reprice_count": 0,
         }
 
     def get_recent_daily(self, days: int = 7) -> list:
@@ -8801,7 +8970,23 @@ class GridBot:
             gross_pnl = (fill.avg_price - leg.open_price) * fill.filled_qty
         else:
             gross_pnl = (leg.open_price - fill.avg_price) * fill.filled_qty
-        net_pnl = gross_pnl - fill.fee
+        # Proportional share of the opening fill's fee attributable to the
+        # qty closed by THIS fill — see OpenLeg.open_fee docstring and
+        # GridEngine._on_fill's identical formula. leg.qty here is still
+        # its pre-this-close value (this function doesn't mutate it) and
+        # this is always the FINAL close for whatever's left of the leg
+        # (a prior partial chunk, if any, already claimed its own share
+        # via _record_partial_leg_close and shrunk leg.open_fee/leg.qty in
+        # lockstep) — so fill.filled_qty == leg.qty here and this reduces
+        # to attributing whatever open_fee remains, in full. The
+        # proportional form is used anyway rather than assuming, so a
+        # rounding-off qty mismatch degrades gracefully instead of over-
+        # or under-attributing.
+        open_fee_share = (
+            leg.open_fee * (fill.filled_qty / leg.qty)
+            if leg.qty > 0 else leg.open_fee
+        )
+        net_pnl = gross_pnl - fill.fee - open_fee_share
 
         logger.warning(
             f"[GridBot]{tag} Leg #{leg.leg_id} {log_verb}: {close_side} "
@@ -8815,7 +9000,7 @@ class GridBot:
                 ts_utc=time.time(), side=close_side, level_idx=-1,
                 price_usd=fill.avg_price, qty_btc=fill.filled_qty,
                 fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
-                is_liquidation=False, leg_id=leg.leg_id,
+                is_liquidation=False, is_reprice_loss=True, leg_id=leg.leg_id,
                 close_reason=reason, is_close=True,
             ))
             if not ok_rf:
@@ -8896,19 +9081,35 @@ class GridBot:
         the eventual market-fallback qty, _long_qty/stats, and a
         mid-chase process restart re-seeding from DB — sees only what's
         actually left, not the pre-partial original.
+
+        leg.open_fee is shrunk the same way, in lockstep: this chunk
+        claims its proportional share of whatever open_fee is still
+        unclaimed (fill.filled_qty / leg.qty, using leg.qty's value
+        BEFORE this chunk's reduction), so that share isn't available to
+        be claimed again by a later chunk or the eventual final close —
+        see OpenLeg.open_fee docstring. This function doesn't compute or
+        log a net= figure itself (no caller currently surfaces one for a
+        partial chunk), but gets this right anyway so whichever call
+        eventually finishes the leg (_finalize_leg_close) sees a
+        correctly-reduced open_fee rather than double-attributing a share
+        this chunk already took.
         """
         tag = f"[{reason}]"
         if leg.open_side == "BUY":
             gross_pnl = (fill.avg_price - leg.open_price) * fill.filled_qty
         else:
             gross_pnl = (leg.open_price - fill.avg_price) * fill.filled_qty
+        open_fee_share = (
+            leg.open_fee * (fill.filled_qty / leg.qty)
+            if leg.qty > 0 else leg.open_fee
+        )
 
         if self._store is not None:
             ok, err = self._store.execute_with_retry(lambda: self._store.record_fill(
                 ts_utc=time.time(), side=close_side, level_idx=-1,
                 price_usd=fill.avg_price, qty_btc=fill.filled_qty,
                 fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
-                is_liquidation=False, leg_id=leg.leg_id,
+                is_liquidation=False, is_reprice_loss=True, leg_id=leg.leg_id,
                 close_reason=reason,
                 # is_close=False: this chunk does NOT close the leg — it
                 # stays in _open_legs/DB with qty shrunk (see below), so it
@@ -8938,9 +9139,10 @@ class GridBot:
                 )
 
         leg.qty = max(0.0, leg.qty - fill.filled_qty)
+        leg.open_fee = max(0.0, leg.open_fee - open_fee_share)
         if self._store is not None:
             ok_r, err_r = self._store.execute_with_retry(
-                lambda: self._store.reduce_leg_qty(leg.leg_id, leg.qty))
+                lambda: self._store.reduce_leg_qty(leg.leg_id, leg.qty, leg.open_fee))
             if not ok_r:
                 logger.critical(
                     f"[GridBot]{tag} PERSISTENT reduce_leg_qty FAILURE for "
@@ -10535,6 +10737,10 @@ class GridBot:
           - Cumulative all-time net
           - Today's net (HKT day)
           - SL losses today
+          - Reprice/trail losses today (rebuild_reprice(_pending), trail_up,
+            trail_down — legs cut loose by grid range drift, a different
+            risk category from a stop-loss halt; see record_fill's
+            is_reprice_loss param)
           - Estimated funding accrued (all-time, from DB)
           - Last 7 daily rows
         """
@@ -10547,12 +10753,16 @@ class GridBot:
         cum_fees     = acc.get("fees",      0.0)
         cum_cycles   = acc.get("cycle_count", 0)
         cum_sl       = acc.get("sl_gross",  0.0)
+        cum_reprice  = acc.get("reprice_gross", 0.0)
+        cum_reprice_n = acc.get("reprice_count", 0)
 
         today_net    = today.get("net_pnl_usd",   0.0)
         today_gross  = today.get("gross_pnl_usd", 0.0)
         today_fees   = today.get("fees_usd",      0.0)
         today_cycles = today.get("cycle_count",   0)
         today_sl     = today.get("sl_gross_usd",  0.0)
+        today_reprice = today.get("reprice_gross_usd", 0.0)
+        today_reprice_n = today.get("reprice_count", 0)
 
         funding_usd  = self._get_funding_accrued()
         net_after_funding = cum_net + funding_usd   # funding already negative if cost
@@ -10568,6 +10778,7 @@ class GridBot:
             f"  Gross:    {_s(cum_gross)} USD",
             f"  Fees:     {_s(-abs(cum_fees))} USD",
             f"  SL loss:  {_s(cum_sl)} USD",
+            f"  Reprice/trail loss: {_s(cum_reprice)} USD (×{cum_reprice_n})",
             f"  Funding:  {_s(funding_usd)} USD (est.)",
             f"  Net+fund: {_s(net_after_funding)} USD",
             f"  Cycles:   {cum_cycles}",
@@ -10577,6 +10788,7 @@ class GridBot:
             f"  Gross:    {_s(today_gross)} USD",
             f"  Fees:     {_s(-abs(today_fees))} USD",
             f"  SL loss:  {_s(today_sl)} USD",
+            f"  Reprice/trail loss: {_s(today_reprice)} USD (×{today_reprice_n})",
             f"  Cycles:   {today_cycles}",
         ]
 
@@ -10683,12 +10895,16 @@ class GridBot:
         daily_net   = today["net_pnl_usd"]
         daily_sl    = today.get("sl_gross_usd", 0.0)
         daily_sl_n  = today.get("sl_count", 0)
+        daily_reprice   = today.get("reprice_gross_usd", 0.0)
+        daily_reprice_n = today.get("reprice_count", 0)
         acc_net     = acc["net_pnl"]
         acc_gross   = acc["gross_pnl"]
         acc_fees    = acc["fees"]          # stored as negative in DB
         acc_cycles  = acc["cycle_count"]
         acc_sl      = acc.get("sl_gross", 0.0)
         acc_sl_n    = acc.get("sl_count", 0)
+        acc_reprice   = acc.get("reprice_gross", 0.0)
+        acc_reprice_n = acc.get("reprice_count", 0)
 
         # ── Live price ────────────────────────────────────────────────────────
         mid = _price_cache.get_mid()
@@ -10744,11 +10960,14 @@ class GridBot:
         for row in history:
             sign = "✅" if row["net_pnl_usd"] >= 0 else "❌"
             sl_tag = f"  🚨SL={row.get('sl_gross_usd', 0.0):+.4f}" if row.get("sl_count", 0) > 0 else ""
+            reprice_tag = (f"  🔁Reprice={row.get('reprice_gross_usd', 0.0):+.4f}×{row.get('reprice_count', 0)}"
+                           if row.get("reprice_count", 0) > 0 else "")
             hist_lines.append(
                 f"  {sign} {row['hkt_date']}  "
                 f"net={row['net_pnl_usd']:+.4f}  "
                 f"cycles={row['cycle_count']}"
                 f"{sl_tag}"
+                f"{reprice_tag}"
             )
         hist_block = "\n".join(hist_lines) if hist_lines else "  (no data yet)"
 
@@ -10794,6 +11013,7 @@ class GridBot:
             f"  {_e(daily_net)}  Net:   `{daily_net:+.4f} USD` (`{_pct(daily_net)}`)",
             f"  • Gross: `{today['gross_pnl_usd']:+.4f}`"
             + (f" _(incl. 🚨SL `{daily_sl:+.4f}` ×{daily_sl_n})_" if daily_sl_n > 0 else "")
+            + (f" _(incl. 🔁Reprice `{daily_reprice:+.4f}` ×{daily_reprice_n})_" if daily_reprice_n > 0 else "")
             + f"  Fees: `{today['fees_usd']:+.4f}`"
             + (f" _({abs(today['fees_usd']) / today['gross_pnl_usd'] * 100:.1f}% of gross)_"
                if today['gross_pnl_usd'] != 0 else ""),
@@ -10803,7 +11023,8 @@ class GridBot:
             "*3️⃣  Accumulated PnL* (all-time from DB)",
             f"  {_e(acc_net)}  Net:   `{acc_net:+.4f} USD` (`{_pct(acc_net)}`)",
             f"  • Gross realised: `{acc_gross:+.4f} USD`"
-            + (f" _(incl. 🚨SL `{acc_sl:+.4f}` ×{acc_sl_n})_" if acc_sl_n > 0 else ""),
+            + (f" _(incl. 🚨SL `{acc_sl:+.4f}` ×{acc_sl_n})_" if acc_sl_n > 0 else "")
+            + (f" _(incl. 🔁Reprice `{acc_reprice:+.4f}` ×{acc_reprice_n})_" if acc_reprice_n > 0 else ""),
             f"  • Total fees:     `{acc_fees:+.4f} USD`"
             + (f" _({abs(acc_fees) / acc_gross * 100:.1f}% of gross)_"
                if acc_gross != 0 else ""),
