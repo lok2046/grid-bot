@@ -6684,18 +6684,18 @@ class GridStateStore:
         launch, reset or not, so a stale live position is still detected and
         liquidated exactly as before.
 
-        open_legs is included in the wipe (2026-08-03 fix): a normal
-        stop()/_liquidate_position() closes the net position with one
-        aggregate market order but — by design, see _liquidate_position's
-        docstring — never calls close_leg() on the individual rows that made
-        up that net, so they silently survive even a clean shutdown. Left
-        alone, GridEngine.__init__ unconditionally reseeds _open_legs from
-        these stale rows on the next launch regardless of this flag,
-        resurrecting a phantom position (and, post-refactor, leg rows whose
-        opened_level_idx was assigned under the old level model) into a
-        supposedly fresh process. Discovered during the grid-cells fresh-
-        start deploy: a liquidated 0.016 BTC net position left two open_legs
-        rows (a 0.032 BUY + a 0.016 SELL) behind after a clean stop.
+        open_legs is included in the wipe (2026-08-03). Originally needed
+        because _liquidate_position() left the individual rows that made up
+        a liquidated net position behind (no close_leg() call), so this
+        wipe was the only thing preventing them resurrecting as a phantom
+        position on the next launch. 2026-08-05: _liquidate_position() now
+        closes those rows itself right after its fill confirms (see that
+        method), which also covers the auto-restart path this wipe never
+        reached (auto-restart rebuilds in place / on a fresh process
+        without going through reset_state() at all — see the 2026-08-05
+        stop-loss incident that exposed exactly that gap). Keeping this
+        wipe anyway as a belt-and-suspenders clean slate for an explicit
+        reset, not because it's still the only protection.
 
         If backup=True (default), the WAL is checkpointed and the db file is
         copied to "<db_path>.bak-<timestamp>" before anything is wiped, so
@@ -8885,6 +8885,58 @@ class GridBot:
                 f"🔴 Position closed ({_md_escape(reason)})\n"
                 f"Sold {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f}{pnl_note}"
             )
+
+            # Close out the underlying per-leg open_legs rows this aggregate
+            # fill just settled. This method always liquidates the WHOLE
+            # position (every call site above passes the full long_qty /
+            # stale_qty, never a partial amount), so every leg still marked
+            # open in the DB at this point is, by definition, now closed —
+            # there is no partial-liquidation case here that would make
+            # closing ALL of them wrong.
+            #
+            # 2026-08-05 fix: this was a known, previously-worked-around gap
+            # (see reset_state()'s open_legs-wipe comment, 2026-08-03) —
+            # _liquidate_position recorded ONE aggregate record_fill row but
+            # never called close_leg() on the individual rows that made up
+            # that net qty, so they silently survived. reset_state() wiping
+            # open_legs only helped a manual --reset-state cold start; it
+            # never touched the auto-restart path, which rebuilds the grid
+            # in-process/on-restart without going through reset_state() at
+            # all. Confirmed in the 2026-08-05 11:19 stop-loss incident: the
+            # 1-hour-later auto-restart re-seeded all 3 already-liquidated
+            # legs from these stale rows (net_qty showing +0.0240 against an
+            # already-flat position), and immediately chase-closed all 3
+            # AGAIN — a second, phantom liquidation of BTC that was already
+            # sold, roughly doubling the reported loss (-4.1969 real +
+            # -4.4453 phantom) on top of corrupting net_qty tracking. In
+            # live mode this would be worse: a real duplicate SELL against
+            # an already-flat exchange position, not just a paper-mode
+            # accounting artifact.
+            if self._store is not None:
+                try:
+                    stale_legs = self._store.get_open_legs()
+                except Exception as e:
+                    stale_legs = []
+                    logger.error(
+                        f"[GridBot]{tag} Failed to read open_legs for "
+                        f"post-liquidation cleanup: {e}"
+                    )
+                for row in stale_legs:
+                    try:
+                        self._store.close_leg(row["leg_id"])
+                    except Exception as e:
+                        logger.error(
+                            f"[GridBot]{tag} Failed to close_leg(#{row['leg_id']}) "
+                            f"during post-liquidation cleanup: {e}"
+                        )
+                if stale_legs:
+                    logger.warning(
+                        f"[GridBot]{tag} Post-liquidation cleanup: closed "
+                        f"{len(stale_legs)} open_legs row(s) "
+                        f"({sorted(r['leg_id'] for r in stale_legs)}) that this "
+                        f"aggregate fill settled — prevents them resurfacing "
+                        f"as a phantom position on the next rebuild/restart."
+                    )
         else:
             logger.error(
                 f"[GridBot]{tag} Liquidation fill TIMED OUT — "
