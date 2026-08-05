@@ -10958,6 +10958,22 @@ class GridBot:
         acc_reprice   = acc.get("reprice_gross", 0.0)
         acc_reprice_n = acc.get("reprice_count", 0)
 
+        # ── TradeProfit: pure grid-cycle capture, stripped of the one-off
+        # SL / chase-reprice events, so it's visible on its own whether
+        # ordinary buy-low/sell-high cycling is working even on a day where
+        # SL/Reprice swamp the headline Gross/Net numbers.
+        # IMPORTANT: per the daily_pnl schema (net_pnl_usd = gross_pnl_usd +
+        # fees_usd), fees_usd is NOT a component of gross_pnl_usd — it's
+        # applied once, separately, to get net. sl_gross_usd/reprice_gross_usd
+        # ARE pre-fee subsets of gross_pnl_usd (see their "_gross_usd" naming
+        # and the daily_pnl table comment). So TradeProfit here is still
+        # gross/pre-fee — do NOT subtract fees_usd again on top, that would
+        # double-count fees that are already excluded from gross_pnl_usd.
+        #   Gross = TradeProfit + SL + Reprice   (fees not part of this)
+        #   Net   = Gross + Fees                 (fees applied once, here)
+        daily_trade_profit = today["gross_pnl_usd"] - daily_sl - daily_reprice
+        acc_trade_profit   = acc_gross - acc_sl - acc_reprice
+
         # ── Live price ────────────────────────────────────────────────────────
         mid = _price_cache.get_mid()
         mid_str = f"${mid:,.2f}" if mid is not None else "N/A"
@@ -11069,6 +11085,8 @@ class GridBot:
             + f"  Fees: `{today['fees_usd']:+.4f}`"
             + (f" _({abs(today['fees_usd']) / today['gross_pnl_usd'] * 100:.1f}% of gross)_"
                if today['gross_pnl_usd'] != 0 else ""),
+            f"  {_e(daily_trade_profit)} Trade P/L: `{daily_trade_profit:+.4f}`"
+            + " _(ex SL/Reprice, gross/pre-fee — pure grid-cycle capture)_",
             f"  • Cycles today: `{today['cycle_count']}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
@@ -11080,6 +11098,8 @@ class GridBot:
             f"  • Total fees:     `{acc_fees:+.4f} USD`"
             + (f" _({abs(acc_fees) / acc_gross * 100:.1f}% of gross)_"
                if acc_gross != 0 else ""),
+            f"  {_e(acc_trade_profit)} Trade P/L: `{acc_trade_profit:+.4f} USD`"
+            + " _(ex SL/Reprice, gross/pre-fee — pure grid-cycle capture)_",
             f"  • Total cycles:   `{acc_cycles}`",
             "",
             "━━━━━━━━━━━━━━━━━━━━━",
