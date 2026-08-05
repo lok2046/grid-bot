@@ -801,6 +801,37 @@ GRID_CONFIG: dict = {
     "trend_gate_outside_range_block_on_up": True,  # block ALL sells when UP + OUTSIDE_RANGE (above upper)
     "sell_gate_block_on_confirmed_uptrend": True,  # also suppress once drift_shift_trend_confirm_count is met
 
+    # ── Trail-flip: stop seeding fresh shorts/longs INTO a confirmed move (2026-08-05) ──
+    # SellGate (above) only gates the counter-SELL placed after a cell's own
+    # BUY leg fills — it never touched GridEngine._trail_up's Step 2, which
+    # unconditionally opens a BRAND NEW SELL (a fresh short) at the new top
+    # cell every single time the grid trails up, by design ("a trail up
+    # always seeds a fresh short as the natural continuation of the
+    # breakout that triggered it"). That is exactly backwards during a
+    # confirmed, persistent uptrend: each fresh short opened this way has
+    # only one spacing of headroom before the NEXT trail_up drops it again,
+    # handing it to the stray-leg chase, which force-closes it at an
+    # ever-worse (higher) price. 2026-08-05 07:09-13:26: 11 separate
+    # trail_up chase-closes this way in one session, -13.25 USD, while
+    # SellGate (guarding a different code path) stayed green the whole
+    # time. BuyGate/_trail_down has the exact mirror problem on the way
+    # down.
+    #
+    # Fix: when the SAME confirmed-uptrend predicate SellGate already uses
+    # (GridBot._sell_gate, via GridEngine._sell_gate_fn) is blocking, the
+    # new top cell TRAIL UP creates opens as a BUY (a dip-buy level)
+    # instead of a fresh SELL. This is mechanically safe specifically here
+    # — unlike a blanket "flip every SELL cell above mid" — because
+    # TRAIL UP only fires once mid has already cleared new_upper, so the
+    # new cell's entire range (and therefore its lower boundary, where the
+    # BUY would rest) is guaranteed to already be BELOW current mid: a
+    # legitimate passive resting order, never one that crosses the spread.
+    # Mirrored for TRAIL DOWN using GridEngine._buy_gate_fn (BuyGate's
+    # confirmed-DOWN read: TrendSignal DOWN regime + score threshold —
+    # see GridBot._buy_gate).
+    "trail_flip_to_buy_on_confirmed_uptrend":     True,
+    "trail_flip_to_sell_on_confirmed_downtrend":  True,
+
     # ── BuyGate auto-calibration ──────────────────────────────────────────────
     # After each stop-loss event, _calibrate_threshold() records the peak
     # score observed in the N seconds before the halt and uses it to nudge
@@ -3656,7 +3687,10 @@ class GridEngine:
                  buy_gate_fn: Optional[Callable[[], bool]] = None,
                  sell_gate_fn: Optional[Callable[[], bool]] = None,
                  trend_confirm_fn: Optional[Callable[[], int]] = None,
-                 stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = None):
+                 stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = None,
+                 uptrend_confirmed_fn: Optional[Callable[[], bool]] = None,
+                 downtrend_confirmed_fn: Optional[Callable[[], bool]] = None,
+                 down_shift_record_fn: Optional[Callable[[], None]] = None):
         self._params     = params
         self._oms        = oms
         self._instrument = instrument
@@ -3686,6 +3720,41 @@ class GridEngine:
         # see reconcile_open_legs' pending_since docs). None = no catch-up
         # (legacy behaviour).
         self._trend_confirm_fn: Optional[Callable[[], int]] = trend_confirm_fn
+        # uptrend_confirmed_fn / downtrend_confirmed_fn / down_shift_record_fn
+        # (2026-08-05, "trail-flip" — see GRID_CONFIG comment block):
+        #
+        # uptrend_confirmed_fn: read-only mirror of GridBot._uptrend_confirmed_now
+        # — is the SAME drift_shift_trend_* shift-count evidence
+        # trend_confirm_fn already records currently "confirmed"? Unlike
+        # sell_gate_fn, this does NOT first require TrendSignal's hourly
+        # regime to read UP. That distinction is the whole point: on
+        # 2026-08-05 the hourly regime sat at NEUTRAL for the entire
+        # 07:05-14:00 window while price still ground out 11 top-sell
+        # drift-shifts (5 of them already flagged CONFIRMED by
+        # trend_confirm_fn's own shift-count logic) — sell_gate_fn, gated
+        # behind the regime read, never once suppressed anything in that
+        # window. uptrend_confirmed_fn reads the same underlying evidence
+        # trend_confirm_fn was already collecting, just without the
+        # regime gate in front of it.
+        #
+        # downtrend_confirmed_fn / down_shift_record_fn: mirror for the
+        # downside. No fill-triggered drift-shift-on-bottom-buy path
+        # exists (see drift_shift_trend_* GRID_CONFIG comment), so there
+        # was no existing shift-count evidence to read on this side —
+        # down_shift_record_fn is GridEngine's own way of contributing
+        # that evidence (called once per actual _trail_down, mirroring
+        # what the top-sell fill handler already does for
+        # trend_confirm_fn), and downtrend_confirmed_fn reads it back.
+        #
+        # Both confirmed_fn callables are read-only / side-effect-free —
+        # safe to call every _trail_up / _trail_down. Their backing state
+        # lives on GridBot, not here, for the same reason trend_confirm_fn's
+        # does (a full rebuild replaces this GridEngine instance and would
+        # silently reset any history kept on it — see that param's own
+        # docstring above).
+        self._uptrend_confirmed_fn: Optional[Callable[[], bool]] = uptrend_confirmed_fn
+        self._downtrend_confirmed_fn: Optional[Callable[[], bool]] = downtrend_confirmed_fn
+        self._down_shift_record_fn: Optional[Callable[[], None]] = down_shift_record_fn
         # stray_leg_fn: optional callable(leg, reason) -> None. Called by
         # _trail_up/_trail_down when a dropped cell was holding a leg's
         # designated closer — see those methods' docstrings for why the
@@ -3873,6 +3942,61 @@ class GridEngine:
             # the mid passed in here). `>=` makes the tie an explicit
             # SELL instead of an orphaned level.
             lv.open_side = "BUY" if lv.lower < mid else "SELL"
+
+            # 2026-08-05 ("Trail-flip" — see GRID_CONFIG comment block):
+            # this loop previously had NO trend gating at all — every
+            # full rebuild placed a fresh SELL on every above-mid cell
+            # regardless of trend, even while SellGate was actively
+            # blocking the exact same kind of order everywhere else. This
+            # is the ONE placement path where an outright side-flip
+            # (SELL→BUY at the SAME price boundary) is NOT safe to do the
+            # way _trail_up/_trail_down do it: unlike a trail-created
+            # cell, this cell's lower boundary can sit AT OR ABOVE current
+            # mid by construction (that's the whole reason it was
+            # classified SELL), so resting a BUY there would be a
+            # marketable/crossing order, not a passive one. Suppress
+            # instead — same SUPPRESSED state SellGate/BuyGate already use
+            # for exactly this "don't open it now, but don't lose the
+            # slot either" situation; release_one_suppressed_level() picks
+            # it back up once the confirmed-trend evidence clears, same as
+            # any other SellGate/BuyGate suppression.
+            if lv.open_side == "SELL":
+                shift_evidence_up = (
+                    self._uptrend_confirmed_fn is not None
+                    and self._uptrend_confirmed_fn()
+                )
+                regime_blocked_up = (
+                    self._sell_gate_fn is not None and not self._sell_gate_fn()
+                )
+                if shift_evidence_up or regime_blocked_up:
+                    lv.state           = LevelState.SUPPRESSED
+                    lv.suppressed_side = "SELL"
+                    logger.info(
+                        f"[GridEngine] SELL [{lv.index}] @ {lv.upper:.2f} "
+                        f"suppressed at rebuild — confirmed uptrend "
+                        f"(no fresh short opened)"
+                    )
+                    time.sleep(0.05)
+                    continue
+            elif lv.open_side == "BUY":
+                shift_evidence_down = (
+                    self._downtrend_confirmed_fn is not None
+                    and self._downtrend_confirmed_fn()
+                )
+                regime_blocked_down = (
+                    self._buy_gate_fn is not None and not self._buy_gate_fn()
+                )
+                if shift_evidence_down or regime_blocked_down:
+                    lv.state           = LevelState.SUPPRESSED
+                    lv.suppressed_side = "BUY"
+                    logger.info(
+                        f"[GridEngine] BUY  [{lv.index}] @ {lv.lower:.2f} "
+                        f"suppressed at rebuild — confirmed downtrend "
+                        f"(no fresh long opened)"
+                    )
+                    time.sleep(0.05)
+                    continue
+
             if lv.open_side == "BUY":
                 self._place_buy(lv)
             else:
@@ -4348,13 +4472,31 @@ class GridEngine:
             for i, lv in enumerate(self._levels):
                 lv.index = i
 
-            # Step 2: append new cell at the top, opening via SELL (a trail
-            # up always seeds a fresh short as the natural continuation of
-            # the breakout that triggered it — same as the pre-existing
-            # _place_sell(new_lv) call below).
+            # Step 2: append new cell at the top. Default identity is SELL
+            # (a trail up always seeds a fresh short as the natural
+            # continuation of the breakout that triggered it) — UNLESS a
+            # confirmed uptrend is active, in which case this cell opens
+            # as a BUY (dip-buy) instead. See "Trail-flip" GRID_CONFIG
+            # comment block (2026-08-05) for why: this specific new cell
+            # is guaranteed to sit entirely below current mid at this
+            # instant (trail_up only fires once mid >= new_upper), so a
+            # resting BUY at its lower boundary is always a valid passive
+            # order, never a market-crossing one.
+            shift_evidence_up = (
+                self._uptrend_confirmed_fn is not None
+                and self._uptrend_confirmed_fn()
+            )
+            regime_blocked_up = (
+                self._sell_gate_fn is not None and not self._sell_gate_fn()
+            )
+            confirmed_up = (
+                self._cfg.get("trail_flip_to_buy_on_confirmed_uptrend", True)
+                and (shift_evidence_up or regime_blocked_up)
+            )
+            new_side = "BUY" if confirmed_up else "SELL"
             new_idx = len(self._levels)
             new_lv  = GridLevel(index=new_idx, lower=old_upper, upper=new_upper,
-                                 open_side="SELL")
+                                 open_side=new_side)
             self._levels.append(new_lv)
             self._params = GridParams(
                 lower=self._levels[0].lower,
@@ -4365,12 +4507,21 @@ class GridEngine:
                 notional_per_level=self._params.notional_per_level,
             )
 
-        # Place the new SELL outside the lock
-        self._place_sell(new_lv)
+        # Place the new cell outside the lock
+        if new_lv.open_side == "BUY":
+            self._place_buy(new_lv)
+            logger.info(
+                f"[GridEngine] TRAIL UP — confirmed uptrend active: new top "
+                f"cell [{new_lv.index}] opened as BUY (dip-buy) @ "
+                f"{new_lv.lower:.2f} instead of a fresh SELL"
+            )
+        else:
+            self._place_sell(new_lv)
         if dropped_leg is not None and self._stray_leg_fn is not None:
             self._stray_leg_fn(dropped_leg, "trail_up")
         self._alerter_send(
             f"⬆️ Grid trailed UP → [{self._params.lower:.0f}, {new_upper:.0f}]"
+            + (" (top cell flipped to BUY — confirmed uptrend)" if new_lv.open_side == "BUY" else "")
         )
 
     def _trail_down(self, old_lower: float, old_upper: float, spacing: float):
@@ -4425,12 +4576,42 @@ class GridEngine:
                 top.client_oid = ""
             self._levels.pop()
 
-            # Prepend new cell at the bottom, opening via BUY (a trail down
-            # always seeds a fresh long as the natural continuation of the
-            # breakdown that triggered it — same as the pre-existing
-            # _place_buy(new_lv) call below).
+            # Prepend new cell at the bottom. Default identity is BUY (a
+            # trail down always seeds a fresh long as the natural
+            # continuation of the breakdown that triggered it) — UNLESS a
+            # confirmed downtrend is active, in which case this cell opens
+            # as a SELL (rally-sell) instead. Mirror of the TRAIL UP
+            # flip above (see "Trail-flip" GRID_CONFIG comment block,
+            # 2026-08-05) — mechanically safe here too: trail_down only
+            # fires once mid <= new_lower, so this cell's entire range
+            # (and its upper boundary, where the SELL would rest) is
+            # guaranteed to already be ABOVE current mid.
+            # Record this shift as evidence for downtrend persistence — no
+            # fill-triggered path does this for the down side today (see
+            # down_shift_record_fn's docstring above), so _trail_down
+            # itself is the only place this evidence can be captured.
+            if self._down_shift_record_fn is not None:
+                try:
+                    self._down_shift_record_fn()
+                except Exception:
+                    logger.exception(
+                        "[GridEngine] down_shift_record_fn raised — "
+                        "downtrend persistence evidence for this shift lost"
+                    )
+            shift_evidence_down = (
+                self._downtrend_confirmed_fn is not None
+                and self._downtrend_confirmed_fn()
+            )
+            regime_blocked_down = (
+                self._buy_gate_fn is not None and not self._buy_gate_fn()
+            )
+            confirmed_down = (
+                self._cfg.get("trail_flip_to_sell_on_confirmed_downtrend", True)
+                and (shift_evidence_down or regime_blocked_down)
+            )
+            new_side = "SELL" if confirmed_down else "BUY"
             new_lv = GridLevel(index=0, lower=new_lower, upper=old_lower,
-                                open_side="BUY")
+                                open_side=new_side)
             self._levels.insert(0, new_lv)
             # Re-index
             for i, lv in enumerate(self._levels):
@@ -4444,12 +4625,21 @@ class GridEngine:
                 notional_per_level=self._params.notional_per_level,
             )
 
-        # Place the new BUY outside the lock
-        self._place_buy(new_lv)
+        # Place the new cell outside the lock
+        if new_lv.open_side == "SELL":
+            self._place_sell(new_lv)
+            logger.info(
+                f"[GridEngine] TRAIL DOWN — confirmed downtrend active: new "
+                f"bottom cell [{new_lv.index}] opened as SELL (rally-sell) "
+                f"@ {new_lv.upper:.2f} instead of a fresh BUY"
+            )
+        else:
+            self._place_buy(new_lv)
         if dropped_leg is not None and self._stray_leg_fn is not None:
             self._stray_leg_fn(dropped_leg, "trail_down")
         self._alerter_send(
             f"⬇️ Grid trailed DOWN → [{new_lower:.0f}, {self._params.upper:.0f}]"
+            + (" (bottom cell flipped to SELL — confirmed downtrend)" if new_lv.open_side == "SELL" else "")
         )
 
     def _alerter_send(self, msg: str):
@@ -6953,6 +7143,21 @@ class GridBot:
         # both _sell_gate and its release condition in _run()).
         self._recent_up_shifts: List[float] = []
 
+        # ── Trail-flip downtrend evidence (2026-08-05) ─────────────────────────
+        # Mirror of _recent_up_shifts above, for TRAIL DOWN. Written by
+        # _record_down_shift (called from GridEngine._trail_down every time
+        # it actually fires — there is no fill-triggered drift-shift path
+        # on the bottom-buy side to hook this into instead, unlike the
+        # top-sell side), read by _downtrend_confirmed_now (used by
+        # GridEngine's trail-flip decision in _trail_down). Same
+        # lookback/confirm-count knobs as the uptrend side
+        # (drift_shift_trend_lookback_s / drift_shift_trend_confirm_count)
+        # — this is the same underlying idea (repeated same-direction
+        # shifts in a short window = a real, persistent move, not noise),
+        # just tracked independently since it has no shared state with the
+        # uptrend catch-up feature.
+        self._recent_down_shifts: List[float] = []
+
         self._oms = OMS(
             api_key      = config.get("api_key", ""),
             api_secret   = config.get("api_secret", ""),
@@ -8654,7 +8859,22 @@ class GridBot:
             if self._stop_scorer is not None and self._params is not None:
                 score = self._stop_scorer.compute(mid, self._params.stop_price)
                 resume_thr = self._cfg.get("stop_score_resume_threshold", 0.35)
-                if (score <= resume_thr
+                buy_release_ok = score <= resume_thr
+                # 2026-08-05 (trail-flip): hold back release while
+                # confirmed-downtrend shift evidence (_downtrend_confirmed_now,
+                # written by GridEngine._trail_down via down_shift_record_fn)
+                # is still fresh, even if the trend-risk score above has
+                # already dipped back under resume_thr — a level suppressed
+                # for THAT reason (see _place_initial_orders) should wait for
+                # the same shift-count evidence that suppressed it to age out
+                # of drift_shift_trend_lookback_s, same hysteresis SellGate's
+                # own release condition below already gives the up side.
+                # Additive only — never releases MORE eagerly than before.
+                if (buy_release_ok
+                        and self._cfg.get("trail_flip_to_sell_on_confirmed_downtrend", True)
+                        and self._downtrend_confirmed_now()):
+                    buy_release_ok = False
+                if (buy_release_ok
                         and self._engine is not None
                         and self._engine.count_suppressed("BUY") > 0):
                     released = self._engine.release_one_suppressed_level("BUY")
@@ -8689,6 +8909,21 @@ class GridBot:
                                 and self._cfg.get("sell_gate_block_on_confirmed_uptrend", True)
                                 and self._uptrend_confirmed_now()):
                             sell_gate_still_blocking = True
+                # 2026-08-05 (trail-flip): also hold back release while the
+                # regime-INDEPENDENT shift-count evidence
+                # (_uptrend_confirmed_now) that _place_initial_orders / 
+                # _trail_up may have suppressed or flipped against is still
+                # fresh — same evidence sell_gate_block_on_confirmed_uptrend
+                # reads above, just not gated behind TrendSignal's hourly
+                # regime the way sell_gate_still_blocking's own checks are.
+                # Without this, a level suppressed purely on shift evidence
+                # while regime reads NEUTRAL would get released on the very
+                # next tick, undoing the suppression before the evidence
+                # itself has aged out of drift_shift_trend_lookback_s.
+                if (not sell_gate_still_blocking
+                        and self._cfg.get("trail_flip_to_buy_on_confirmed_uptrend", True)
+                        and self._uptrend_confirmed_now()):
+                    sell_gate_still_blocking = True
                 if not sell_gate_still_blocking:
                     released = self._engine.release_one_suppressed_level("SELL")
                     if released:
@@ -9983,7 +10218,10 @@ class GridBot:
             buy_gate_fn=_buy_gate,
             sell_gate_fn=_sell_gate,
             trend_confirm_fn=self._trend_confirm,
-            stray_leg_fn=self._chase_close_leg)
+            stray_leg_fn=self._chase_close_leg,
+            uptrend_confirmed_fn=self._uptrend_confirmed_now,
+            downtrend_confirmed_fn=self._downtrend_confirmed_now,
+            down_shift_record_fn=self._record_down_shift)
         if carried_chasing_leg_ids:
             # update(), not assignment — defensive against a concurrent
             # chase-completion discard landing in this same window; never
@@ -11297,6 +11535,37 @@ class GridBot:
         now = time.time()
         lookback = self._cfg.get("drift_shift_trend_lookback_s", 1800.0)
         recent = [t for t in self._recent_up_shifts if now - t <= lookback]
+        confirm_count = self._cfg.get("drift_shift_trend_confirm_count", 2)
+        return len(recent) >= confirm_count
+
+    def _record_down_shift(self) -> None:
+        """
+        down_shift_record_fn passed to GridEngine (see its __init__
+        docstring). Called once per actual TRAIL DOWN, right as
+        GridEngine._trail_down fires — the down-side mirror of
+        _trend_confirm's recording half. Unlike _trend_confirm, this has
+        no "extra shifts" catch-up decision to make (that feature only
+        exists on the up side today) — it just records the evidence for
+        _downtrend_confirmed_now to read back.
+        """
+        now = time.time()
+        lookback = self._cfg.get("drift_shift_trend_lookback_s", 1800.0)
+        self._recent_down_shifts = [
+            t for t in self._recent_down_shifts if now - t <= lookback
+        ]
+        self._recent_down_shifts.append(now)
+
+    def _downtrend_confirmed_now(self) -> bool:
+        """
+        Read-only check: mirror of _uptrend_confirmed_now for the down
+        side — is the SAME repeated-shift evidence _record_down_shift has
+        been collecting currently at/above drift_shift_trend_confirm_count
+        within drift_shift_trend_lookback_s? Never adds to
+        _recent_down_shifts itself — safe to call every tick.
+        """
+        now = time.time()
+        lookback = self._cfg.get("drift_shift_trend_lookback_s", 1800.0)
+        recent = [t for t in self._recent_down_shifts if now - t <= lookback]
         confirm_count = self._cfg.get("drift_shift_trend_confirm_count", 2)
         return len(recent) >= confirm_count
 
