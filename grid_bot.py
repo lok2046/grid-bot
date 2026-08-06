@@ -336,7 +336,7 @@ GRID_CONFIG: dict = {
     # against 4h/8h (backtested better, but more unmanaged-exposure time
     # than this sample's P&L-only view can price in) once more days of
     # REPRICE_UNDERCOUNT-fixed data accumulate.
-    "zero_candidate_pre_chase_grace_s": 0.0,
+    "zero_candidate_pre_chase_grace_s": 7200.0,
 
     # ── Stray-leg chase (trail-up/trail-down dropped-cell closers) ────────────
     # A leg whose closing cell gets dropped by _trail_up/_trail_down no longer
