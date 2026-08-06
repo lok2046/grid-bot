@@ -338,6 +338,31 @@ GRID_CONFIG: dict = {
     # REPRICE_UNDERCOUNT-fixed data accumulate.
     "zero_candidate_pre_chase_grace_s": 7200.0,
 
+    # Cooldown between GridEngine's "orphaned leg — requesting fast rebuild"
+    # triggers (see check_price_fills()). Without this, an orphaned/zero-
+    # candidate leg that the dead-band check keeps bouncing (range hasn't
+    # shifted >= retune_deadband_pct yet) re-requests a rebuild on every
+    # single tick with nothing throttling the main loop in between — each
+    # attempt calls GridAutoTuner.compute() and immediately bails out in
+    # _rebuild_grid()'s dead-band check without ever reaching
+    # reconcile_open_legs(), so the orphan condition is never actually
+    # cleared and the exact same trigger fires again next tick.
+    # 2026-08-06 GEN00037_GREEN incident: leg #816 went zero-candidate at
+    # handoff (19:03:12) and wasn't force-liquidated by the dwell cap until
+    # 19:19:59 (1007s later, see reconcile_zero_candidate_max_dwell_s).
+    # For that entire 1007s window the trigger re-armed and got dead-band-
+    # skipped on every tick — 36,614 times — at ~36/s, producing ~290
+    # log lines/s (188K of them just from AutoTuner.compute()) and pinning
+    # the main loop in a CPU-bound busy-spin the whole time (no sleep on
+    # this path). The dwell cap still correctly liquidated the leg on
+    # schedule regardless — this cooldown doesn't change that outcome, it
+    # only stops the request from re-firing faster than it could possibly
+    # do anything, since a dead-band-blocked rebuild can't change outcome
+    # tick-to-tick anyway (mid moves far too little between consecutive
+    # ticks to cross retune_deadband_pct). Set to 0 to restore the old
+    # (broken) every-tick behavior.
+    "orphan_leg_rebuild_cooldown_s": 15.0,
+
     # ── Stray-leg chase (trail-up/trail-down dropped-cell closers) ────────────
     # A leg whose closing cell gets dropped by _trail_up/_trail_down no longer
     # maps onto any remaining cell boundary (see GridEngine._trail_up
@@ -3807,6 +3832,10 @@ class GridEngine:
         self._last_drift_shift: float = 0.0   # epoch time of last sell-triggered shift
         self._needs_rebuild:   bool  = False  # set by drift-shift when mid is far OOB
         self._handoff_freeze:  bool  = False  # set by GridBot during blue-green handoff
+        # Epoch time of the last orphaned-leg "requesting fast rebuild"
+        # trigger (see check_price_fills() / orphan_leg_rebuild_cooldown_s).
+        # 0.0 so the very first detection always fires immediately.
+        self._last_orphan_rebuild_request: float = 0.0
 
         # Accounting — seeded from DB so a restart or re-tune doesn't zero out history.
         # In-memory values are the authoritative running total for this process;
@@ -4179,9 +4208,27 @@ class GridEngine:
             orphaned_legs = (set(self._open_legs.keys()) - tagged_leg_ids
                               - self._chasing_leg_ids)
         buys_are_intentionally_paused = (open_buys == 0 and suppressed > 0)
+        # Cooldown-gated (2026-08-06 GEN00037_GREEN incident — see
+        # orphan_leg_rebuild_cooldown_s in GRID_CONFIG for the full writeup):
+        # without this gate, a leg that stays orphaned across many
+        # consecutive ticks re-requests a rebuild every single tick,
+        # regardless of whether the previous request could possibly have
+        # accomplished anything yet (a dead-band-blocked _rebuild_grid()
+        # call bails out before it ever reaches reconcile_open_legs(), so
+        # re-requesting faster than mid can plausibly cross
+        # retune_deadband_pct just burns CPU and log volume for no benefit).
+        # `not self._needs_rebuild` alone doesn't prevent this: the flag is
+        # cleared by pop_needs_rebuild() every time _rebuild_grid() runs
+        # (dead-band-skipped or not), so it's back to False well within the
+        # same tick that set it. The cooldown timestamp survives that reset.
+        rebuild_cooldown = self._cfg.get("orphan_leg_rebuild_cooldown_s", 15.0)
+        cooldown_elapsed = (
+            time.time() - self._last_orphan_rebuild_request >= rebuild_cooldown
+        )
         if (not buys_are_intentionally_paused
                 and orphaned_legs
-                and not self._needs_rebuild):
+                and not self._needs_rebuild
+                and cooldown_elapsed):
             side = "SELL" if open_buys == 0 else "BUY"
             logger.warning(
                 f"[GridEngine] {len(orphaned_legs)} open leg(s) have no "
@@ -4191,6 +4238,7 @@ class GridEngine:
                 f"retune check"
             )
             self._needs_rebuild = True
+            self._last_orphan_rebuild_request = time.time()
 
         # Trailing checks run after fills so counter-orders are placed first
         self._check_trailing(mid)
