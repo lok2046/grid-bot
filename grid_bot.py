@@ -5408,9 +5408,30 @@ class GridEngine:
         # unmanaged wait; one stranded during flat/noisy conditions gets
         # close to the full cap. See the "2026-08-03 16:35 incident"
         # GRID_CONFIG comment block.
+        #
+        # GRACE_DWELL_COORDINATION_2026_08_06: zero_candidate_since is the
+        # SAME anchor zero_candidate_pre_chase_grace_s counts from (see
+        # _rebuild_grid's pre-chase grace loop). Before this fix, this cap
+        # was compared against that same anchor on its own — so with grace
+        # set to 7200s and this cap at its 900s default, EVERY zero-
+        # candidate leg hit this liquidation check ~900s in, while still
+        # sitting inside its own 7200s grace window, and got a market
+        # order with zero chase attempts ever dispatched. That's strictly
+        # worse than both the pre-grace baseline (immediate chase, a real
+        # shot at a maker fill) and the intended grace behavior (patient
+        # wait, THEN chase) — confirmed against leg #816
+        # (GEN00037_GREEN, 2026-08-06 19:03:12-19:19:59): 0 chase attempts,
+        # liquidated at 1007s solely by this check. Adding the grace
+        # period on top makes the total budget grace-time (no resting
+        # order, not yet chasing) + dwell-time (no resting order, chase
+        # already tried and exhausted) instead of the two silently
+        # overlapping on the same clock.
+        pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
         zc_max_dwell = self._cfg.get("reconcile_zero_candidate_max_dwell_s", 900.0)
-        zc_dwell_cap = (zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
-                        if urgent_threshold > 0 else 0.0)
+        zc_dwell_cap = pre_chase_grace_s + (
+            zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
+            if urgent_threshold > 0 else 0.0
+        )
 
         assignments:   Dict[int, int] = {}
         claimed:       set            = set()
@@ -9740,8 +9761,24 @@ class GridBot:
                     trend_risk = self._stop_scorer.compute_trend_risk(
                         mid, self._effective_trend_regime(), self._last_trend_slope_pct
                     )
-            zc_dwell_cap = (zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
-                            if urgent_threshold > 0 else 0.0)
+            # GRACE_DWELL_COORDINATION_2026_08_06: same fix as the
+            # reconcile_open_legs liquidation check above and for the same
+            # reason — this elapsed-time clock started at the SAME
+            # zero_candidate_since anchor, which already includes however
+            # long the leg spent waiting out its pre-chase grace before
+            # this chase was ever dispatched. Without adding the grace
+            # period back in here too, a leg that used up most of its
+            # grace time before finally getting chased would arrive here
+            # with almost no dwell budget left, defeating the point of a
+            # separate post-chase dwell. In practice this branch is only
+            # reached once a leg's own grace has already elapsed (see
+            # _rebuild_grid), so this mainly matters if grace and dwell
+            # are ever retuned to overlapping magnitudes.
+            pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
+            zc_dwell_cap = pre_chase_grace_s + (
+                zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
+                if urgent_threshold > 0 else 0.0
+            )
             started = self._leg_zero_candidate_since.get(leg.leg_id, time.time())
             elapsed = time.time() - started
 
