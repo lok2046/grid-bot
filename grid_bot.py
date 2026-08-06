@@ -308,6 +308,36 @@ GRID_CONFIG: dict = {
     # stop waiting.
     "reconcile_zero_candidate_max_dwell_s": 900.0,
 
+    # Pre-chase grace (2026-08-06, REPRICE_UNDERCOUNT_2026_08_05 follow-up):
+    # in the legacy behavior (this at 0.0), a leg is handed to the stray-leg
+    # chase on the SAME rebuild it's first flagged zero-candidate — no wait
+    # at all before paying (at best) a maker-fee loss at/near current
+    # market. Backtested against 202 historical loss-realizing zero-
+    # candidate/trail closes (24 days of fills, Jul 11 - Aug 4, plus a full
+    # day of 1-min candles, Aug 5 - Aug 6; $215.07 total realized loss
+    # across them): price crossed back through the leg's own open price —
+    # count-based / $-weighted — within 1h in 53.2% of cases (31.2% of $),
+    # within 4h in 64.9% (48.8% of $), within 8h in 73.7% (54.2% of $).
+    # Net effect (avoided losses MINUS the extra loss on cases that never
+    # recovered in the window, since those still eventually chase-close,
+    # possibly at a worse price after drifting further) was positive at
+    # every window tried: roughly +$31-43 (15-30min), +$35-36 (1-2h),
+    # +$52 (4h), +$94 (8h) out of the $215.07 baseline — noisy given the
+    # sample is mostly one 4-day episode plus one day, not a broad set of
+    # independent trends, so treat these as directional, not precise.
+    # Set to a positive value to hold a newly-stranded leg with NO resting
+    # order for up to this many seconds before starting the chase — same
+    # unmanaged-wait mechanics as reconcile_zero_candidate_max_dwell_s
+    # above, just applied before the chase instead of only after it fails,
+    # and subject to the same reconcile_urgent_trend_risk bypass (a
+    # genuinely urgent move skips the grace and chases immediately).
+    # Starting recommendation: 7200 (2h) — meaningful recovery capture
+    # without leaving a leg unmanaged for most of a trading day; revisit
+    # against 4h/8h (backtested better, but more unmanaged-exposure time
+    # than this sample's P&L-only view can price in) once more days of
+    # REPRICE_UNDERCOUNT-fixed data accumulate.
+    "zero_candidate_pre_chase_grace_s": 0.0,
+
     # ── Stray-leg chase (trail-up/trail-down dropped-cell closers) ────────────
     # A leg whose closing cell gets dropped by _trail_up/_trail_down no longer
     # maps onto any remaining cell boundary (see GridEngine._trail_up
@@ -6630,8 +6660,68 @@ class GridStateStore:
 
     # ── Accumulated totals ────────────────────────────────────────────────────
 
+    # Reason strings that _finalize_leg_close / _record_partial_leg_close
+    # pass through as close_reason whenever is_reprice_loss=True (see
+    # record_fill's docstring). Kept as one list so the read-time repair
+    # below (REPRICE_UNDERCOUNT_2026_08_05) and any future caller checking
+    # "is this row a reprice/trail loss" stay in sync with each other.
+    REPRICE_CLOSE_REASONS = (
+        "rebuild_reprice", "rebuild_reprice_pending", "trail_up", "trail_down",
+    )
+
+    def _reprice_totals_from_fills(self, hkt_date: Optional[str] = None) -> Tuple[float, int]:
+        """
+        REPRICE_UNDERCOUNT_2026_08_05: reprice_gross_usd/reprice_count in
+        daily_pnl are maintained incrementally (record_fill's ON CONFLICT
+        DO UPDATE, gated on is_reprice_loss) and were found to silently
+        undercount — confirmed against grid_fills on 2026-08-06: 2026-08-04
+        showed 0 of 4 real trail_up closes counted, 2026-08-05 showed 13 of
+        27 rebuild_reprice(_pending)/trail_up closes counted (13 short,
+        -$17.69 missing), while gross_pnl_usd/net_pnl_usd/fill_count — sourced
+        from the exact same INSERT statement, same row, same call — reconciled
+        against raw fills perfectly every time. is_reprice_loss=True is set
+        unconditionally at both call sites that ever set close_reason (see
+        record_fill's is_reprice_loss docstring), so this isn't a call-site
+        logic bug; the leading hypothesis is a write race between concurrent
+        chase-worker threads (each stray leg gets its own daemon thread —
+        see _chase_close_leg — and several can close within milliseconds of
+        each other, as happened at the 2026-08-05 04:19:07 UTC post-restart
+        reconcile) that occasionally drops an UPDATE's contribution to just
+        the sl_/reprice_ columns without affecting the row's other columns.
+        Root cause not yet confirmed; this recomputes the reprice figure
+        directly from grid_fills (an append-only INSERT-only log that HAS
+        reconciled correctly in every check so far) instead of trusting the
+        incremental counter, so /status is right regardless of whichever
+        write path is losing updates. sl_gross_usd/sl_count are NOT touched
+        here — no evidence of the same bug there yet (every single-SL day
+        checked has matched exactly) — but see close_reason='stop_loss' now
+        being tagged on liquidation fills (_liquidate_position) for the same
+        kind of raw-fill fallback if that ever turns out to need it too.
+        """
+        placeholders = ",".join("?" for _ in self.REPRICE_CLOSE_REASONS)
+        with self._lock:
+            if hkt_date is None:
+                row = self._conn.execute(
+                    f"""SELECT COALESCE(SUM(gross_pnl), 0.0), COUNT(*)
+                        FROM grid_fills WHERE close_reason IN ({placeholders})""",
+                    self.REPRICE_CLOSE_REASONS,
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    f"""SELECT COALESCE(SUM(gross_pnl), 0.0), COUNT(*)
+                        FROM grid_fills
+                        WHERE hkt_date=? AND close_reason IN ({placeholders})""",
+                    (hkt_date, *self.REPRICE_CLOSE_REASONS),
+                ).fetchone()
+        return (row[0], row[1]) if row else (0.0, 0)
+
     def get_accumulated(self) -> dict:
-        """Sum all rows in daily_pnl -> all-time totals."""
+        """
+        Sum all rows in daily_pnl -> all-time totals. reprice_gross/
+        reprice_count are recomputed from grid_fills rather than summed
+        from the daily_pnl column — see _reprice_totals_from_fills'
+        REPRICE_UNDERCOUNT_2026_08_05 docstring.
+        """
         with self._lock:
             row = self._conn.execute(
                 """SELECT
@@ -6641,44 +6731,59 @@ class GridStateStore:
                        COALESCE(SUM(fill_count),     0)   AS fill_count,
                        COALESCE(SUM(cycle_count),    0)   AS cycle_count,
                        COALESCE(SUM(sl_gross_usd),  0.0) AS sl_gross,
-                       COALESCE(SUM(sl_count),       0)   AS sl_count,
-                       COALESCE(SUM(reprice_gross_usd), 0.0) AS reprice_gross,
-                       COALESCE(SUM(reprice_count),      0)   AS reprice_count
+                       COALESCE(SUM(sl_count),       0)   AS sl_count
                    FROM daily_pnl"""
             ).fetchone()
-        return dict(row) if row else {
+        result = dict(row) if row else {
             "gross_pnl": 0.0, "fees": 0.0, "net_pnl": 0.0,
             "fill_count": 0,  "cycle_count": 0,
             "sl_gross": 0.0,  "sl_count": 0,
-            "reprice_gross": 0.0, "reprice_count": 0,
         }
+        reprice_gross, reprice_count = self._reprice_totals_from_fills(hkt_date=None)
+        result["reprice_gross"], result["reprice_count"] = reprice_gross, reprice_count
+        return result
 
     # ── Daily PnL ─────────────────────────────────────────────────────────────
 
     def get_daily(self, hkt_date: Optional[str] = None) -> dict:
-        """Return the daily_pnl row for hkt_date (today HKT if None)."""
+        """
+        Return the daily_pnl row for hkt_date (today HKT if None).
+        reprice_gross_usd/reprice_count are recomputed from grid_fills
+        rather than read from the daily_pnl row — see
+        _reprice_totals_from_fills' REPRICE_UNDERCOUNT_2026_08_05 docstring.
+        """
         if hkt_date is None:
             hkt_date = _db_hkt_date(time.time())
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM daily_pnl WHERE hkt_date=?", (hkt_date,)
             ).fetchone()
-        if row:
-            return dict(row)
-        return {
+        result = dict(row) if row else {
             "hkt_date": hkt_date, "gross_pnl_usd": 0.0, "fees_usd": 0.0,
             "net_pnl_usd": 0.0, "fill_count": 0, "cycle_count": 0,
             "sl_gross_usd": 0.0, "sl_count": 0,
-            "reprice_gross_usd": 0.0, "reprice_count": 0,
         }
+        reprice_gross, reprice_count = self._reprice_totals_from_fills(hkt_date=hkt_date)
+        result["reprice_gross_usd"], result["reprice_count"] = reprice_gross, reprice_count
+        return result
 
     def get_recent_daily(self, days: int = 7) -> list:
-        """Return last N HKT-day rows, newest first."""
+        """
+        Return last N HKT-day rows, newest first. reprice_gross_usd/
+        reprice_count per row are recomputed from grid_fills — see
+        _reprice_totals_from_fills' REPRICE_UNDERCOUNT_2026_08_05 docstring.
+        """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM daily_pnl ORDER BY hkt_date DESC LIMIT ?", (days,)
             ).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            reprice_gross, reprice_count = self._reprice_totals_from_fills(hkt_date=d["hkt_date"])
+            d["reprice_gross_usd"], d["reprice_count"] = reprice_gross, reprice_count
+            result.append(d)
+        return result
 
     # ── Meta ──────────────────────────────────────────────────────────────────
 
@@ -9082,11 +9187,19 @@ class GridBot:
                 # exactly (it was always inferred from side=="SELL" before
                 # record_fill's is_close param existed — this function only
                 # ever closes/reduces a position, never opens one).
+                # close_reason="stop_loss" (2026-08-06, REPRICE_UNDERCOUNT_2026_08_05):
+                # previously left as the default None, indistinguishable from an
+                # ordinary cycle fill in grid_fills. sl_gross_usd/sl_count haven't
+                # shown the same incremental-counter undercount reprice_gross_usd
+                # did, but there'd been no way to check directly from raw fills
+                # either — this tag makes that possible going forward without
+                # changing anything about how is_liquidation itself is tallied.
                 ok, err = self._store.execute_with_retry(lambda: self._store.record_fill(
                     ts_utc=time.time(), side="SELL", level_idx=-1,
                     price_usd=fill.avg_price, qty_btc=fill.filled_qty,
                     fee_usd=fill.fee, gross_pnl=gross_pnl, cycle_num=-1,
                     is_liquidation=is_liquidation, is_close=True,
+                    close_reason=("stop_loss" if is_liquidation else None),
                 ))
                 if not ok:
                     # The market SELL already happened for real — this is a
@@ -10282,31 +10395,67 @@ class GridBot:
             if leg_id not in still_pending_leg_ids:
                 del self._leg_no_fit_since[leg_id]
 
-        # Same bookkeeping for the zero-candidate dwell map, plus: the
-        # very first time a leg shows up here, kick off the stray-leg
-        # chase for it (a shot at a decent price before it settles into
-        # the unmanaged wait) — mirrors exactly how _trail_up/_trail_down
-        # hand a dropped leg to the same chase mechanism. Guarded on
-        # "not already chasing" so a leg that recovers, goes stranded
-        # again, and is still mid-chase from the first time doesn't get a
-        # second chase spawned on top of the first.
+        # Same bookkeeping for the zero-candidate dwell map, plus: once a
+        # leg has been zero-candidate for at least
+        # zero_candidate_pre_chase_grace_s, kick off the stray-leg chase
+        # for it (a shot at a decent price before it settles into the
+        # unmanaged post-chase wait) — mirrors exactly how
+        # _trail_up/_trail_down hand a dropped leg to the same chase
+        # mechanism. Guarded on "not already chasing" so a leg that
+        # recovers, goes stranded again, and is still mid-chase from
+        # earlier doesn't get a second chase spawned on top of the first.
+        #
+        # zero_candidate_pre_chase_grace_s (2026-08-06, sized against the
+        # REPRICE_UNDERCOUNT_2026_08_05 recovery-time backtest — see
+        # GRID_CONFIG comment block): default 0.0 preserves the exact
+        # legacy behavior (chase immediately, first rebuild a leg is seen
+        # zero-candidate). Set > 0 to hold a newly-stranded leg with NO
+        # resting order for up to that many seconds first — same
+        # "unmanaged, re-checked at the next rebuild" mechanics the
+        # POST-chase-exhaustion dwell cap already uses below, just applied
+        # BEFORE the chase starts instead of only after it fails. If price
+        # re-enters a real cell before the grace period elapses, the leg
+        # is picked up by the ordinary (non-zero-candidate) reconcile path
+        # next rebuild and never needs the chase at all. Same urgent-
+        # trend_risk bypass as the post-chase dwell cap: a genuinely
+        # urgent move skips the grace and chases immediately regardless.
         zero_candidate_ids = {leg.leg_id for leg in zero_candidate_legs}
+        pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
+        urgent_threshold = self._cfg.get(
+            "reconcile_urgent_trend_risk",
+            self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+        )
         for leg in zero_candidate_legs:
-            if leg.leg_id in self._leg_zero_candidate_since:
-                continue  # already dwelling from a prior rebuild
-            self._leg_zero_candidate_since[leg.leg_id] = now_ts
+            first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
             with self._engine._lock:
                 already_chasing = leg.leg_id in self._engine._chasing_leg_ids
-                if not already_chasing:
-                    self._engine._chasing_leg_ids.add(leg.leg_id)
-            if not already_chasing:
+            if already_chasing:
+                continue  # chase already in flight from an earlier rebuild
+            grace_elapsed = now_ts - first_seen
+            within_grace = (
+                pre_chase_grace_s > 0.0
+                and grace_elapsed < pre_chase_grace_s
+                and reconcile_trend_risk < urgent_threshold
+            )
+            if within_grace:
                 logger.info(
                     f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
-                    f"rebuild (open={leg.open_price:.2f}) — handing off to "
-                    f"stray-leg chase for a shot at a decent price before "
-                    f"settling into the unmanaged wait."
+                    f"rebuild (open={leg.open_price:.2f}) — within pre-chase "
+                    f"grace ({grace_elapsed:.0f}s/{pre_chase_grace_s:.0f}s, "
+                    f"trend_risk={reconcile_trend_risk:.2f}<"
+                    f"{urgent_threshold:.2f}) — holding with no resting "
+                    f"order, re-evaluated at the next rebuild."
                 )
-                self._chase_close_leg(leg, reason="rebuild_reprice_pending")
+                continue
+            with self._engine._lock:
+                self._engine._chasing_leg_ids.add(leg.leg_id)
+            logger.info(
+                f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
+                f"rebuild (open={leg.open_price:.2f}) — handing off to "
+                f"stray-leg chase for a shot at a decent price before "
+                f"settling into the unmanaged wait."
+            )
+            self._chase_close_leg(leg, reason="rebuild_reprice_pending")
         for leg_id in list(self._leg_zero_candidate_since.keys()):
             if leg_id in zero_candidate_ids:
                 continue  # still dwelling, reported again this rebuild
