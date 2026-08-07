@@ -10829,6 +10829,18 @@ class GridBot:
             snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
             if snap_lv.get("closes_leg_id") is not None
         } | carried_chasing_leg_ids
+        if already_handled_leg_ids:
+            from_restore_plan = {
+                snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
+                if snap_lv.get("closes_leg_id") is not None
+            }
+            logger.info(
+                f"[GridBot] rebuild_reprice: {len(already_handled_leg_ids)} "
+                f"leg(s) excluded from reconcile_open_legs (never evaluated "
+                f"this rebuild) — from handoff restore_plan: "
+                f"{sorted(from_restore_plan)}, from in-flight chase: "
+                f"{sorted(carried_chasing_leg_ids)}"
+            )
         # Same trend_risk score already used to gate the dead-band stop
         # raise above — reused here (not recomputed) so a leg's misfit
         # tolerance and the stop's raise aggressiveness always agree on
@@ -10837,6 +10849,14 @@ class GridBot:
         if self._stop_scorer is not None:
             reconcile_trend_risk = self._stop_scorer.compute_trend_risk(
                 mid, self._effective_trend_regime(), self._last_trend_slope_pct
+            )
+        if self._leg_zero_candidate_since:
+            now_dbg = time.time()
+            logger.info(
+                f"[GridBot] rebuild_reprice: reconcile_open_legs inputs — "
+                f"trend_risk={reconcile_trend_risk:.2f}, zero_candidate_since="
+                f"{ {lid: round(now_dbg - ts, 0) for lid, ts in self._leg_zero_candidate_since.items()} } "
+                f"(values are seconds elapsed, not raw timestamps)"
             )
         leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs = (
             self._engine.reconcile_open_legs(
