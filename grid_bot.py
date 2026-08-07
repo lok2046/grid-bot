@@ -4511,7 +4511,19 @@ class GridEngine:
                 f"[GridEngine] TRAIL UP: dropping lower={old_lower:.2f}, "
                 f"adding upper={new_upper:.2f}"
             )
-            if bottom.state != LevelState.IDLE and bottom.client_oid:
+            # SUPPRESSED cells always have client_oid=="" (a suppressed
+            # level never had an order placed for it — see BuyGate/
+            # SellGate, and now also the trail-flip fresh-open suppression
+            # in _replace_idle_levels), so the plain "state != IDLE and
+            # client_oid" check below can never be true for one. Without
+            # this OR clause, a cell dropped while sitting SUPPRESSED
+            # silently skips the closes_leg_id hand-off entirely: no
+            # chase, no warning log, no _chasing_leg_ids entry — the leg
+            # just sits in _open_legs untracked until the generic
+            # orphan-leg safety net notices on a later tick and forces a
+            # full rebuild.
+            if bottom.state == LevelState.SUPPRESSED or (
+                    bottom.state != LevelState.IDLE and bottom.client_oid):
                 if bottom.closes_leg_id is not None:
                     # This cell was mid-CLOSE-phase, holding a leg's
                     # designated closer. Its ideal closing price IS the
@@ -4629,7 +4641,11 @@ class GridEngine:
                 f"[GridEngine] TRAIL DOWN: dropping upper={old_upper:.2f}, "
                 f"adding lower={new_lower:.2f}"
             )
-            if top.state != LevelState.IDLE and top.client_oid:
+            # See the matching TRAIL UP comment — SUPPRESSED cells always
+            # have client_oid=="", so they need this explicit OR to reach
+            # the closes_leg_id hand-off below.
+            if top.state == LevelState.SUPPRESSED or (
+                    top.state != LevelState.IDLE and top.client_oid):
                 if top.closes_leg_id is not None:
                     # See the matching TRAIL UP comment — same handoff,
                     # mirrored for the top cell.
@@ -9534,6 +9550,19 @@ class GridBot:
             with self._engine._lock:
                 self._engine._open_legs.pop(leg.leg_id, None)
                 self._engine._chasing_leg_ids.discard(leg.leg_id)
+                # Mirror GridEngine._on_fill's closing-fill bookkeeping
+                # (gross_pnl into _realized_pnl, the raw fill fee — not
+                # open_fee_share — into _total_fees, one _cycle_count per
+                # finished leg). Without this, chase-closes and reconcile-
+                # forced market liquidations (this function's two callers)
+                # land correctly in the DB via record_fill/close_leg above,
+                # but the *running* engine's own net_pnl/cycles — what the
+                # periodic Status line and Telegram alerts actually show —
+                # never reflect them until the next full rebuild reseeds
+                # from DB and the number silently jumps.
+                self._engine._realized_pnl += gross_pnl
+                self._engine._total_fees += fill.fee
+                self._engine._cycle_count += 1
 
         self._alerter.send(
             f"🔁 {_md_escape(alert_label)} ({_md_escape(reason)})\n"
