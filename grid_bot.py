@@ -2379,8 +2379,43 @@ class OMS:
             f"[OMS] Cancelling {order.exchange_id} [{client_oid[:8]}] — "
             f"grid cell dropped out from under it (trail)"
         )
-        self._rest_cancel_order(order.exchange_id)
-        return self.wait_fill(client_oid, timeout=timeout)
+        rest_ok = self._rest_cancel_order(order.exchange_id)
+        t0 = time.time()
+        fill = self.wait_fill(client_oid, timeout=timeout)
+        if fill is None:
+            # 2026-08-08: distinguish the two very different things a
+            # timeout here can mean, instead of leaving both looking like
+            # an identical "unknown" to whoever reads the log later. Only
+            # the caller's own logic needs to treat them the same
+            # (neither resolution is safe to guess) — the DIAGNOSIS
+            # should not be the same:
+            #   rest_ok True  -> the exchange accepted/acknowledged the
+            #                    cancel request itself (code 0/316), so
+            #                    the gap is specifically the WS user.order
+            #                    stream never delivering a FILLED/CANCELED
+            #                    update for this order within timeout —
+            #                    points at WS reliability/latency, not at
+            #                    the cancel call.
+            #   rest_ok False -> the REST cancel call itself didn't
+            #                    confirm (network error, non-0/316 code)
+            #                    — points at REST/API health instead, and
+            #                    the WS gap (if any) is a secondary
+            #                    symptom, not the root cause.
+            # If this starts showing up with rest_ok=True repeatedly, that's
+            # the signal the request_cancel_and_await review flagged as an
+            # open assumption (WS CANCELED confirmation reliability) — this
+            # line is what would turn that from a suspicion into evidence.
+            logger.critical(
+                f"[OMS] request_cancel_and_await TIMEOUT [{client_oid[:8]}] "
+                f"after {time.time() - t0:.1f}s/{timeout:.0f}s — "
+                f"REST cancel {'confirmed (code 0/316)' if rest_ok else 'did NOT confirm (request/network failure)'}, "
+                f"no WS user.order FILLED/CANCELED update seen for this "
+                f"order in that window. "
+                + ("Points at WS confirmation lag/drop, not the cancel "
+                   "itself — watch for repeats." if rest_ok else
+                   "Points at the REST cancel call itself — check API/network health.")
+            )
+        return fill
 
     def reconcile_on_startup(self) -> float:
         """
