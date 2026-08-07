@@ -2323,49 +2323,64 @@ class OMS:
                 logger.info(f"[OMS] Cancelling dangling order {order.exchange_id}")
                 self._rest_cancel_order(order.exchange_id)
 
-    def cancel_order_by_client_oid(self, client_oid: str) -> bool:
+    def request_cancel_and_await(self, client_oid: str,
+                                  timeout: float = 15.0) -> Optional[FillEvent]:
         """
-        Cancel one still-resting order by the client_oid a GridLevel
-        tracks, for a cell being dropped out from under it (trail-up/
-        trail-down). Without this, in live mode, the order stays resting
-        on the real exchange book after the bot has already forgotten
-        about it — _poll_live_fills only polls wait_fill() for levels
-        still in self._levels, so once a level is popped, nobody is
-        polling its client_oid's fill queue anymore. If that order goes
-        on to fill for real anyway, the FillEvent lands in
-        _fill_queues[client_oid] with no one left to collect it: a real
-        position the bot never accounts for.
+        Cancel a still-tracked order and wait for its REAL resolution
+        before returning, instead of guessing from the cancel response
+        alone.
 
-        Mirrors the cancel + _orders/_exid_to_coid cleanup
-        _maker_timeout_handler does for its own timeout-cancel case, plus
-        dropping the now-unpollable _fill_queues entry so it doesn't sit
-        there forever (submit() always creates one, but only wait_fill()
-        ever removes it — with nothing left to call wait_fill() for this
-        client_oid, it would otherwise leak for the life of the process).
+        2026-08-07: this replaces an earlier version that fired the REST
+        cancel and then immediately popped _orders/_exid_to_coid/
+        _fill_queues itself, on the assumption that a 0/316 ("already
+        gone") response meant "safe to discard." That's a real race
+        against _handle_order_update (fed by the WS user.order stream):
+        "already gone" can mean either "already cancelled" or "already
+        filled," and if it was actually filled, _handle_order_update's
+        FILLED branch calls _deliver_fill() unconditionally regardless
+        of whether _orders/_exid_to_coid were already popped by someone
+        else. If this method's own premature pop had already removed
+        the _fill_queues entry first, that real fill's FillEvent would
+        find nobody home and vanish — worse than doing nothing, since at
+        least an uncancelled order's eventual fill was still delivered
+        (just to a queue nobody was polling — see the trail-drop
+        cancellation comment this method serves).
 
-        Safe no-op if the order already resolved (filled/cancelled/
-        rejected) or was never live-submitted at all — paper mode never
-        populates _orders, since _place_buy/_place_sell only call
-        self._oms.submit() when self._oms.live_trading is True.
+        Fix: don't guess, and don't touch _orders/_exid_to_coid/
+        _fill_queues here at all. _handle_order_update remains the sole
+        writer of those three structures no matter which resolution
+        actually happens, and wait_fill() below is the sole reader/
+        cleaner of _fill_queues — exactly the same plumbing
+        _liquidate_position, the leg-chase loop, and every other caller
+        already trust. This method just triggers the cancel and then
+        observes whatever _handle_order_update eventually reports,
+        instead of racing it.
+
+        Returns the resolving FillEvent — status FILLED if the order
+        filled before the cancel could land, or CANCELLED (possibly
+        with a nonzero filled_qty, if part of it filled first — same
+        partial-delivery shape _maker_timeout_handler already produces)
+        — or None in either of two different situations this method
+        can't distinguish from the return value alone: the order was
+        never live-tracked to begin with (paper mode never populates
+        _orders), or it genuinely didn't resolve within timeout. Callers
+        that need to tell those apart should check their own knowledge
+        of whether this was a live order before calling, and treat a
+        None after a real cancel attempt as "resolution unknown" —
+        never as "safe to assume cancelled."
         """
         with self._orders_lock:
             order = self._orders.get(client_oid)
         if order is None or not order.exchange_id:
-            return False
+            return None
         if order.status not in (OrderStatus.PENDING, OrderStatus.ACTIVE):
-            return False
+            return None
         logger.info(
             f"[OMS] Cancelling {order.exchange_id} [{client_oid[:8]}] — "
             f"grid cell dropped out from under it (trail)"
         )
-        ok = self._rest_cancel_order(order.exchange_id)
-        with self._orders_lock:
-            o = self._orders.pop(client_oid, None)
-            if o and o.exchange_id:
-                self._exid_to_coid.pop(o.exchange_id, None)
-        with self._fill_queues_lock:
-            self._fill_queues.pop(client_oid, None)
-        return ok
+        self._rest_cancel_order(order.exchange_id)
+        return self.wait_fill(client_oid, timeout=timeout)
 
     def reconcile_on_startup(self) -> float:
         """
@@ -3786,7 +3801,7 @@ class GridEngine:
                  buy_gate_fn: Optional[Callable[[], bool]] = None,
                  sell_gate_fn: Optional[Callable[[], bool]] = None,
                  trend_confirm_fn: Optional[Callable[[], int]] = None,
-                 stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = None,
+                 stray_leg_fn: Optional[Callable[[Optional["OpenLeg"], str, Optional[str], Optional[str]], None]] = None,
                  uptrend_confirmed_fn: Optional[Callable[[], bool]] = None,
                  downtrend_confirmed_fn: Optional[Callable[[], bool]] = None,
                  down_shift_record_fn: Optional[Callable[[], None]] = None):
@@ -3854,17 +3869,22 @@ class GridEngine:
         self._uptrend_confirmed_fn: Optional[Callable[[], bool]] = uptrend_confirmed_fn
         self._downtrend_confirmed_fn: Optional[Callable[[], bool]] = downtrend_confirmed_fn
         self._down_shift_record_fn: Optional[Callable[[], None]] = down_shift_record_fn
-        # stray_leg_fn: optional callable(leg, reason) -> None. Called by
-        # _trail_up/_trail_down when a dropped cell was holding a leg's
-        # designated closer — see those methods' docstrings for why the
-        # remaining cell grid is structurally the wrong home for it. Set by
-        # GridBot to GridBot._chase_close_leg, which spawns a background
-        # thread and returns immediately; this attribute exists (rather than
-        # hardcoding that call here) so GridEngine has no upward dependency
-        # on GridBot and stays constructible standalone in tests. None =
-        # legacy behaviour (log a warning, rely on the orphan-leg rebuild
-        # safety net).
-        self._stray_leg_fn: Optional[Callable[["OpenLeg", str], None]] = stray_leg_fn
+        # stray_leg_fn: optional callable(leg, reason, dropped_client_oid,
+        # dropped_order_side) -> None. Called by _trail_up/_trail_down
+        # whenever a dropped cell was holding a leg's designated closer
+        # (leg not None) and/or a still-live resting order of its own
+        # (dropped_client_oid not None, live-trading only — see those
+        # methods' docstrings for why the remaining cell grid is
+        # structurally the wrong home for either). Set by GridBot to
+        # GridBot._chase_close_leg, which spawns a background thread and
+        # returns immediately; this attribute exists (rather than
+        # hardcoding that call here) so GridEngine has no upward
+        # dependency on GridBot and stays constructible standalone in
+        # tests. None = legacy behaviour (log a warning, rely on the
+        # orphan-leg rebuild safety net; the dropped order, if any, is
+        # simply left resting — see the trail methods' cancellation
+        # comments for why that's live-mode-risky).
+        self._stray_leg_fn: Optional[Callable[[Optional["OpenLeg"], str, Optional[str], Optional[str]], None]] = stray_leg_fn
         # Leg ids currently being actively managed by stray_leg_fn (a chase
         # in progress). check_price_fills()'s orphan-leg detector excludes
         # these — they're accounted for, just not by a cell — so it doesn't
@@ -4518,6 +4538,7 @@ class GridEngine:
 
         dropped_leg = None
         dropped_client_oid = None
+        dropped_order_side = None
         with self._lock:
             # Step 1: remove bottom cell and cancel its order
             if not self._levels:
@@ -4599,9 +4620,21 @@ class GridEngine:
                             f"_open_legs — relying on the orphan-leg rebuild "
                             f"safety net."
                         )
-                # Mark idle so poll_fills won't try to re-place it
-                if bottom.client_oid:
+                # Mark idle so poll_fills won't try to re-place it. Only
+                # capture the client_oid for cancellation when it's a
+                # REAL exchange order (live_trading) — in paper mode
+                # client_oid is set but nothing was ever submitted to the
+                # OMS, so there's nothing to cancel and no phantom-fill
+                # risk (see _trail_up's cancellation comment below).
+                # Gating here, rather than trying to tell the two cases
+                # apart from request_cancel_and_await's return value
+                # later, is deliberate: a None back from that call always
+                # means "genuinely unresolved," never "wasn't live."
+                if bottom.client_oid and self._oms.live_trading:
                     dropped_client_oid = bottom.client_oid
+                    dropped_order_side = (
+                        "BUY" if bottom.state == LevelState.BUY_OPEN else "SELL"
+                    )
                 bottom.state      = LevelState.IDLE
                 bottom.client_oid = ""
             self._levels.pop(0)
@@ -4654,19 +4687,24 @@ class GridEngine:
             )
         else:
             self._place_sell(new_lv)
-        if dropped_client_oid is not None and self._oms.live_trading:
-            # The dropped bottom cell had a real resting order on the
-            # exchange (client_oid was non-empty — SUPPRESSED cells never
-            # reach here since theirs is always ""). Cancel it now that
-            # the cell is gone from self._levels — see
-            # OMS.cancel_order_by_client_oid's docstring for why leaving
-            # it resting is a live-only phantom-fill risk. No-op in
-            # paper mode (self._oms.live_trading guards the call; the OMS
-            # method would also just no-op there anyway, since paper
-            # orders never get registered in self._orders).
-            self._oms.cancel_order_by_client_oid(dropped_client_oid)
-        if dropped_leg is not None and self._stray_leg_fn is not None:
-            self._stray_leg_fn(dropped_leg, "trail_up")
+        if (dropped_leg is not None or dropped_client_oid is not None) \
+                and self._stray_leg_fn is not None:
+            # Single hand-off covering both: a leg that needs chasing,
+            # and/or a still-live order that needs cancelling. These
+            # used to be two independent calls fired back-to-back here —
+            # cancel this function's own order while, in parallel, the
+            # chase worker immediately started racing to fill a FRESH
+            # order for the same leg. If the original order won its own
+            # race against its cancel (filled instead of cancelling) at
+            # the same time the chase's new order also filled, the leg
+            # would close twice — a real double-execution, not just a
+            # bookkeeping gap. Bundling them into one call lets the
+            # receiving worker cancel-and-confirm the original order
+            # FIRST, and only then decide whether (and for how much
+            # remaining qty) the leg still needs chasing — see
+            # GridBot._reconcile_dropped_cell_worker.
+            self._stray_leg_fn(dropped_leg, "trail_up",
+                                dropped_client_oid, dropped_order_side)
         self._alerter_send(
             f"⬆️ Grid trailed UP → [{self._params.lower:.0f}, {new_upper:.0f}]"
             + (" (top cell flipped to BUY — confirmed uptrend)" if new_lv.open_side == "BUY" else "")
@@ -4683,6 +4721,7 @@ class GridEngine:
 
         dropped_leg = None
         dropped_client_oid = None
+        dropped_order_side = None
         with self._lock:
             if not self._levels:
                 return
@@ -4725,8 +4764,11 @@ class GridEngine:
                             f"_open_legs — relying on the orphan-leg rebuild "
                             f"safety net."
                         )
-                if top.client_oid:
+                if top.client_oid and self._oms.live_trading:
                     dropped_client_oid = top.client_oid
+                    dropped_order_side = (
+                        "BUY" if top.state == LevelState.BUY_OPEN else "SELL"
+                    )
                 top.state      = LevelState.IDLE
                 top.client_oid = ""
             self._levels.pop()
@@ -4790,12 +4832,13 @@ class GridEngine:
             )
         else:
             self._place_buy(new_lv)
-        if dropped_client_oid is not None and self._oms.live_trading:
-            # See the matching TRAIL UP comment — same live-only
-            # phantom-fill risk, mirrored for the top cell.
-            self._oms.cancel_order_by_client_oid(dropped_client_oid)
-        if dropped_leg is not None and self._stray_leg_fn is not None:
-            self._stray_leg_fn(dropped_leg, "trail_down")
+        if (dropped_leg is not None or dropped_client_oid is not None) \
+                and self._stray_leg_fn is not None:
+            # See the matching TRAIL UP comment — same double-execution
+            # risk from firing cancel and chase independently, mirrored
+            # for the top cell.
+            self._stray_leg_fn(dropped_leg, "trail_down",
+                                dropped_client_oid, dropped_order_side)
         self._alerter_send(
             f"⬇️ Grid trailed DOWN → [{new_lower:.0f}, {self._params.upper:.0f}]"
             + (" (bottom cell flipped to SELL — confirmed downtrend)" if new_lv.open_side == "SELL" else "")
@@ -9740,18 +9783,195 @@ class GridBot:
             f"realized {gross_pnl:+.4f} USD | {leg.qty:.4f} BTC remaining"
         )
 
-    def _chase_close_leg(self, leg: "OpenLeg", reason: str) -> None:
+    def _chase_close_leg(self, leg: Optional["OpenLeg"], reason: str,
+                          dropped_client_oid: Optional[str] = None,
+                          dropped_order_side: Optional[str] = None) -> None:
         """
         stray_leg_fn — called by GridEngine (from _trail_up/_trail_down,
-        inside its tick path) when trailing drops a cell that was holding
-        leg's designated closer. Must return immediately: it only spawns
-        the worker thread and does no I/O itself, since the caller's tick
-        loop (and every other level's fill processing behind it) is
-        waiting on this call to return.
+        inside its tick path) when trailing drops a cell that was
+        holding a leg's designated closer (leg not None) and/or a still-
+        live resting order of its own (dropped_client_oid not None).
+        Must return immediately: it only spawns the worker thread and
+        does no I/O itself, since the caller's tick loop (and every
+        other level's fill processing behind it) is waiting on this
+        call to return.
         """
         threading.Thread(
-            target=self._chase_close_leg_worker, args=(leg, reason),
-            name=f"LegChase-{leg.leg_id}", daemon=True).start()
+            target=self._reconcile_dropped_cell_worker,
+            args=(leg, reason, dropped_client_oid, dropped_order_side),
+            name=f"TrailDrop-{leg.leg_id if leg is not None else dropped_client_oid[:8]}",
+            daemon=True).start()
+
+    def _reconcile_dropped_cell_worker(
+            self, leg: Optional["OpenLeg"], reason: str,
+            dropped_client_oid: Optional[str],
+            dropped_order_side: Optional[str]) -> None:
+        """
+        Runs off the tick loop. If the dropped cell had a live resting
+        order (dropped_client_oid), cancel it and wait for its REAL
+        resolution BEFORE deciding what, if anything, still needs
+        chasing — see OMS.request_cancel_and_await's docstring for why
+        guessing from the cancel response alone isn't safe, and the
+        TRAIL UP/DOWN comments in GridEngine for why this has to be
+        sequenced (cancel-confirm, then chase) rather than fired
+        alongside the chase in parallel: if the original order and the
+        chase's fresh order were both live at once for the same leg,
+        both could fill and close it twice.
+
+        Three cases fall out of dropped_client_oid's resolution:
+          - Cleanly cancelled, nothing filled: proceed to chase leg for
+            its full qty, same as if there'd been no order to cancel.
+          - Filled (fully or partially) before the cancel could land:
+            that's real, permanent PnL against leg's close side — apply
+            it via the exact same accounting a normal chase fill would
+            use (_finalize_leg_close / _record_partial_leg_close), THEN
+            chase whatever qty (if any) is still left. If it was a
+            plain fresh-open order with no leg attached at all, this is
+            a brand new, entirely unexpected position — hand off to
+            _register_and_close_orphan_leg instead.
+          - Timed out with no resolution either way: order state is
+            genuinely unknown. Don't guess — a wrong guess here risks
+            either an untracked position (assumed cancelled, wasn't) or
+            a double-close (assumed filled and chased anyway, but it
+            was actually still resting and the chase's fill was the
+            second execution). Escalate loudly and leave leg alone
+            rather than auto-chase it.
+        """
+        close_side = None
+        if leg is not None:
+            close_side = "SELL" if leg.open_side == "BUY" else "BUY"
+
+        fill = None
+        if dropped_client_oid is not None:
+            fill = self._oms.request_cancel_and_await(dropped_client_oid, timeout=15.0)
+
+            if fill is None:
+                logger.critical(
+                    f"[GridBot][{reason}] Cancel-and-await UNKNOWN resolution "
+                    f"for order [{dropped_client_oid[:8]}] (dropped by trail) "
+                    f"after 15s — order state is genuinely unknown, not "
+                    f"assumed cancelled. "
+                    + (f"Leg #{leg.leg_id} is NOT being auto-chased to avoid "
+                       f"a possible double-close — check manually." if leg
+                       is not None else
+                       "No leg was attached to this cell (it was a fresh, "
+                       "still-unfilled open order), so there's no double-"
+                       "close risk, but its true fate is still unknown — "
+                       "check manually for a possible untracked position.")
+                )
+                self._alerter.send(
+                    f"🚨 Trail-drop cancel: UNKNOWN resolution for order "
+                    f"[{dropped_client_oid[:8]}] after 15s — manual check "
+                    f"needed."
+                    + (f" Leg #{leg.leg_id} withheld from auto-chase."
+                       if leg is not None else "")
+                )
+                return
+
+        if fill is not None and (fill.is_filled or fill.filled_qty > 0):
+            if leg is not None and close_side is not None:
+                if fill.is_filled:
+                    self._finalize_leg_close(
+                        leg, fill, close_side, reason,
+                        log_verb="filled during trail-cancel",
+                        alert_label="Leg closed (raced trail-cancel)")
+                    return   # leg fully closed by its own original order
+                self._record_partial_leg_close(leg, fill, close_side, reason)
+                # falls through below to chase whatever's left of leg.qty
+            elif leg is None:
+                # Fresh open order, no leg ever attached — filled anyway
+                # during what was meant to be a clean cancel. A real,
+                # entirely new position now exists that nothing expected.
+                if dropped_order_side is None:
+                    # Shouldn't happen — GridEngine always sets this
+                    # alongside dropped_client_oid (see _trail_up/
+                    # _trail_down) — but fail loudly rather than guess a
+                    # side for a real position.
+                    logger.critical(
+                        f"[GridBot][{reason}] TRAIL-DROP CANCEL RACE: order "
+                        f"[{dropped_client_oid[:8]}] filled "
+                        f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f} with "
+                        f"no known side — cannot safely register as a leg. "
+                        f"Manual check required immediately."
+                    )
+                    self._alerter.send(
+                        f"🚨 Trail-drop cancel race: order "
+                        f"[{dropped_client_oid[:8]}] filled with unknown "
+                        f"side — manual check required immediately."
+                    )
+                    return
+                self._register_and_close_orphan_leg(
+                    fill, dropped_order_side, reason)
+                return
+
+        if leg is not None and leg.qty > 0:
+            self._chase_close_leg_worker(leg, reason)
+
+    def _register_and_close_orphan_leg(self, fill: "FillEvent",
+                                        open_side: str, reason: str) -> None:
+        """
+        A cell trail-up/trail-down dropped was a plain fresh-open order
+        (no closes_leg_id — nothing was tracking it as any leg's
+        closer) that filled for real in the narrow race window between
+        deciding to cancel it and that cancel actually landing. That
+        fill opened a brand new, real position nothing anywhere was
+        expecting. Register it as a genuine OpenLeg — same shape
+        GridEngine._on_fill's own opening path produces — and hand it
+        straight to the chase worker to flatten back out, rather than
+        leave a stray untracked position sitting on the book. Loud by
+        design (CRITICAL + alert): this path firing at all means a
+        trail-drop's cancel lost its race, which should be rare enough
+        that every occurrence deserves a human's attention regardless
+        of how cleanly it's handled automatically from here.
+        """
+        leg_id = None
+        db_write_failed = False
+        if self._store is not None:
+            ok, result = self._store.execute_with_retry(lambda: self._store.open_leg(
+                open_side=open_side, open_price=fill.avg_price,
+                qty=fill.filled_qty, opened_ts=time.time(),
+                opened_level_idx=-1, open_fee=fill.fee,
+            ))
+            if ok:
+                leg_id = result
+            else:
+                db_write_failed = True
+                logger.error(
+                    f"[GridBot][{reason}] DB open_leg error after retries "
+                    f"for orphaned trail-drop fill: {result}", exc_info=result,
+                )
+        if leg_id is None:
+            with self._engine._lock:
+                self._engine._local_leg_seq -= 1
+                leg_id = self._engine._local_leg_seq
+            if db_write_failed:
+                logger.critical(
+                    f"[GridBot][{reason}] UNTRACKED LEG (trail-drop race): "
+                    f"open_leg DB write failed after retries for {open_side} "
+                    f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f} (local leg "
+                    f"#{leg_id}). Tracked in-memory for now; will be silently "
+                    f"lost from the ledger at the next rebuild/restart unless "
+                    f"fixed manually first."
+                )
+        new_leg = OpenLeg(leg_id=leg_id, open_side=open_side,
+                           open_price=fill.avg_price, qty=fill.filled_qty,
+                           opened_ts=time.time(), opened_level_idx=-1,
+                           open_fee=fill.fee)
+        with self._engine._lock:
+            self._engine._open_legs[leg_id] = new_leg
+            self._engine._chasing_leg_ids.add(leg_id)
+        logger.critical(
+            f"[GridBot][{reason}] TRAIL-DROP CANCEL RACE: a dropped cell's "
+            f"order filled for real during cancellation — {open_side} "
+            f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f}. Registered as "
+            f"leg #{leg_id}; handing to chase now to flatten it back out."
+        )
+        self._alerter.send(
+            f"⚠️ Trail-drop cancel race: order filled anyway — {open_side} "
+            f"{fill.filled_qty:.4f} @ {fill.avg_price:.2f}. Registered as "
+            f"leg #{leg_id}, closing via chase now."
+        )
+        self._chase_close_leg_worker(new_leg, reason)
 
     def _chase_close_leg_worker(self, leg: "OpenLeg", reason: str) -> None:
         """
