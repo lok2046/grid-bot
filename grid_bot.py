@@ -10405,9 +10405,27 @@ class GridBot:
         # underlying ledger is the shared DB, not this specific instance;
         # it's only reconcile's fresh-assignment side that needed this fix).
         carried_chasing_leg_ids: set = set()
+        # ORPHAN_COOLDOWN_CARRY_2026_08_07: _last_orphan_rebuild_request
+        # (orphan_leg_rebuild_cooldown_s's cooldown clock) lives on the
+        # GridEngine instance, but a real (non-dead-band-skipped) rebuild
+        # replaces that instance right here — a plain GridEngine(...) call
+        # with no carry-over resets the clock to 0.0 on the new object.
+        # Confirmed in GEN00040_GREEN 2026-08-07: leg #875 zero-candidate
+        # 07:22:09-08:05:19, warnings otherwise correctly spaced ~15s apart
+        # (the cooldown holding), except immediately after every completed
+        # rebuild (07:51:15, 07:52:16, 07:53:31, ...) where a second
+        # warning fired in the same second — the fresh engine had no memory
+        # of the one that had just fired moments earlier. Only matters right
+        # at a rebuild boundary (one extra dead-band-skipped attempt, not a
+        # busy loop), but it's the same class of bug as the original
+        # incident, so carry it across the same way carried_chasing_leg_ids
+        # already does below.
+        carried_last_orphan_rebuild_request: float = 0.0
         if self._engine is not None:
             with self._engine._lock:
                 carried_chasing_leg_ids = set(self._engine._chasing_leg_ids)
+                carried_last_orphan_rebuild_request = \
+                    self._engine._last_orphan_rebuild_request
 
         self._engine = GridEngine(
             params=new_params, oms=self._oms,
@@ -10420,6 +10438,8 @@ class GridBot:
             uptrend_confirmed_fn=self._uptrend_confirmed_now,
             downtrend_confirmed_fn=self._downtrend_confirmed_now,
             down_shift_record_fn=self._record_down_shift)
+        self._engine._last_orphan_rebuild_request = \
+            carried_last_orphan_rebuild_request
         if carried_chasing_leg_ids:
             # update(), not assignment — defensive against a concurrent
             # chase-completion discard landing in this same window; never
