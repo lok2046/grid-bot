@@ -5477,7 +5477,18 @@ class GridEngine:
             if not candidates:
                 # Every candidate level on the closing side is already
                 # claimed by another clean-fit leg — unchanged from
-                # pre-existing behaviour.
+                # pre-existing behaviour. Previously silent (2026-08-07:
+                # leg #893's restart-triggered liquidation left no trace
+                # anywhere in reconcile_open_legs' own logging, making the
+                # actual branch that fired unrecoverable after the fact) —
+                # log it like every other to_liquidate/zero_candidate_pending
+                # branch below does.
+                logger.info(
+                    f"[GridEngine] Leg #{leg.leg_id} clean-fit (open="
+                    f"{leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}]) "
+                    f"but every closing-side level already claimed by "
+                    f"another clean-fit leg — liquidating"
+                )
                 to_liquidate.append(leg)
                 continue
             best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
@@ -10601,6 +10612,12 @@ class GridBot:
                 f"the rebuilt grid"
             )
 
+        if legs_to_liquidate:
+            logger.info(
+                f"[GridBot] rebuild_reprice: reconcile_open_legs flagged "
+                f"{len(legs_to_liquidate)} leg(s) for market liquidation this "
+                f"rebuild: {[(leg.leg_id, leg.open_side, round(leg.open_price, 2)) for leg in legs_to_liquidate]}"
+            )
         for leg in legs_to_liquidate:
             self._liquidate_leg_at_market(leg, reason="rebuild_reprice")
 
