@@ -2323,6 +2323,50 @@ class OMS:
                 logger.info(f"[OMS] Cancelling dangling order {order.exchange_id}")
                 self._rest_cancel_order(order.exchange_id)
 
+    def cancel_order_by_client_oid(self, client_oid: str) -> bool:
+        """
+        Cancel one still-resting order by the client_oid a GridLevel
+        tracks, for a cell being dropped out from under it (trail-up/
+        trail-down). Without this, in live mode, the order stays resting
+        on the real exchange book after the bot has already forgotten
+        about it — _poll_live_fills only polls wait_fill() for levels
+        still in self._levels, so once a level is popped, nobody is
+        polling its client_oid's fill queue anymore. If that order goes
+        on to fill for real anyway, the FillEvent lands in
+        _fill_queues[client_oid] with no one left to collect it: a real
+        position the bot never accounts for.
+
+        Mirrors the cancel + _orders/_exid_to_coid cleanup
+        _maker_timeout_handler does for its own timeout-cancel case, plus
+        dropping the now-unpollable _fill_queues entry so it doesn't sit
+        there forever (submit() always creates one, but only wait_fill()
+        ever removes it — with nothing left to call wait_fill() for this
+        client_oid, it would otherwise leak for the life of the process).
+
+        Safe no-op if the order already resolved (filled/cancelled/
+        rejected) or was never live-submitted at all — paper mode never
+        populates _orders, since _place_buy/_place_sell only call
+        self._oms.submit() when self._oms.live_trading is True.
+        """
+        with self._orders_lock:
+            order = self._orders.get(client_oid)
+        if order is None or not order.exchange_id:
+            return False
+        if order.status not in (OrderStatus.PENDING, OrderStatus.ACTIVE):
+            return False
+        logger.info(
+            f"[OMS] Cancelling {order.exchange_id} [{client_oid[:8]}] — "
+            f"grid cell dropped out from under it (trail)"
+        )
+        ok = self._rest_cancel_order(order.exchange_id)
+        with self._orders_lock:
+            o = self._orders.pop(client_oid, None)
+            if o and o.exchange_id:
+                self._exid_to_coid.pop(o.exchange_id, None)
+        with self._fill_queues_lock:
+            self._fill_queues.pop(client_oid, None)
+        return ok
+
     def reconcile_on_startup(self) -> float:
         """
         Called once at startup (after OMS.start()) to detect leftover state
@@ -4473,6 +4517,7 @@ class GridEngine:
         new_upper = round(old_upper + spacing, 2)
 
         dropped_leg = None
+        dropped_client_oid = None
         with self._lock:
             # Step 1: remove bottom cell and cancel its order
             if not self._levels:
@@ -4555,6 +4600,8 @@ class GridEngine:
                             f"safety net."
                         )
                 # Mark idle so poll_fills won't try to re-place it
+                if bottom.client_oid:
+                    dropped_client_oid = bottom.client_oid
                 bottom.state      = LevelState.IDLE
                 bottom.client_oid = ""
             self._levels.pop(0)
@@ -4607,6 +4654,17 @@ class GridEngine:
             )
         else:
             self._place_sell(new_lv)
+        if dropped_client_oid is not None and self._oms.live_trading:
+            # The dropped bottom cell had a real resting order on the
+            # exchange (client_oid was non-empty — SUPPRESSED cells never
+            # reach here since theirs is always ""). Cancel it now that
+            # the cell is gone from self._levels — see
+            # OMS.cancel_order_by_client_oid's docstring for why leaving
+            # it resting is a live-only phantom-fill risk. No-op in
+            # paper mode (self._oms.live_trading guards the call; the OMS
+            # method would also just no-op there anyway, since paper
+            # orders never get registered in self._orders).
+            self._oms.cancel_order_by_client_oid(dropped_client_oid)
         if dropped_leg is not None and self._stray_leg_fn is not None:
             self._stray_leg_fn(dropped_leg, "trail_up")
         self._alerter_send(
@@ -4624,6 +4682,7 @@ class GridEngine:
         new_lower = round(old_lower - spacing, 2)
 
         dropped_leg = None
+        dropped_client_oid = None
         with self._lock:
             if not self._levels:
                 return
@@ -4666,6 +4725,8 @@ class GridEngine:
                             f"_open_legs — relying on the orphan-leg rebuild "
                             f"safety net."
                         )
+                if top.client_oid:
+                    dropped_client_oid = top.client_oid
                 top.state      = LevelState.IDLE
                 top.client_oid = ""
             self._levels.pop()
@@ -4729,6 +4790,10 @@ class GridEngine:
             )
         else:
             self._place_buy(new_lv)
+        if dropped_client_oid is not None and self._oms.live_trading:
+            # See the matching TRAIL UP comment — same live-only
+            # phantom-fill risk, mirrored for the top cell.
+            self._oms.cancel_order_by_client_oid(dropped_client_oid)
         if dropped_leg is not None and self._stray_leg_fn is not None:
             self._stray_leg_fn(dropped_leg, "trail_down")
         self._alerter_send(
