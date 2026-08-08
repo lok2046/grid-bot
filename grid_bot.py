@@ -10241,6 +10241,57 @@ class GridBot:
                 return
 
         if leg is not None and leg.qty > 0:
+            # GRACE_TRAIL_DROP_2026_08_08: trail-up/trail-down dropping a
+            # cell used to hand the orphaned leg straight to
+            # _chase_close_leg_worker unconditionally — the SAME immediate-
+            # chase behavior _rebuild_grid's zero-candidate path had before
+            # zero_candidate_pre_chase_grace_s existed, just never updated
+            # to match once that grace period was added. Confirmed via leg
+            # #1007 (GEN00044_GREEN, 2026-08-08 22:29:59): trend_risk=0.00,
+            # chased and closed for -$1.55 within the same second its cell
+            # was dropped, despite a 7200s grace budget sitting completely
+            # unused because this path never consults it.
+            #
+            # Fix: give a trail-dropped leg the same chance to wait as a
+            # rebuild-flagged one, by registering it in the exact same
+            # _leg_zero_candidate_since map _rebuild_grid's loop (and
+            # reconcile_open_legs' dwell-cap check) already read — rather
+            # than inventing a second, parallel wait mechanism here. This
+            # leg stays in self._open_legs either way, so the very next
+            # rebuild's reconcile_open_legs evaluates it fresh: if it's
+            # found a cell by then, it's re-anchored normally (no forced
+            # loss, same as legs #875/#895); if it's still zero-candidate,
+            # reconcile_open_legs' own dwell-cap check (now grace-aware,
+            # see GRACE_DWELL_COORDINATION_2026_08_06) decides whether to
+            # keep waiting or finally chase/liquidate it. Skips straight to
+            # chase, unchanged, when grace is off (0.0, the legacy default)
+            # or trend_risk is already urgent — same bypass condition used
+            # everywhere else grace is checked.
+            pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
+            urgent_threshold = self._cfg.get(
+                "reconcile_urgent_trend_risk",
+                self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+            )
+            trend_risk = 0.0
+            if self._stop_scorer is not None:
+                _bid, _ask, mid = _price_cache.get_l1()
+                if mid is not None:
+                    trend_risk = self._stop_scorer.compute_trend_risk(
+                        mid, self._effective_trend_regime(), self._last_trend_slope_pct
+                    )
+            if pre_chase_grace_s > 0.0 and trend_risk < urgent_threshold:
+                self._leg_zero_candidate_since[leg.leg_id] = time.time()
+                logger.info(
+                    f"[GridBot][{reason}] Leg #{leg.leg_id} (open="
+                    f"{leg.open_price:.2f}) dropped by trailing with no "
+                    f"cell left to hold its closer — within pre-chase "
+                    f"grace (0s/{pre_chase_grace_s:.0f}s, trend_risk="
+                    f"{trend_risk:.2f}<{urgent_threshold:.2f}) — holding "
+                    f"with no resting order; the next rebuild's "
+                    f"reconcile_open_legs picks it up from here instead "
+                    f"of chasing immediately."
+                )
+                return
             self._chase_close_leg_worker(leg, reason)
 
     def _register_and_close_orphan_leg(self, fill: "FillEvent",
