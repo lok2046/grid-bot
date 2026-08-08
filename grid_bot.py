@@ -5526,7 +5526,78 @@ class GridEngine:
         if not legs:
             return {}, [], set(), []
         if not levels:
-            return {}, list(legs), set(), []
+            # No cells left to host ANYONE's closer this rebuild (e.g. a
+            # handoff restore_plan claimed every level in a small grid —
+            # exactly what happened to leg #893, GEN00041_GREEN,
+            # 2026-08-07 13:10:55: a levels=3 grid, restore_plan claimed
+            # all 3, so `levels` came back empty here). Structurally this
+            # means every leg in `legs` is zero-candidate — there's no
+            # cell for ANY of them, same as the "no direction-correct
+            # level exists" case in the main loop below — NOT "confirmed
+            # misfit, liquidate now" regardless of remaining grace/dwell
+            # budget. FIX_2026_08_07: this branch previously returned
+            # `list(legs)` straight as to_liquidate unconditionally,
+            # bypassing zero_candidate_since entirely and skipping the
+            # "[GridEngine] reconcile_open_legs: ..." summary log below
+            # (this returns before reaching it) — leg #893 had ~6700s of
+            # its ~8057s grace+dwell budget left and got market-
+            # liquidated anyway, with zero chase attempts, purely because
+            # of this early-return. Apply the same urgent/dwell-cap
+            # decision the main zero-candidate branch uses instead of
+            # skipping it — see that branch (below) for the identical
+            # logic and the "2026-08-03 16:35 incident" GRID_CONFIG
+            # comment block this and that branch both defer to.
+            urgent_threshold = self._cfg.get(
+                "reconcile_urgent_trend_risk",
+                self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+            )
+            pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
+            zc_max_dwell = self._cfg.get("reconcile_zero_candidate_max_dwell_s", 900.0)
+            zc_dwell_cap = pre_chase_grace_s + (
+                zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
+                if urgent_threshold > 0 else 0.0
+            )
+            to_liquidate_nc: List["OpenLeg"] = []
+            zero_candidate_pending_nc: List["OpenLeg"] = []
+            now_nc = time.time()
+            for leg in sorted(legs, key=lambda l: l.opened_ts):
+                if trend_risk >= urgent_threshold:
+                    logger.info(
+                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate "
+                        f"(no cells available at all this rebuild) + "
+                        f"urgent trend_risk={trend_risk:.2f} >= "
+                        f"{urgent_threshold:.2f} — liquidating now"
+                    )
+                    to_liquidate_nc.append(leg)
+                    continue
+                first_zc = zero_candidate_since.get(leg.leg_id)
+                if first_zc is not None and (now_nc - first_zc) >= zc_dwell_cap:
+                    logger.info(
+                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate "
+                        f"for {now_nc - first_zc:.0f}s >= dwell cap "
+                        f"{zc_dwell_cap:.0f}s (trend_risk={trend_risk:.2f}, "
+                        f"no cells available at all this rebuild) — "
+                        f"liquidating"
+                    )
+                    to_liquidate_nc.append(leg)
+                    continue
+                logger.info(
+                    f"[GridEngine] Leg #{leg.leg_id} zero-candidate (open="
+                    f"{leg.open_price:.2f}) — no cells available at all "
+                    f"this rebuild (all {len(all_levels)} claimed "
+                    f"elsewhere), trend_risk={trend_risk:.2f}, dwell cap "
+                    f"{zc_dwell_cap:.0f}s ({'starting now' if first_zc is None else f'{now_nc - first_zc:.0f}s elapsed'})"
+                )
+                zero_candidate_pending_nc.append(leg)
+            if to_liquidate_nc or zero_candidate_pending_nc:
+                logger.info(
+                    f"[GridEngine] reconcile_open_legs: 0 leg(s) "
+                    f"re-anchored to the rebuilt grid (0 cells available "
+                    f"at all this rebuild), {len(to_liquidate_nc)} "
+                    f"liquidating, {len(zero_candidate_pending_nc)} "
+                    f"zero-candidate pending"
+                )
+            return {}, to_liquidate_nc, set(), zero_candidate_pending_nc
 
         # lower/upper/spacing describe the REBUILT GRID'S true range, from
         # every level regardless of exclusion — not just the subset left
