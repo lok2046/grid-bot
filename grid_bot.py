@@ -7767,6 +7767,18 @@ class GridBot:
         # from _leg_no_fit_since since the two dwell caps and the
         # first-time-seen bookkeeping (kick off a chase) differ.
         self._leg_zero_candidate_since: Dict[int, float] = {}
+        # _leg_zero_candidate_since was main-thread-only (only ever
+        # touched inside _rebuild_grid) until GRACE_TRAIL_DROP_2026_08_08
+        # started writing/reading it from _reconcile_dropped_cell_worker
+        # and _chase_close_leg_worker, both background threads. A plain
+        # dict[key]=value is atomic under the GIL (no corruption risk),
+        # but an unguarded .items()/.keys() iteration on the main thread
+        # racing a background-thread write can still raise "dictionary
+        # changed size during iteration" — this lock is what actually
+        # prevents that, not just the logical race of which thread's
+        # decision lands last (see the GRACE_TRAIL_DROP_2026_08_08
+        # reason-gate above for that half).
+        self._leg_zero_candidate_since_lock = threading.Lock()
         # Same idea again, separate map, for the claim-collision case
         # (2026-08-08, gen00042_green) — a clean-fit leg whose target cell
         # lost a claim to another clean-fit leg this rebuild. Kept apart
@@ -10267,20 +10279,29 @@ class GridBot:
             # chase, unchanged, when grace is off (0.0, the legacy default)
             # or trend_risk is already urgent — same bypass condition used
             # everywhere else grace is checked.
+            # Only a genuine trail-drop gets a fresh grace window here.
+            # _rebuild_grid's own zero-candidate escalation loop reaches
+            # this same worker (via _chase_close_leg(leg,
+            # reason="rebuild_reprice_pending")) specifically because it
+            # already decided this leg's grace is used up — re-applying
+            # the same check there would just re-grant it, forever, for
+            # every non-urgent escalation.
             pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
             urgent_threshold = self._cfg.get(
                 "reconcile_urgent_trend_risk",
                 self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
             )
             trend_risk = 0.0
-            if self._stop_scorer is not None:
+            if reason in ("trail_up", "trail_down") and self._stop_scorer is not None:
                 _bid, _ask, mid = _price_cache.get_l1()
                 if mid is not None:
                     trend_risk = self._stop_scorer.compute_trend_risk(
                         mid, self._effective_trend_regime(), self._last_trend_slope_pct
                     )
-            if pre_chase_grace_s > 0.0 and trend_risk < urgent_threshold:
-                self._leg_zero_candidate_since[leg.leg_id] = time.time()
+            if (reason in ("trail_up", "trail_down")
+                    and pre_chase_grace_s > 0.0 and trend_risk < urgent_threshold):
+                with self._leg_zero_candidate_since_lock:
+                    self._leg_zero_candidate_since[leg.leg_id] = time.time()
                 logger.info(
                     f"[GridBot][{reason}] Leg #{leg.leg_id} (open="
                     f"{leg.open_price:.2f}) dropped by trailing with no "
@@ -10491,7 +10512,8 @@ class GridBot:
                 zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
                 if urgent_threshold > 0 else 0.0
             )
-            started = self._leg_zero_candidate_since.get(leg.leg_id, time.time())
+            with self._leg_zero_candidate_since_lock:
+                started = self._leg_zero_candidate_since.get(leg.leg_id, time.time())
             elapsed = time.time() - started
 
             if trend_risk < urgent_threshold and elapsed < zc_dwell_cap:
@@ -11202,12 +11224,14 @@ class GridBot:
             reconcile_trend_risk = self._stop_scorer.compute_trend_risk(
                 mid, self._effective_trend_regime(), self._last_trend_slope_pct
             )
-        if self._leg_zero_candidate_since:
+        with self._leg_zero_candidate_since_lock:
+            zero_candidate_since_snapshot = dict(self._leg_zero_candidate_since)
+        if zero_candidate_since_snapshot:
             now_dbg = time.time()
             logger.info(
                 f"[GridBot] rebuild_reprice: reconcile_open_legs inputs — "
                 f"trend_risk={reconcile_trend_risk:.2f}, zero_candidate_since="
-                f"{ {lid: round(now_dbg - ts, 0) for lid, ts in self._leg_zero_candidate_since.items()} } "
+                f"{ {lid: round(now_dbg - ts, 0) for lid, ts in zero_candidate_since_snapshot.items()} } "
                 f"(values are seconds elapsed, not raw timestamps)"
             )
         leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs, claim_collision_legs = (
@@ -11217,7 +11241,7 @@ class GridBot:
                 trend_risk=reconcile_trend_risk,
                 effective_atr=new_params.effective_atr,
                 pending_since=self._leg_no_fit_since,
-                zero_candidate_since=self._leg_zero_candidate_since,
+                zero_candidate_since=zero_candidate_since_snapshot,
                 claim_collision_since=self._leg_claim_collision_since,
             )
         )
@@ -11264,7 +11288,8 @@ class GridBot:
             self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
         )
         for leg in zero_candidate_legs:
-            first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
+            with self._leg_zero_candidate_since_lock:
+                first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
             with self._engine._lock:
                 already_chasing = leg.leg_id in self._engine._chasing_leg_ids
             if already_chasing:
@@ -11297,7 +11322,9 @@ class GridBot:
                 f"settling into the unmanaged wait."
             )
             self._chase_close_leg(leg, reason="rebuild_reprice_pending")
-        for leg_id in list(self._leg_zero_candidate_since.keys()):
+        with self._leg_zero_candidate_since_lock:
+            zero_candidate_since_ids_snapshot = list(self._leg_zero_candidate_since.keys())
+        for leg_id in zero_candidate_since_ids_snapshot:
             if leg_id in zero_candidate_ids:
                 continue  # still dwelling, reported again this rebuild
             with self._engine._lock:
@@ -11315,7 +11342,8 @@ class GridBot:
             # genuinely resolved — recovered to a clean/buffered fit, or
             # was already confirmed-liquidated (by reconcile's cap-expiry
             # branch, or by the chase worker's own exhaustion fallback).
-            del self._leg_zero_candidate_since[leg_id]
+            with self._leg_zero_candidate_since_lock:
+                self._leg_zero_candidate_since.pop(leg_id, None)
             with self._engine._lock:
                 self._engine._grace_held_leg_ids.discard(leg_id)
 
@@ -11648,9 +11676,11 @@ class GridBot:
         """
         if self._store is None:
             return
+        with self._leg_zero_candidate_since_lock:
+            snapshot = dict(self._leg_zero_candidate_since)
         self._store.set_meta(
             "leg_zero_candidate_since",
-            json.dumps({str(k): v for k, v in self._leg_zero_candidate_since.items()}),
+            json.dumps({str(k): v for k, v in snapshot.items()}),
         )
 
     def _restore_leg_zero_candidate_since(self) -> None:
@@ -11685,7 +11715,8 @@ class GridBot:
                 f"— starting with an empty dwell map: {e}"
             )
             return
-        self._leg_zero_candidate_since = {int(k): float(v) for k, v in restored.items()}
+        with self._leg_zero_candidate_since_lock:
+            self._leg_zero_candidate_since = {int(k): float(v) for k, v in restored.items()}
         if self._leg_zero_candidate_since:
             logger.info(
                 f"[GridBot] Restored zero-candidate dwell state for "
