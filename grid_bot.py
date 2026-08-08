@@ -1700,17 +1700,35 @@ class OMS:
         self._order_queue.put(req)
 
     def wait_fill(self, client_oid: str, timeout: float = 3.0) -> Optional[FillEvent]:
+        """
+        2026-08-08 (Mechanism A investigation): the queue used to be
+        popped in a `finally`, unconditionally — on a genuine fill/cancel
+        AND on a plain timeout miss alike. That's correct for the first
+        case (the item's been consumed, nothing left to poll for) but
+        wrong for the second: check_price_fills() -> _poll_live_fills()
+        calls this every tick, with timeout=0.0, for every still-resting
+        live order, and keeps calling it across as many ticks as the
+        order takes to resolve. The old code destroyed the queue on that
+        very first empty poll — before the order had any real chance to
+        fill or cancel — so _deliver_fill()'s later, real delivery
+        (fed by the WS user.order stream once the order actually
+        resolves) would find q is None and silently drop the FillEvent,
+        for ANY order that outlived a single tick. Popping only on an
+        actual hit means a miss just leaves the (still-empty) queue in
+        place for the next poll to try again — exactly how a queue meant
+        to be polled repeatedly has to behave.
+        """
         with self._fill_queues_lock:
             q = self._fill_queues.get(client_oid)
         if q is None:
             return None
         try:
-            return q.get(timeout=timeout)
+            fill = q.get(timeout=timeout)
         except queue.Empty:
             return None
-        finally:
-            with self._fill_queues_lock:
-                self._fill_queues.pop(client_oid, None)
+        with self._fill_queues_lock:
+            self._fill_queues.pop(client_oid, None)
+        return fill
 
     # ── Worker ────────────────────────────────────────────────────────────────
 
@@ -2368,13 +2386,43 @@ class OMS:
         of whether this was a live order before calling, and treat a
         None after a real cancel attempt as "resolution unknown" —
         never as "safe to assume cancelled."
+
+        2026-08-08 (Mechanism A, deeper fix): the two early checks below
+        used to return None the instant self._orders had nothing live
+        for client_oid, on the assumption that covers "never tracked."
+        That assumption doesn't hold for how this method is actually
+        called: every caller today (GridEngine._trail_up/_trail_down,
+        via GridBot._reconcile_dropped_cell_worker) only ever passes a
+        client_oid it captured, under lock, at the exact instant it was
+        a genuinely live resting order — see "only capture when
+        live_trading" in those methods. So by the time THIS method runs
+        (on a background thread, moments later), an already-empty or
+        already-terminal order record can only mean one thing:
+        _handle_order_update (the WS thread) already resolved it
+        concurrently — never "was never tracked." Its FillEvent may
+        already be sitting in _fill_queues[client_oid] (delivered by
+        _deliver_fill), or about to be: _handle_order_update sets
+        order.status to a terminal value BEFORE popping self._orders and
+        calling _deliver_fill (see its FILLED branch), so the two checks
+        below can observe a live order record that's already terminal,
+        moments before the pop+deliver that follows it. Returning None
+        immediately here — without ever looking at _fill_queues — is
+        exactly how a real fill gets silently stranded: the original
+        failure mode this whole mechanism exists to prevent, just
+        relocated from "cancel path" to "cancel path's own early exit"
+        instead of removed. Give both branches a short grace wait via
+        _await_concurrent_resolution() before concluding there's
+        genuinely nothing to find.
         """
         with self._orders_lock:
             order = self._orders.get(client_oid)
         if order is None or not order.exchange_id:
-            return None
+            return self._await_concurrent_resolution(
+                client_oid, "order record already gone from OMS")
         if order.status not in (OrderStatus.PENDING, OrderStatus.ACTIVE):
-            return None
+            return self._await_concurrent_resolution(
+                client_oid,
+                f"order record already in terminal status={order.status.value}")
         logger.info(
             f"[OMS] Cancelling {order.exchange_id} [{client_oid[:8]}] — "
             f"grid cell dropped out from under it (trail)"
@@ -2414,6 +2462,45 @@ class OMS:
                 + ("Points at WS confirmation lag/drop, not the cancel "
                    "itself — watch for repeats." if rest_ok else
                    "Points at the REST cancel call itself — check API/network health.")
+            )
+        return fill
+
+    def _await_concurrent_resolution(
+            self, client_oid: str, why: str,
+            grace_s: float = 2.0) -> Optional[FillEvent]:
+        """
+        Called from request_cancel_and_await's two early-exit checks
+        instead of returning None outright — see that method's
+        "Mechanism A, deeper fix" docstring section for why an
+        already-empty/already-terminal order record there means
+        "resolved concurrently," never "never tracked."
+
+        wait_fill() is safe and cheap to call even when there's
+        genuinely nothing pending — a missing/already-drained queue just
+        returns None immediately (see wait_fill's own q is None
+        handling) — so this costs nothing extra in whatever fraction of
+        cases turn out not to be the race. grace_s is deliberately much
+        shorter than request_cancel_and_await's own default 15s timeout:
+        by the time either early-exit check fires, the resolution has
+        already happened on the WS thread (that's WHY the record is
+        gone/terminal) — this is only waiting on _deliver_fill() to
+        finish running and land the entry in _fill_queues, not on the
+        exchange to do anything further.
+        """
+        fill = self.wait_fill(client_oid, timeout=grace_s)
+        if fill is not None:
+            logger.warning(
+                f"[OMS] request_cancel_and_await: order [{client_oid[:8]}] "
+                f"resolved concurrently ({why}) — caught via a "
+                f"{grace_s:.0f}s grace wait instead of being stranded. "
+                f"resolution={fill.status.value} filled_qty={fill.filled_qty:.4f}"
+            )
+        else:
+            logger.info(
+                f"[OMS] request_cancel_and_await: order [{client_oid[:8]}] "
+                f"gone ({why}); {grace_s:.0f}s grace wait found nothing in "
+                f"_fill_queues either — its resolution was already "
+                f"collected and cleaned up before this call ran."
             )
         return fill
 
