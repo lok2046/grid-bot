@@ -338,6 +338,23 @@ GRID_CONFIG: dict = {
     # REPRICE_UNDERCOUNT-fixed data accumulate.
     "zero_candidate_pre_chase_grace_s": 7200.0,
 
+    # Claim-collision dwell (2026-08-08, gen00042_green): a CLEAN-FIT leg
+    # (its open price genuinely sits inside the live range) whose ideal
+    # closing cell is already claimed by another clean-fit leg this
+    # rebuild — grid capacity contention, not a range mismatch. Before
+    # this, reconcile_open_legs() liquidated it on the spot, unconditionally,
+    # the very first time this happened. 3 of 6 same-session
+    # rebuild_reprice closes in that log traced directly to this branch,
+    # on a session that happened to be rebuilding every ~15s for unrelated
+    # reasons — more rebuilds simply means more chances for two legs'
+    # ideal cells to collide on the same pass. Much shorter than
+    # zero_candidate_pre_chase_grace_s on purpose: this isn't "no cell
+    # will ever work", it's "a cell WOULD work and is occupied right now"
+    # — the leg holding it will very likely close naturally (an ordinary
+    # grid cycle, typically minutes) well before this expires. Same
+    # reconcile_urgent_trend_risk bypass as every other dwell cap here.
+    "reconcile_claim_collision_dwell_s": 300.0,
+
     # Cooldown between GridEngine's "orphaned leg — requesting fast rebuild"
     # triggers (see check_price_fills()). Without this, an orphaned/zero-
     # candidate leg that the dead-band check keeps bouncing (range hasn't
@@ -4012,6 +4029,31 @@ class GridEngine:
         # these — they're accounted for, just not by a cell — so it doesn't
         # force a needless rebuild out from under an in-flight chase.
         self._chasing_leg_ids: set = set()
+        # 2026-08-08: legs GridBot's reconcile pass has deliberately decided
+        # to hold with NO resting order for a good reason — either a
+        # zero-candidate leg still within its pre-chase grace window, or a
+        # clean-fit leg whose target cell lost a claim-collision to another
+        # leg on this rebuild (see reconcile_open_legs' claim_collision_since
+        # param) — re-populated fresh by GridBot on every _rebuild_grid()
+        # call, synchronously, right after this engine is constructed; never
+        # needs carrying across a rebuild the way _chasing_leg_ids does,
+        # since it's fully recomputed each time reconcile runs rather than
+        # tracking async state that could still be in flight.
+        #
+        # check_price_fills()'s orphan-leg detector excludes these for the
+        # exact same reason it excludes _chasing_leg_ids: gen00042_green
+        # 2026-08-08 incident — without this, a leg correctly held in grace
+        # (by design, to avoid forcing a premature close) looked identical
+        # to a genuine orphan to the detector, which doesn't know WHY a leg
+        # has no resting order, only that it doesn't have one. Rate-limited
+        # by orphan_leg_rebuild_cooldown_s to roughly once per cooldown
+        # window rather than every tick, but the underlying condition never
+        # actually resolved until grace ended — 935 rebuilds over 3.6 hours
+        # in that log, each one a wasted reconcile_open_legs pass that (among
+        # other things) increased how often two unrelated legs' target cells
+        # would collide and hit the very liquidation branch this was meant
+        # to help avoid. See claim_collision_since for that second half.
+        self._grace_held_leg_ids: set = set()
         self._lock       = threading.Lock()
         self._levels: List[GridLevel] = []
         self._stop_event = threading.Event()
@@ -4392,7 +4434,7 @@ class GridEngine:
             tagged_leg_ids = {lv.closes_leg_id for lv in self._levels
                                if lv.closes_leg_id is not None}
             orphaned_legs = (set(self._open_legs.keys()) - tagged_leg_ids
-                              - self._chasing_leg_ids)
+                              - self._chasing_leg_ids - self._grace_held_leg_ids)
         buys_are_intentionally_paused = (open_buys == 0 and suppressed > 0)
         # Cooldown-gated (2026-08-06 GEN00037_GREEN incident — see
         # orphan_leg_rebuild_cooldown_s in GRID_CONFIG for the full writeup):
@@ -5525,7 +5567,8 @@ class GridEngine:
         effective_atr: float = 0.0,
         pending_since: Optional[Dict[int, float]] = None,
         zero_candidate_since: Optional[Dict[int, float]] = None,
-    ) -> Tuple[Dict[int, int], List["OpenLeg"], set, List["OpenLeg"]]:
+        claim_collision_since: Optional[Dict[int, float]] = None,
+    ) -> Tuple[Dict[int, int], List["OpenLeg"], set, List["OpenLeg"], List["OpenLeg"]]:
         """
         Decide, for every currently-open leg, whether it still fits the
         just-rebuilt grid.
@@ -5537,6 +5580,21 @@ class GridEngine:
           {level_index: leg_id} for the caller to pass into
           start(skip_indices=...), then apply via apply_leg_reassignments()
           once start() has finished placing everything else.
+        - Cleanly within range, but every direction-correct level is
+          already claimed by another clean-fit leg (grid capacity
+          contention, not a genuine range mismatch — a narrow grid with
+          more legs on one side than it has cells): unlike a real range
+          mismatch this is usually transient and self-resolving (the
+          leg currently holding that cell closes naturally, freeing it up
+          on the very next rebuild), so it gets the same dwell-then-
+          liquidate treatment as the zero-candidate case, via the fifth
+          return value (claim_collision_pending), rather than the
+          instant, unconditional liquidation this branch used before
+          2026-08-08 (gen00042_green: 3 of 6 same-session
+          rebuild_reprice closes traced directly to this branch firing
+          on a session that was independently rebuilding every ~15s —
+          more rebuilds simply means more chances for two legs' ideal
+          cells to collide on the same pass; see claim_collision_since).
         - Outside [lower,upper] but within a trend_risk-scaled tolerance
           buffer (see reconcile_buffer_atr_mult), AND a direction-correct
           closing level still exists: same tentative re-anchor as above, but
@@ -5563,9 +5621,28 @@ class GridEngine:
           shrinking toward 0 as trend_risk climbs toward
           reconcile_urgent_trend_risk). See the "2026-08-03 16:35
           incident" GRID_CONFIG comment block.
-        - Flagged pending (either kind) for too long and still not a
-          clean fit: returned in the second list (to_liquidate). This
-          method does NOT liquidate them itself — it only decides;
+
+          IMPORTANT CAVEAT (2026-08-08, gen00043_green): this whole
+          grace -> chase transition is entirely dependent on
+          reconcile_open_legs actually being CALLED. GridBot._rebuild_grid
+          only calls it when the dead-band check passes (a genuine
+          reposition) or is bypassed (mid outside range) — every branch
+          of a dead-band-SKIPPED rebuild returns before ever reaching
+          this method at all. If the grid stays stable for longer than
+          the combined grace+dwell budget with no repositioning event in
+          between, a zero-candidate leg's very first re-evaluation can
+          already be past its dwell cap, with zero chase attempts ever
+          having had a chance to fire — confirmed against legs #1000/#1001
+          in that log (flagged zero-candidate at 06:00:37, dwell cap
+          8100s, next and ONLY re-evaluation at 08:19:23 — 8326s later,
+          straight to liquidation). This method's own dwell-cap logic is
+          working exactly as designed in that case; the gap is upstream,
+          in when this method gets called at all. Not fixed here — flagged
+          for its own dedicated pass, since it means changing
+          _rebuild_grid's dead-band control flow itself, not this method.
+        - Flagged pending (any of the three kinds above) for too long and
+          still not resolved: returned in the second list (to_liquidate).
+          This method does NOT liquidate them itself — it only decides;
           GridBot._rebuild_grid executes the actual market close (real
           fill, real fee, real fill event in grid_fills) and only then
           removes the leg from the ledger. A leg that can't be reconciled
@@ -5599,11 +5676,22 @@ class GridEngine:
         Kept as a separate map (not merged into pending_since) since the two
         cases mean different things operationally: pending_since always has
         a resting order in place while it waits; this one never does.
+        claim_collision_since: {leg_id: first-flagged-ts} for the clean-fit-
+        but-claimed case — owned and persisted by the caller
+        (GridBot._leg_claim_collision_since). Kept separate from
+        zero_candidate_since too, deliberately: sharing one clock risks a
+        leg that transitions FROM zero-candidate INTO a claim-collision (the
+        range widened enough to give it a direction, just not a free cell
+        yet) inheriting a stale multi-hour "first seen" timestamp from a
+        completely different, much longer-budgeted wait, and instantly
+        blowing through the much shorter collision dwell the moment it
+        switches categories.
         """
         exclude_indices = exclude_indices or set()
         already_handled_leg_ids = already_handled_leg_ids or set()
         pending_since = pending_since or {}
         zero_candidate_since = zero_candidate_since or {}
+        claim_collision_since = claim_collision_since or {}
         with self._lock:
             legs = [leg for leg in self._open_legs.values()
                     if leg.leg_id not in already_handled_leg_ids]
@@ -5611,7 +5699,7 @@ class GridEngine:
             levels = [lv for lv in all_levels if lv.index not in exclude_indices]
 
         if not legs:
-            return {}, [], set(), []
+            return {}, [], set(), [], []
         if not levels:
             # No cells left to host ANYONE's closer this rebuild (e.g. a
             # handoff restore_plan claimed every level in a small grid —
@@ -5684,7 +5772,7 @@ class GridEngine:
                     f"liquidating, {len(zero_candidate_pending_nc)} "
                     f"zero-candidate pending"
                 )
-            return {}, to_liquidate_nc, set(), zero_candidate_pending_nc
+            return {}, to_liquidate_nc, set(), zero_candidate_pending_nc, []
 
         # lower/upper/spacing describe the REBUILT GRID'S true range, from
         # every level regardless of exclusion — not just the subset left
@@ -5750,11 +5838,25 @@ class GridEngine:
             if urgent_threshold > 0 else 0.0
         )
 
+        # Claim-collision dwell cap (2026-08-08, gen00042_green): much
+        # shorter than the zero-candidate cap on purpose — this isn't "no
+        # cell will ever work", it's "a cell WOULD work and is currently
+        # taken". The leg currently holding it will very likely close
+        # naturally (an ordinary grid cycle, typically minutes, not hours)
+        # well before this expires; if it hasn't by then, fall back to the
+        # same liquidation this branch always did rather than let a leg
+        # dwell unmanaged indefinitely over what's ultimately just cell
+        # contention. Same urgent-trend_risk bypass as every other dwell
+        # cap here — a genuinely urgent move shouldn't wait on a cell
+        # freeing up either.
+        claim_collision_dwell_s = self._cfg.get("reconcile_claim_collision_dwell_s", 300.0)
+
         assignments:   Dict[int, int] = {}
         claimed:       set            = set()
         to_liquidate:  List[OpenLeg]  = []
         still_pending: set            = set()
         zero_candidate_pending: List[OpenLeg] = []
+        claim_collision_pending: List[OpenLeg] = []
         now = time.time()
 
         def _closer_price(lv: "GridLevel", leg: "OpenLeg") -> float:
@@ -5793,20 +5895,49 @@ class GridEngine:
             target, candidates = _candidates(leg)
             if not candidates:
                 # Every candidate level on the closing side is already
-                # claimed by another clean-fit leg — unchanged from
-                # pre-existing behaviour. Previously silent (2026-08-07:
-                # leg #893's restart-triggered liquidation left no trace
-                # anywhere in reconcile_open_legs' own logging, making the
-                # actual branch that fired unrecoverable after the fact) —
-                # log it like every other to_liquidate/zero_candidate_pending
-                # branch below does.
+                # claimed by another clean-fit leg. Grid capacity
+                # contention, not a genuine range mismatch — see
+                # claim_collision_since in the docstring for why this gets
+                # the same dwell-then-liquidate treatment as a
+                # zero-candidate leg now, instead of the instant,
+                # unconditional liquidation this branch used before
+                # 2026-08-08 (previously silent too until the 2026-08-07
+                # logging-only fix — leg #893's restart-triggered
+                # liquidation left no trace anywhere in this method's own
+                # logging, making the actual branch that fired
+                # unrecoverable after the fact).
+                if trend_risk >= urgent_threshold:
+                    logger.info(
+                        f"[GridEngine] Leg #{leg.leg_id} clean-fit + urgent "
+                        f"trend_risk={trend_risk:.2f} >= {urgent_threshold:.2f} "
+                        f"— every closing-side level already claimed, "
+                        f"bypassing collision dwell, liquidating now"
+                    )
+                    to_liquidate.append(leg)
+                    continue
+
+                first_cc = claim_collision_since.get(leg.leg_id)
+                if first_cc is not None and (now - first_cc) >= claim_collision_dwell_s:
+                    logger.info(
+                        f"[GridEngine] Leg #{leg.leg_id} clean-fit (open="
+                        f"{leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}]) "
+                        f"— every closing-side level still claimed after "
+                        f"{now - first_cc:.0f}s >= collision dwell "
+                        f"{claim_collision_dwell_s:.0f}s — liquidating"
+                    )
+                    to_liquidate.append(leg)
+                    continue
+
                 logger.info(
                     f"[GridEngine] Leg #{leg.leg_id} clean-fit (open="
                     f"{leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}]) "
                     f"but every closing-side level already claimed by "
-                    f"another clean-fit leg — liquidating"
+                    f"another clean-fit leg — holding with no resting "
+                    f"order, collision dwell {claim_collision_dwell_s:.0f}s "
+                    f"({'starting now' if first_cc is None else f'{now - first_cc:.0f}s elapsed'}), "
+                    f"re-evaluated at the next rebuild"
                 )
-                to_liquidate.append(leg)
+                claim_collision_pending.append(leg)
                 continue
             best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
             claimed.add(best.index)
@@ -5900,15 +6031,17 @@ class GridEngine:
             assignments[best.index] = leg.leg_id
             still_pending.add(leg.leg_id)
 
-        if assignments or to_liquidate or zero_candidate_pending:
+        if assignments or to_liquidate or zero_candidate_pending or claim_collision_pending:
             logger.info(
                 f"[GridEngine] reconcile_open_legs: {len(assignments)} leg(s) "
                 f"re-anchored to the rebuilt grid ({len(still_pending)} still "
                 f"pending confirm), {len(to_liquidate)} liquidating, "
-                f"{len(zero_candidate_pending)} zero-candidate pending "
+                f"{len(zero_candidate_pending)} zero-candidate pending, "
+                f"{len(claim_collision_pending)} claim-collision pending "
                 f"(new range=[{lower:.2f},{upper:.2f}])"
             )
-        return assignments, to_liquidate, still_pending, zero_candidate_pending
+        return (assignments, to_liquidate, still_pending, zero_candidate_pending,
+                claim_collision_pending)
 
     def apply_leg_reassignments(self, assignments: Dict[int, int]) -> None:
         """
@@ -7634,6 +7767,15 @@ class GridBot:
         # from _leg_no_fit_since since the two dwell caps and the
         # first-time-seen bookkeeping (kick off a chase) differ.
         self._leg_zero_candidate_since: Dict[int, float] = {}
+        # Same idea again, separate map, for the claim-collision case
+        # (2026-08-08, gen00042_green) — a clean-fit leg whose target cell
+        # lost a claim to another clean-fit leg this rebuild. Kept apart
+        # from both maps above: sharing zero_candidate_since's clock would
+        # let a leg that transitions between the two categories inherit a
+        # stale, much-longer first-seen timestamp and instantly blow
+        # through the much shorter collision dwell — see
+        # reconcile_open_legs' claim_collision_since docstring.
+        self._leg_claim_collision_since: Dict[int, float] = {}
 
         # ── Confirmed-trend catch-up + SellGate state (2026-08-04) ────────────
         # Timestamps of top-sell-triggered up-shifts, pruned to
@@ -8422,6 +8564,7 @@ class GridBot:
         # BEFORE it runs its "already dwelling from a prior rebuild" check.
         # See _restore_leg_zero_candidate_since() docstring.
         self._restore_leg_zero_candidate_since()
+        self._restore_leg_claim_collision_since()
 
         # Restore a halt (stop-loss cooldown/recovery-floor wait, or a
         # daily-loss circuit-breaker halt) from a previous session before
@@ -11016,7 +11159,7 @@ class GridBot:
                 f"{ {lid: round(now_dbg - ts, 0) for lid, ts in self._leg_zero_candidate_since.items()} } "
                 f"(values are seconds elapsed, not raw timestamps)"
             )
-        leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs = (
+        leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs, claim_collision_legs = (
             self._engine.reconcile_open_legs(
                 exclude_indices=set(restore_plan.keys()),
                 already_handled_leg_ids=already_handled_leg_ids,
@@ -11024,6 +11167,7 @@ class GridBot:
                 effective_atr=new_params.effective_atr,
                 pending_since=self._leg_no_fit_since,
                 zero_candidate_since=self._leg_zero_candidate_since,
+                claim_collision_since=self._leg_claim_collision_since,
             )
         )
         # Maintain the dwell dict across rebuilds: start the clock the
@@ -11081,6 +11225,8 @@ class GridBot:
                 and reconcile_trend_risk < urgent_threshold
             )
             if within_grace:
+                with self._engine._lock:
+                    self._engine._grace_held_leg_ids.add(leg.leg_id)
                 logger.info(
                     f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
                     f"rebuild (open={leg.open_price:.2f}) — within pre-chase "
@@ -11092,6 +11238,7 @@ class GridBot:
                 continue
             with self._engine._lock:
                 self._engine._chasing_leg_ids.add(leg.leg_id)
+                self._engine._grace_held_leg_ids.discard(leg.leg_id)
             logger.info(
                 f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
                 f"rebuild (open={leg.open_price:.2f}) — handing off to "
@@ -11118,6 +11265,34 @@ class GridBot:
             # was already confirmed-liquidated (by reconcile's cap-expiry
             # branch, or by the chase worker's own exhaustion fallback).
             del self._leg_zero_candidate_since[leg_id]
+            with self._engine._lock:
+                self._engine._grace_held_leg_ids.discard(leg_id)
+
+        # Same bookkeeping for the claim-collision dwell map (2026-08-08,
+        # gen00042_green — see reconcile_open_legs' claim_collision_since
+        # docstring and GRID_CONFIG's reconcile_claim_collision_dwell_s
+        # entry). No chase to kick off here — unlike a zero-candidate leg,
+        # a claim-collision leg already has a perfectly good cell
+        # somewhere, it's just occupied right now — so this only needs to
+        # (a) track how long it's been colliding, for reconcile_open_legs'
+        # own dwell-cap check next rebuild, and (b) keep it out of the
+        # orphan-leg detector while it waits, exactly like a grace-held
+        # zero-candidate leg.
+        claim_collision_ids = {leg.leg_id for leg in claim_collision_legs}
+        for leg in claim_collision_legs:
+            self._leg_claim_collision_since.setdefault(leg.leg_id, now_ts)
+            with self._engine._lock:
+                self._engine._grace_held_leg_ids.add(leg.leg_id)
+        for leg_id in list(self._leg_claim_collision_since.keys()):
+            if leg_id in claim_collision_ids:
+                continue  # still colliding, reported again this rebuild
+            # Resolved: either it got a real assignment this rebuild (a
+            # cell freed up), or reconcile's own dwell-cap check already
+            # liquidated it.
+            del self._leg_claim_collision_since[leg_id]
+            with self._engine._lock:
+                self._engine._grace_held_leg_ids.discard(leg_id)
+        self._persist_leg_claim_collision_since()
 
         # Persist right after this block finishes mutating the dict (both
         # the additions above and the deletions just above) — see
@@ -11465,6 +11640,51 @@ class GridBot:
                 f"[GridBot] Restored zero-candidate dwell state for "
                 f"{len(self._leg_zero_candidate_since)} leg(s) from previous "
                 f"session: {sorted(self._leg_zero_candidate_since.keys())}"
+            )
+
+    def _persist_leg_claim_collision_since(self) -> None:
+        """
+        Persist `_leg_claim_collision_since` — same reasoning and same
+        placement (called once per _rebuild_grid(), right after that
+        method's claim-collision bookkeeping finishes mutating the dict)
+        as _persist_leg_zero_candidate_since(), for the same reason: a
+        cold restart shouldn't make a leg that's been colliding for most
+        of its dwell budget look brand new and get another full dwell
+        window for free.
+        """
+        if self._store is None:
+            return
+        self._store.set_meta(
+            "leg_claim_collision_since",
+            json.dumps({str(k): v for k, v in self._leg_claim_collision_since.items()}),
+        )
+
+    def _restore_leg_claim_collision_since(self) -> None:
+        """
+        Restore `_leg_claim_collision_since` persisted by
+        _persist_leg_claim_collision_since(). Called once from start(),
+        before the first _rebuild_grid() call — same timing requirement as
+        _restore_leg_zero_candidate_since(), same reasoning.
+        """
+        if self._store is None:
+            return
+        raw = self._store.get_meta("leg_claim_collision_since")
+        if not raw:
+            return
+        try:
+            restored = json.loads(raw)
+        except Exception as e:
+            logger.error(
+                f"[GridBot] Failed to parse persisted leg_claim_collision_since "
+                f"— starting with an empty dwell map: {e}"
+            )
+            return
+        self._leg_claim_collision_since = {int(k): float(v) for k, v in restored.items()}
+        if self._leg_claim_collision_since:
+            logger.info(
+                f"[GridBot] Restored claim-collision dwell state for "
+                f"{len(self._leg_claim_collision_since)} leg(s) from previous "
+                f"session: {sorted(self._leg_claim_collision_since.keys())}"
             )
 
     # ── Auto-restart ──────────────────────────────────────────────────────────
