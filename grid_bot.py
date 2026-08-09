@@ -9644,9 +9644,12 @@ class GridBot:
             # _leg_zero_candidate_since is snapshotted under its lock
             # (GRACE_TRAIL_DROP_2026_08_08 — background threads write it
             # too now) before iterating, same pattern _rebuild_grid itself
-            # uses. The claim-collision watchdog right below this one reads
-            # its own map directly, unlocked — see that block's comment for
-            # why that's safe.
+            # uses. The claim-collision watchdog right below this one used
+            # to read its own map directly, unlocked — that stopped being
+            # safe once _leg_claim_collision_since gained its own lock
+            # (2026-08-09, alongside _finalize_leg_close's new background-
+            # thread write to it), so it now snapshots under that lock too,
+            # same pattern as here.
             if (self._engine is not None
                     and not self._engine._needs_rebuild
                     and self._leg_zero_candidate_since):
@@ -12051,7 +12054,8 @@ class GridBot:
                 f"— starting with an empty dwell map: {e}"
             )
             return
-        self._leg_claim_collision_since = {int(k): float(v) for k, v in restored.items()}
+        with self._leg_claim_collision_since_lock:
+            self._leg_claim_collision_since = {int(k): float(v) for k, v in restored.items()}
         if self._leg_claim_collision_since:
             logger.info(
                 f"[GridBot] Restored claim-collision dwell state for "
