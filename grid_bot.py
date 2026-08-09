@@ -7762,6 +7762,14 @@ class GridBot:
         # across rebuilds to accumulate real wall-clock dwell time. Mirrors
         # _pending_raise_candidate/_pending_raise_since above.
         self._leg_no_fit_since: Dict[int, float] = {}
+        # 2026-08-09: added alongside the same fix for
+        # _leg_zero_candidate_since_lock below — _finalize_leg_close now
+        # clears a leg's entry from this map immediately on close, and
+        # that function runs from _chase_close_leg_worker's background
+        # thread as well as the main one. Same "atomic dict[key]=value
+        # under the GIL, but unguarded iteration racing a background
+        # write can still raise" reasoning.
+        self._leg_no_fit_since_lock = threading.Lock()
         # Same idea, separate map, for the zero-candidate case (no cell to
         # rest a closer on at all — see reconcile_open_legs). Kept apart
         # from _leg_no_fit_since since the two dwell caps and the
@@ -7798,6 +7806,10 @@ class GridBot:
         # through the much shorter collision dwell — see
         # reconcile_open_legs' claim_collision_since docstring.
         self._leg_claim_collision_since: Dict[int, float] = {}
+        # Same reasoning as _leg_no_fit_since_lock and
+        # _leg_zero_candidate_since_lock above — added 2026-08-09 for the
+        # same _finalize_leg_close background-thread write.
+        self._leg_claim_collision_since_lock = threading.Lock()
 
         # ── Confirmed-trend catch-up + SellGate state (2026-08-04) ────────────
         # Timestamps of top-sell-triggered up-shifts, pruned to
@@ -9686,21 +9698,28 @@ class GridBot:
             # the identical "only ever checked at rebuild time" gap the
             # zero-candidate watchdog above closes, just with a cap ~27x
             # shorter, so the relative overshoot from a rebuild-free stretch
-            # is worse, not better. _leg_claim_collision_since is still
-            # main-thread-only (no background thread writes it, unlike
-            # _leg_zero_candidate_since — confirmed by grep, not just
-            # assumed), so no lock needed to read it here.
-            if (self._engine is not None
-                    and not self._engine._needs_rebuild
-                    and self._leg_claim_collision_since):
+            # is worse, not better. _leg_claim_collision_since gained its
+            # own lock on 2026-08-09 alongside _finalize_leg_close's new
+            # background-thread write to it (same reason
+            # _leg_zero_candidate_since needed one) — snapshot under it
+            # before reading, same pattern as the zero-candidate watchdog
+            # above.
+            if self._engine is not None and not self._engine._needs_rebuild:
+                with self._leg_claim_collision_since_lock:
+                    cc_has_any = bool(self._leg_claim_collision_since)
+            else:
+                cc_has_any = False
+            if cc_has_any:
                 cc_cooldown = self._cfg.get("orphan_leg_rebuild_cooldown_s", 15.0)
                 if time.time() - self._last_cc_dwell_rebuild_request >= cc_cooldown:
                     cc_dwell_cap = self._cfg.get(
                         "reconcile_claim_collision_dwell_s", 300.0)
                     now_ts = time.time()
+                    with self._leg_claim_collision_since_lock:
+                        cc_snapshot = dict(self._leg_claim_collision_since)
                     cc_expired = [
                         (lid, now_ts - started)
-                        for lid, started in self._leg_claim_collision_since.items()
+                        for lid, started in cc_snapshot.items()
                         if now_ts - started >= cc_dwell_cap
                     ]
                     if cc_expired:
@@ -10145,37 +10164,40 @@ class GridBot:
                 self._engine._cycle_count += 1
 
         # 2026-08-09: this leg is genuinely closed now, however it got here
-        # (chase-fill or forced liquidation) — clear it out of the
-        # zero-candidate dwell tracker immediately, rather than leaving a
-        # stale entry for the next rebuild's reconcile_open_legs to
-        # eventually notice and pop (see that loop's "genuinely resolved"
-        # branch, which only runs at rebuild time). Found via the dwell-
-        # cap watchdog (2026-08-09) firing on exactly this stale state:
-        # leg #1014 (gen00048_green) was chase-closed at 16:37:38, but the
-        # watchdog still saw it in the dict at 16:43:41 and requested an
-        # otherwise-unnecessary rebuild. Harmless that time — nothing was
-        # left to act on by the time the rebuild ran — but worth closing
-        # at the source instead of relying on the next rebuild to catch
-        # up. Locked: _finalize_leg_close runs from
+        # (chase-fill or forced liquidation) — clear it out of all three
+        # per-leg dwell trackers immediately, rather than leaving a stale
+        # entry for the next rebuild's reconcile_open_legs to eventually
+        # notice and pop (see that loop's "genuinely resolved" branches,
+        # which only run at rebuild time). Found via the dwell-cap
+        # watchdog (2026-08-09) firing on exactly this stale state for the
+        # zero-candidate map: leg #1014 (gen00048_green) was chase-closed
+        # at 16:37:38, but the watchdog still saw it in the dict at
+        # 16:43:41 and requested an otherwise-unnecessary rebuild.
+        # Harmless that time — nothing was left to act on by the time the
+        # rebuild ran — but worth closing at the source instead of
+        # relying on the next rebuild to catch up. _leg_claim_collision_since
+        # and _leg_no_fit_since have the identical shape of staleness and
+        # are fixed the same way here, each under its own lock (added
+        # 2026-08-09 for exactly this: this function runs from
         # _chase_close_leg_worker's background thread as well as the main
-        # thread, and _leg_zero_candidate_since_lock is exactly what
-        # GRACE_TRAIL_DROP_2026_08_08 added for that reason.
-        #
-        # NOT extended here to _leg_claim_collision_since / _leg_no_fit_since,
-        # which have the same "only ever popped at the next rebuild" shape.
-        # Unlike zero-candidate, nothing touches either of those from a
-        # background thread today — adding a write here would be the
-        # first thing to do so, and needs its own lock added first rather
-        # than being folded in silently alongside this fix.
+        # thread, same reason _leg_zero_candidate_since needed
+        # GRACE_TRAIL_DROP_2026_08_08's lock in the first place).
         with self._leg_zero_candidate_since_lock:
             self._leg_zero_candidate_since.pop(leg.leg_id, None)
-        # Re-persist immediately, not just in-memory: without this, a
-        # crash/restart between now and the next rebuild's own
-        # _persist_leg_zero_candidate_since() call would restore this
+        with self._leg_claim_collision_since_lock:
+            self._leg_claim_collision_since.pop(leg.leg_id, None)
+        with self._leg_no_fit_since_lock:
+            self._leg_no_fit_since.pop(leg.leg_id, None)
+        # Re-persist the two persisted maps immediately, not just
+        # in-memory: without this, a crash/restart between now and the
+        # next rebuild's own persist call would restore this
         # already-closed leg's stale entry right back from the DB on
         # startup — same bug, different trigger (restart instead of the
-        # watchdog).
+        # watchdog). _leg_no_fit_since has no persist/restore pair at all
+        # (it was never made to survive a restart — see its own __init__
+        # comment), so there's nothing to re-persist for it.
         self._persist_leg_zero_candidate_since()
+        self._persist_leg_claim_collision_since()
         self._alerter.send(
             f"🔁 {_md_escape(alert_label)} ({_md_escape(reason)})\n"
             f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
@@ -11521,6 +11543,10 @@ class GridBot:
             )
         with self._leg_zero_candidate_since_lock:
             zero_candidate_since_snapshot = dict(self._leg_zero_candidate_since)
+        with self._leg_no_fit_since_lock:
+            no_fit_since_snapshot = dict(self._leg_no_fit_since)
+        with self._leg_claim_collision_since_lock:
+            claim_collision_since_snapshot = dict(self._leg_claim_collision_since)
         if zero_candidate_since_snapshot:
             now_dbg = time.time()
             logger.info(
@@ -11535,9 +11561,9 @@ class GridBot:
                 already_handled_leg_ids=already_handled_leg_ids,
                 trend_risk=reconcile_trend_risk,
                 effective_atr=new_params.effective_atr,
-                pending_since=self._leg_no_fit_since,
+                pending_since=no_fit_since_snapshot,
                 zero_candidate_since=zero_candidate_since_snapshot,
-                claim_collision_since=self._leg_claim_collision_since,
+                claim_collision_since=claim_collision_since_snapshot,
             )
         )
         # Maintain the dwell dict across rebuilds: start the clock the
@@ -11546,11 +11572,12 @@ class GridBot:
         # leg that's no longer pending (either it recovered to a clean fit,
         # or reconcile_open_legs just confirmed-liquidated it).
         now_ts = time.time()
-        for leg_id in still_pending_leg_ids:
-            self._leg_no_fit_since.setdefault(leg_id, now_ts)
-        for leg_id in list(self._leg_no_fit_since.keys()):
-            if leg_id not in still_pending_leg_ids:
-                del self._leg_no_fit_since[leg_id]
+        with self._leg_no_fit_since_lock:
+            for leg_id in still_pending_leg_ids:
+                self._leg_no_fit_since.setdefault(leg_id, now_ts)
+            for leg_id in list(self._leg_no_fit_since.keys()):
+                if leg_id not in still_pending_leg_ids:
+                    del self._leg_no_fit_since[leg_id]
 
         # Same bookkeeping for the zero-candidate dwell map, plus: once a
         # leg has been zero-candidate for at least
@@ -11615,18 +11642,22 @@ class GridBot:
         # orphan-leg detector while it waits, exactly like a grace-held
         # zero-candidate leg.
         claim_collision_ids = {leg.leg_id for leg in claim_collision_legs}
-        for leg in claim_collision_legs:
-            self._leg_claim_collision_since.setdefault(leg.leg_id, now_ts)
-            with self._engine._lock:
+        resolved_cc_ids = []
+        with self._leg_claim_collision_since_lock:
+            for leg in claim_collision_legs:
+                self._leg_claim_collision_since.setdefault(leg.leg_id, now_ts)
+            for leg_id in list(self._leg_claim_collision_since.keys()):
+                if leg_id in claim_collision_ids:
+                    continue  # still colliding, reported again this rebuild
+                # Resolved: either it got a real assignment this rebuild (a
+                # cell freed up), or reconcile's own dwell-cap check already
+                # liquidated it.
+                del self._leg_claim_collision_since[leg_id]
+                resolved_cc_ids.append(leg_id)
+        with self._engine._lock:
+            for leg in claim_collision_legs:
                 self._engine._grace_held_leg_ids.add(leg.leg_id)
-        for leg_id in list(self._leg_claim_collision_since.keys()):
-            if leg_id in claim_collision_ids:
-                continue  # still colliding, reported again this rebuild
-            # Resolved: either it got a real assignment this rebuild (a
-            # cell freed up), or reconcile's own dwell-cap check already
-            # liquidated it.
-            del self._leg_claim_collision_since[leg_id]
-            with self._engine._lock:
+            for leg_id in resolved_cc_ids:
                 self._engine._grace_held_leg_ids.discard(leg_id)
         self._persist_leg_claim_collision_since()
 
@@ -11993,9 +12024,11 @@ class GridBot:
         """
         if self._store is None:
             return
+        with self._leg_claim_collision_since_lock:
+            snapshot = dict(self._leg_claim_collision_since)
         self._store.set_meta(
             "leg_claim_collision_since",
-            json.dumps({str(k): v for k, v in self._leg_claim_collision_since.items()}),
+            json.dumps({str(k): v for k, v in snapshot.items()}),
         )
 
     def _restore_leg_claim_collision_since(self) -> None:
