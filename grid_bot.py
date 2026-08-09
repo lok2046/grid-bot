@@ -7779,6 +7779,16 @@ class GridBot:
         # decision lands last (see the GRACE_TRAIL_DROP_2026_08_08
         # reason-gate above for that half).
         self._leg_zero_candidate_since_lock = threading.Lock()
+        # Cooldown bookkeeping for the dwell-cap watchdog in _run() (2026-08-09,
+        # GEN00046_GREEN incident — see that check's own comment for the
+        # full writeup). Separate from GridEngine._last_orphan_rebuild_request
+        # — different trigger, different condition, shouldn't share a
+        # cooldown clock with each other's unrelated firings.
+        self._last_zc_dwell_rebuild_request: float = 0.0
+        # Same idea, separate clock again, for the claim-collision
+        # watchdog below — kept apart from the zero-candidate cooldown for
+        # the same reason the two dwell maps themselves are kept apart.
+        self._last_cc_dwell_rebuild_request: float = 0.0
         # Same idea again, separate map, for the claim-collision case
         # (2026-08-08, gen00042_green) — a clean-fit leg whose target cell
         # lost a claim to another clean-fit leg this rebuild. Kept apart
@@ -9593,14 +9603,128 @@ class GridBot:
             if self._engine:
                 self._engine.check_price_fills(mid)
 
-            # Engine-requested rebuild. Two setters share this one flag:
-            # drift-shift's "far OOR" cascade guard, and the one-sided-grid
-            # detector (see GridEngine.check_price_fills()) — both funnel
-            # through pop_needs_rebuild() here. Neither setter has access to
-            # trend_risk (it's a GridBot/_stop_scorer concept, not something
-            # GridEngine can see), so it's logged here at the one place both
-            # paths pass through instead. No behavior change — visibility
-            # only, so if one of these ever shows up as a real loss source
+            # Zero-candidate dwell-cap watchdog (2026-08-09, GEN00046_GREEN
+            # incident): reconcile_open_legs's liquidation check and the
+            # chase-exhausted fallback above both only ever run AT rebuild
+            # time. A rebuild is otherwise only triggered by a boundary
+            # breach, a periodic autotune eval, or the orphan-leg detector
+            # in check_price_fills() (which fires on an untagged,
+            # non-chasing leg — a different condition from "this leg's own
+            # dwell cap ran out"; a leg can be zero-candidate with a
+            # perfectly valid chase already tracking it, or simply not
+            # trip that detector's specific check, and still sail past its
+            # cap unnoticed). In a calm/NEUTRAL stretch with no boundary
+            # breaches, none of those may fire for hours: leg #1012 went
+            # zero-candidate at 11:13:41 with an ~8100s cap (due ~13:26),
+            # but the process's last rebuild before that was 11:13:41
+            # itself — nothing re-checked the cap until the NEXT restart's
+            # startup rebuild did, ~1h after it had already run out. The
+            # cap is meant to be a maximum unmanaged-wait TIME, not
+            # "whenever we next happen to rebuild" — this makes that true
+            # by explicitly requesting a rebuild the moment any
+            # zero-candidate leg's own cap is reached, using the exact
+            # same trend-risk-scaled formula reconcile_open_legs uses to
+            # decide liquidation, so a rebuild is only ever requested once
+            # that leg would actually be acted on anyway — never
+            # speculatively, and never any earlier than reconcile_open_legs
+            # itself would already agree it's due.
+            #
+            # _leg_zero_candidate_since is snapshotted under its lock
+            # (GRACE_TRAIL_DROP_2026_08_08 — background threads write it
+            # too now) before iterating, same pattern _rebuild_grid itself
+            # uses. The claim-collision watchdog right below this one reads
+            # its own map directly, unlocked — see that block's comment for
+            # why that's safe.
+            if (self._engine is not None
+                    and not self._engine._needs_rebuild
+                    and self._leg_zero_candidate_since):
+                zc_cooldown = self._cfg.get("orphan_leg_rebuild_cooldown_s", 15.0)
+                if time.time() - self._last_zc_dwell_rebuild_request >= zc_cooldown:
+                    zc_urgent_threshold = self._cfg.get(
+                        "reconcile_urgent_trend_risk",
+                        self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+                    )
+                    zc_max_dwell = self._cfg.get(
+                        "reconcile_zero_candidate_max_dwell_s", 900.0)
+                    zc_pre_chase_grace_s = self._cfg.get(
+                        "zero_candidate_pre_chase_grace_s", 0.0)
+                    zc_trend_risk = 0.0
+                    if self._stop_scorer is not None:
+                        zc_trend_risk = self._stop_scorer.compute_trend_risk(
+                            mid, self._effective_trend_regime(),
+                            self._last_trend_slope_pct
+                        )
+                    zc_dwell_cap = zc_pre_chase_grace_s + (
+                        zc_max_dwell * max(0.0, 1.0 - zc_trend_risk / zc_urgent_threshold)
+                        if zc_urgent_threshold > 0 else 0.0
+                    )
+                    now_ts = time.time()
+                    with self._leg_zero_candidate_since_lock:
+                        zc_snapshot = dict(self._leg_zero_candidate_since)
+                    zc_expired = [
+                        (lid, now_ts - started)
+                        for lid, started in zc_snapshot.items()
+                        if now_ts - started >= zc_dwell_cap
+                    ]
+                    if zc_expired:
+                        lid, elapsed = zc_expired[0]
+                        logger.warning(
+                            f"[GridBot] Leg #{lid} zero-candidate dwell cap "
+                            f"({zc_dwell_cap:.0f}s) reached ({elapsed:.0f}s "
+                            f"elapsed, trend_risk={zc_trend_risk:.2f}) with "
+                            f"no rebuild otherwise pending — requesting one "
+                            f"now instead of waiting for the next unrelated "
+                            f"trigger ({len(zc_expired)} leg(s) affected)"
+                        )
+                        self._engine._needs_rebuild = True
+                        self._last_zc_dwell_rebuild_request = now_ts
+
+            # Claim-collision dwell-cap watchdog (2026-08-09) — same bug,
+            # same fix, mirrored for the other dwell map. reconcile_open_legs'
+            # claim-collision check (reconcile_claim_collision_dwell_s,
+            # 300s flat, no trend-risk scaling — see that config key) has
+            # the identical "only ever checked at rebuild time" gap the
+            # zero-candidate watchdog above closes, just with a cap ~27x
+            # shorter, so the relative overshoot from a rebuild-free stretch
+            # is worse, not better. _leg_claim_collision_since is still
+            # main-thread-only (no background thread writes it, unlike
+            # _leg_zero_candidate_since — confirmed by grep, not just
+            # assumed), so no lock needed to read it here.
+            if (self._engine is not None
+                    and not self._engine._needs_rebuild
+                    and self._leg_claim_collision_since):
+                cc_cooldown = self._cfg.get("orphan_leg_rebuild_cooldown_s", 15.0)
+                if time.time() - self._last_cc_dwell_rebuild_request >= cc_cooldown:
+                    cc_dwell_cap = self._cfg.get(
+                        "reconcile_claim_collision_dwell_s", 300.0)
+                    now_ts = time.time()
+                    cc_expired = [
+                        (lid, now_ts - started)
+                        for lid, started in self._leg_claim_collision_since.items()
+                        if now_ts - started >= cc_dwell_cap
+                    ]
+                    if cc_expired:
+                        lid, elapsed = cc_expired[0]
+                        logger.warning(
+                            f"[GridBot] Leg #{lid} claim-collision dwell cap "
+                            f"({cc_dwell_cap:.0f}s) reached ({elapsed:.0f}s "
+                            f"elapsed) with no rebuild otherwise pending — "
+                            f"requesting one now instead of waiting for the "
+                            f"next unrelated trigger ({len(cc_expired)} "
+                            f"leg(s) affected)"
+                        )
+                        self._engine._needs_rebuild = True
+                        self._last_cc_dwell_rebuild_request = now_ts
+
+            # Engine-requested rebuild. Four setters share this one flag:
+            # drift-shift's "far OOR" cascade guard, the one-sided-grid
+            # detector (see GridEngine.check_price_fills()), and the two
+            # dwell-cap watchdogs just above (zero-candidate, claim-
+            # collision). None of the first two has access to trend_risk
+            # (it's a GridBot/_stop_scorer concept, not something
+            # GridEngine can see), so it's logged here at the one place all
+            # four paths pass through instead. No behavior change from
+            # the pre-existing two — visibility only, so if one of these ever shows up as a real loss source
             # the way the regime-change trigger did, the evidence is already
             # in the log instead of needing to be reconstructed after the
             # fact.
