@@ -10144,6 +10144,38 @@ class GridBot:
                 self._engine._total_fees += fill.fee
                 self._engine._cycle_count += 1
 
+        # 2026-08-09: this leg is genuinely closed now, however it got here
+        # (chase-fill or forced liquidation) — clear it out of the
+        # zero-candidate dwell tracker immediately, rather than leaving a
+        # stale entry for the next rebuild's reconcile_open_legs to
+        # eventually notice and pop (see that loop's "genuinely resolved"
+        # branch, which only runs at rebuild time). Found via the dwell-
+        # cap watchdog (2026-08-09) firing on exactly this stale state:
+        # leg #1014 (gen00048_green) was chase-closed at 16:37:38, but the
+        # watchdog still saw it in the dict at 16:43:41 and requested an
+        # otherwise-unnecessary rebuild. Harmless that time — nothing was
+        # left to act on by the time the rebuild ran — but worth closing
+        # at the source instead of relying on the next rebuild to catch
+        # up. Locked: _finalize_leg_close runs from
+        # _chase_close_leg_worker's background thread as well as the main
+        # thread, and _leg_zero_candidate_since_lock is exactly what
+        # GRACE_TRAIL_DROP_2026_08_08 added for that reason.
+        #
+        # NOT extended here to _leg_claim_collision_since / _leg_no_fit_since,
+        # which have the same "only ever popped at the next rebuild" shape.
+        # Unlike zero-candidate, nothing touches either of those from a
+        # background thread today — adding a write here would be the
+        # first thing to do so, and needs its own lock added first rather
+        # than being folded in silently alongside this fix.
+        with self._leg_zero_candidate_since_lock:
+            self._leg_zero_candidate_since.pop(leg.leg_id, None)
+        # Re-persist immediately, not just in-memory: without this, a
+        # crash/restart between now and the next rebuild's own
+        # _persist_leg_zero_candidate_since() call would restore this
+        # already-closed leg's stale entry right back from the DB on
+        # startup — same bug, different trigger (restart instead of the
+        # watchdog).
+        self._persist_leg_zero_candidate_since()
         self._alerter.send(
             f"🔁 {_md_escape(alert_label)} ({_md_escape(reason)})\n"
             f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
