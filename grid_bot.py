@@ -10591,12 +10591,151 @@ class GridBot:
         self._pending_raise_candidate = max(self._pending_raise_candidate, candidate_stop)
         return False
 
+    def _check_zero_candidate_grace(self, leg: "OpenLeg", trend_risk: float,
+                                     now_ts: float) -> None:
+        """
+        Decide whether a zero-candidate leg's pre-chase grace has ended:
+        if not, hold it (excluded from the orphan detector via
+        _grace_held_leg_ids, re-evaluated later); if so — or trend_risk is
+        already urgent — hand it to the stray-leg chase. Idempotent: a
+        leg already in self._engine._chasing_leg_ids is left alone.
+
+        Extracted 2026-08-09 (previously inlined in _rebuild_grid, only
+        reachable from there) so the exact same decision can also run
+        decoupled from a full reconcile pass — see
+        _check_stranded_leg_grace(), and that method's call site in
+        _rebuild_grid() for why that split needed to exist at all. Having
+        one shared implementation instead of two matters here specifically
+        — GRACE_TRAIL_DROP_2026_08_08 (leg #1007) was exactly this same
+        class of bug: a second call site that needed the same grace logic
+        but was never updated when grace was added, because the logic
+        only existed inline in one place.
+        """
+        with self._leg_zero_candidate_since_lock:
+            first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
+        with self._engine._lock:
+            already_chasing = leg.leg_id in self._engine._chasing_leg_ids
+        if already_chasing:
+            return  # chase already in flight from an earlier check
+        pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
+        urgent_threshold = self._cfg.get(
+            "reconcile_urgent_trend_risk",
+            self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+        )
+        grace_elapsed = now_ts - first_seen
+        within_grace = (
+            pre_chase_grace_s > 0.0
+            and grace_elapsed < pre_chase_grace_s
+            and trend_risk < urgent_threshold
+        )
+        if within_grace:
+            with self._engine._lock:
+                self._engine._grace_held_leg_ids.add(leg.leg_id)
+            logger.info(
+                f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
+                f"{leg.open_price:.2f}) — within pre-chase grace "
+                f"({grace_elapsed:.0f}s/{pre_chase_grace_s:.0f}s, "
+                f"trend_risk={trend_risk:.2f}<{urgent_threshold:.2f}) — "
+                f"holding with no resting order, re-evaluated later."
+            )
+            return
+        with self._engine._lock:
+            self._engine._chasing_leg_ids.add(leg.leg_id)
+            self._engine._grace_held_leg_ids.discard(leg.leg_id)
+        logger.info(
+            f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
+            f"{leg.open_price:.2f}) — handing off to stray-leg chase for "
+            f"a shot at a decent price before settling into the unmanaged "
+            f"wait."
+        )
+        self._chase_close_leg(leg, reason="rebuild_reprice_pending")
+
+    def _check_stranded_leg_grace(self, mid: float) -> None:
+        """
+        Re-evaluate the pre-chase-grace -> chase transition for every
+        currently zero-candidate leg, independent of whether a full grid
+        reposition happens on this particular _rebuild_grid() call.
+
+        Why this needs to exist as its own step, separate from the
+        post-reconcile bookkeeping below: reconcile_open_legs() — and
+        therefore the grace-to-chase transition, which currently only
+        lives inside that bookkeeping — only ever runs when
+        _rebuild_grid()'s dead-band check actually passes (a genuine
+        reposition) or is bypassed (mid outside range). Every branch of a
+        dead-band-SKIPPED rebuild returns before reaching
+        reconcile_open_legs() at all. _rebuild_grid() itself still gets
+        invoked frequently regardless (every ~15s in gen00043_green,
+        driven by the routine retune-check cadence) — it's specifically
+        the LEG-reconciliation step buried inside it that was going
+        uncalled.
+
+        Confirmed against legs #1000/#1001 (gen00043_green, 2026-08-08):
+        flagged zero-candidate at 06:00:37 (logged "within pre-chase
+        grace" exactly once), then not re-evaluated again until 08:19:23
+        — 8326s later, past the full 8100s grace+dwell budget, straight
+        to reconcile_open_legs' own dwell-cap liquidation with ZERO chase
+        attempts ever dispatched — despite ~470 "(Re)building grid..."
+        log lines in that window, every single one dead-band-skipped
+        before ever reaching the code that would have caught the grace
+        period ending partway through.
+
+        Deliberately narrow in scope: does NOT re-run candidate search
+        (a zero-candidate leg's open price sits outside the CURRENT
+        grid's range by definition — re-checking against the same
+        unchanged levels finds the same "no candidate" answer every
+        time, so there's nothing new to compute there) and does NOT
+        replicate reconcile_open_legs' own post-chase dwell-cap
+        liquidation branch — once a leg transitions to actively chasing
+        via _check_zero_candidate_grace() below, _chase_close_leg_worker's
+        own 3-attempt-then-market-fallback exhaustion path already
+        provides that liquidation route. The only thing that was
+        actually going missing was the GRACE-ENDED notification itself;
+        this restores just that, on the same cadence _rebuild_grid()
+        already runs at regardless of dead-band outcome.
+
+        claim_collision_pending legs are deliberately NOT given the same
+        treatment here — their dwell cap defaults far shorter
+        (reconcile_claim_collision_dwell_s, 300s vs 8100s) and, unlike a
+        zero-candidate leg's forced liquidation, the consequence of that
+        cap running past-due while uncoupled from a real reposition is
+        just "held a bit longer than intended before the next real
+        reconcile finally clears it" — strictly safer than the
+        zero-candidate failure mode this fixes, not another instance of
+        it, so it doesn't carry the same urgency to decouple.
+        """
+        if self._engine is None:
+            return
+        trend_risk = 0.0
+        if self._stop_scorer is not None:
+            trend_risk = self._stop_scorer.compute_trend_risk(
+                mid, self._effective_trend_regime(), self._last_trend_slope_pct
+            )
+        now_ts = time.time()
+        with self._leg_zero_candidate_since_lock:
+            tracked_leg_ids = list(self._leg_zero_candidate_since.keys())
+        for leg_id in tracked_leg_ids:
+            with self._engine._lock:
+                leg = self._engine._open_legs.get(leg_id)
+            if leg is None:
+                # Resolved via some other path (closed, liquidated) between
+                # being flagged and this check running. Left in the dwell
+                # map until the next full reconcile pass' own cleanup loop
+                # notices — harmless either way, since a leg_id absent from
+                # self._engine._open_legs can never be liquidated twice.
+                continue
+            self._check_zero_candidate_grace(leg, trend_risk, now_ts)
 
     def _rebuild_grid(self):
         mid = _price_cache.get_mid()
         if mid is None:
             logger.warning("[GridBot] No mid price — cannot build grid")
             return
+
+        # Runs on EVERY call to this method, regardless of what the
+        # dead-band check below decides — see _check_stranded_leg_grace's
+        # docstring for why this can't just live in the post-reconcile
+        # bookkeeping further down like everything else here.
+        self._check_stranded_leg_grace(mid)
 
         logger.info("[GridBot] (Re)building grid...")
 
@@ -11282,46 +11421,8 @@ class GridBot:
         # trend_risk bypass as the post-chase dwell cap: a genuinely
         # urgent move skips the grace and chases immediately regardless.
         zero_candidate_ids = {leg.leg_id for leg in zero_candidate_legs}
-        pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
-        urgent_threshold = self._cfg.get(
-            "reconcile_urgent_trend_risk",
-            self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
-        )
         for leg in zero_candidate_legs:
-            with self._leg_zero_candidate_since_lock:
-                first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
-            with self._engine._lock:
-                already_chasing = leg.leg_id in self._engine._chasing_leg_ids
-            if already_chasing:
-                continue  # chase already in flight from an earlier rebuild
-            grace_elapsed = now_ts - first_seen
-            within_grace = (
-                pre_chase_grace_s > 0.0
-                and grace_elapsed < pre_chase_grace_s
-                and reconcile_trend_risk < urgent_threshold
-            )
-            if within_grace:
-                with self._engine._lock:
-                    self._engine._grace_held_leg_ids.add(leg.leg_id)
-                logger.info(
-                    f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
-                    f"rebuild (open={leg.open_price:.2f}) — within pre-chase "
-                    f"grace ({grace_elapsed:.0f}s/{pre_chase_grace_s:.0f}s, "
-                    f"trend_risk={reconcile_trend_risk:.2f}<"
-                    f"{urgent_threshold:.2f}) — holding with no resting "
-                    f"order, re-evaluated at the next rebuild."
-                )
-                continue
-            with self._engine._lock:
-                self._engine._chasing_leg_ids.add(leg.leg_id)
-                self._engine._grace_held_leg_ids.discard(leg.leg_id)
-            logger.info(
-                f"[GridBot] Leg #{leg.leg_id} zero-candidate on this "
-                f"rebuild (open={leg.open_price:.2f}) — handing off to "
-                f"stray-leg chase for a shot at a decent price before "
-                f"settling into the unmanaged wait."
-            )
-            self._chase_close_leg(leg, reason="rebuild_reprice_pending")
+            self._check_zero_candidate_grace(leg, reconcile_trend_risk, now_ts)
         with self._leg_zero_candidate_since_lock:
             zero_candidate_since_ids_snapshot = list(self._leg_zero_candidate_since.keys())
         for leg_id in zero_candidate_since_ids_snapshot:
