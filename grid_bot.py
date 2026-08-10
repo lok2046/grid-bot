@@ -5622,24 +5622,27 @@ class GridEngine:
           reconcile_urgent_trend_risk). See the "2026-08-03 16:35
           incident" GRID_CONFIG comment block.
 
-          IMPORTANT CAVEAT (2026-08-08, gen00043_green): this whole
-          grace -> chase transition is entirely dependent on
-          reconcile_open_legs actually being CALLED. GridBot._rebuild_grid
-          only calls it when the dead-band check passes (a genuine
-          reposition) or is bypassed (mid outside range) — every branch
-          of a dead-band-SKIPPED rebuild returns before ever reaching
-          this method at all. If the grid stays stable for longer than
-          the combined grace+dwell budget with no repositioning event in
-          between, a zero-candidate leg's very first re-evaluation can
-          already be past its dwell cap, with zero chase attempts ever
-          having had a chance to fire — confirmed against legs #1000/#1001
-          in that log (flagged zero-candidate at 06:00:37, dwell cap
-          8100s, next and ONLY re-evaluation at 08:19:23 — 8326s later,
-          straight to liquidation). This method's own dwell-cap logic is
-          working exactly as designed in that case; the gap is upstream,
-          in when this method gets called at all. Not fixed here — flagged
-          for its own dedicated pass, since it means changing
-          _rebuild_grid's dead-band control flow itself, not this method.
+          NOTE (2026-08-08/09, gen00043_green/GEN00046_GREEN): this
+          method's own grace -> chase transition only runs when it's
+          actually CALLED, which GridBot._rebuild_grid only does when the
+          dead-band check passes (a genuine reposition) or is bypassed
+          (mid outside range) — every branch of a dead-band-SKIPPED
+          rebuild returns before ever reaching this method. Confirmed
+          against legs #1000/#1001 (flagged zero-candidate at 06:00:37,
+          next and ONLY re-evaluation at 08:19:23 — 8326s later, straight
+          to liquidation with zero chase attempts) and again against leg
+          #1012 in a calmer market with no coincidental trigger keeping
+          rebuilds frequent. This method's own dwell-cap logic was
+          working exactly as designed in both cases; the gap was
+          upstream, in when it gets called at all — fixed via
+          GridBot._run()'s dwell-cap watchdog blocks, which directly
+          request a rebuild the instant any tracked leg's own cap is
+          reached (using this exact same dwell-cap formula), combined
+          with GridBot._check_stranded_leg_grace()/_check_zero_candidate_grace(),
+          which perform the actual grace -> chase transition once that
+          forced rebuild happens — independent of whether the rest of
+          _rebuild_grid's dead-band check then passes or skips. See those
+          methods' docstrings.
         - Flagged pending (any of the three kinds above) for too long and
           still not resolved: returned in the second list (to_liquidate).
           This method does NOT liquidate them itself — it only decides;
@@ -10844,11 +10847,30 @@ class GridBot:
         _rebuild_grid()'s dead-band check actually passes (a genuine
         reposition) or is bypassed (mid outside range). Every branch of a
         dead-band-SKIPPED rebuild returns before reaching
-        reconcile_open_legs() at all. _rebuild_grid() itself still gets
-        invoked frequently regardless (every ~15s in gen00043_green,
-        driven by the routine retune-check cadence) — it's specifically
-        the LEG-reconciliation step buried inside it that was going
-        uncalled.
+        reconcile_open_legs() at all.
+
+        Called from _rebuild_grid()'s top unconditionally (see that
+        method) — that catches the transition on any rebuild that happens
+        to fire for an unrelated reason, but is NOT what guarantees one
+        happens in a timely way in the first place. _rebuild_grid() has
+        no cadence of its own: should_retune() (checked every
+        RETUNE_CHECK_INTERVAL, 300s) only returns True on "mid outside
+        range" or a 24h periodic window, and the other trigger
+        (pop_needs_rebuild()) only fires on an orphan-leg detection or
+        drift-far-OOR cascade — neither of which is the same condition as
+        "this specific leg's own dwell cap ran out". In a genuinely calm
+        stretch with none of those true, _rebuild_grid() could otherwise
+        go up to 24h without running at all. The actual guarantee comes
+        from GridBot._run()'s "dwell-cap watchdog" blocks (2026-08-09,
+        GEN00046_GREEN) — they directly request a rebuild
+        (self._engine._needs_rebuild = True) the moment any tracked leg's
+        own zero-candidate or claim-collision cap is reached, using the
+        identical trend-risk-scaled formula reconcile_open_legs() itself
+        uses, so a rebuild is requested only once that leg would actually
+        be acted on anyway. Once that forced rebuild happens, THIS method
+        (unconditional at the top of _rebuild_grid) is what performs the
+        actual transition — regardless of whether the rest of
+        _rebuild_grid's dead-band check then passes or skips.
 
         Confirmed against legs #1000/#1001 (gen00043_green, 2026-08-08):
         flagged zero-candidate at 06:00:37 (logged "within pre-chase
@@ -10858,7 +10880,12 @@ class GridBot:
         attempts ever dispatched — despite ~470 "(Re)building grid..."
         log lines in that window, every single one dead-band-skipped
         before ever reaching the code that would have caught the grace
-        period ending partway through.
+        period ending partway through. (Leg #1012, GEN00046_GREEN,
+        2026-08-09, is the identical failure shape recurring in a calmer
+        market with no orphan-storm coincidentally driving frequent
+        rebuilds — this is what motivated the watchdog mechanism
+        specifically, rather than continuing to rely on some other
+        trigger happening to fire often enough on its own.)
 
         Deliberately narrow in scope: does NOT re-run candidate search
         (a zero-candidate leg's open price sits outside the CURRENT
@@ -10871,8 +10898,8 @@ class GridBot:
         own 3-attempt-then-market-fallback exhaustion path already
         provides that liquidation route. The only thing that was
         actually going missing was the GRACE-ENDED notification itself;
-        this restores just that, on the same cadence _rebuild_grid()
-        already runs at regardless of dead-band outcome.
+        this, plus the watchdog ensuring it actually gets a chance to
+        run, restores just that.
 
         claim_collision_pending legs are deliberately NOT given the same
         treatment here — their dwell cap defaults far shorter
