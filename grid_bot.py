@@ -338,6 +338,57 @@ GRID_CONFIG: dict = {
     # REPRICE_UNDERCOUNT-fixed data accumulate.
     "zero_candidate_pre_chase_grace_s": 7200.0,
 
+    # Adverse-move grace override (2026-08-09, AUTO_ADVERSE_MOVE): the
+    # grace period above is pure time — wait up to zero_candidate_pre_
+    # chase_grace_s regardless of what price does meanwhile. Leg #1010
+    # (gen00046_green, 2026-08-09) rode its full 8100s grace+dwell budget
+    # while price drifted steadily further away the whole time (never
+    # recovering), so the eventual forced close cost -$3.00 instead of
+    # the -$1.52 an immediate chase would have cost at the start — time
+    # alone can't distinguish "waiting is working" from "waiting is
+    # making it worse". This is a second, independent way grace can end
+    # early: if price has moved too far further against a graced leg
+    # since it first went zero-candidate, treat that the same as the
+    # time budget having run out, even if zero_candidate_pre_chase_
+    # grace_s hasn't elapsed yet.
+    #
+    # A fixed dollar figure was the first cut at "too far" (2026-08-09,
+    # same day, superseded by this) — dropped for being hard to tune in
+    # a way that goes beyond just picking the right number once: a
+    # dollar figure sized for today's price level and volatility regime
+    # doesn't mean the same thing after either shifts, so it would need
+    # re-tuning on a schedule nobody would reliably keep up with. This
+    # multiplier is expressed against effective_atr instead — the
+    # market's own continuously-updating answer to "how big a move is
+    # normal right now" (see self._last_effective_atr, refreshed every
+    # _rebuild_grid() call) — so the actual dollar threshold this
+    # evaluates against auto-tracks price level and vol regime on its
+    # own, and the only thing left to hand-pick is a small, stable,
+    # comparable-across-conditions multiplier instead of a raw dollar
+    # figure that goes stale.
+    #
+    # "Based on market sentiment" (as requested) is still exactly what
+    # decides how much of that ATR-denominated room a given leg actually
+    # gets: the effective allowance is scaled down as trend_risk climbs
+    # toward reconcile_urgent_trend_risk — same shape as
+    # zero_candidate_pre_chase_grace_s's own dwell-cap scaling — so a
+    # drift confirmed by the trend signal gets less rope than the same
+    # drift under flat/neutral sentiment. ATR sets the ruler; sentiment
+    # decides how much of it a leg is allowed to use before that's it.
+    #
+    # Sized against leg #1010 as a concrete anchor: effective_atr was
+    # 30.00 (floor-clamped) when it first went zero-candidate, and its
+    # ADDITIONAL adverse drift during the wait (not counting how far
+    # underwater it already was when grace started) was ~140pts (~$1.48
+    # at its qty) — roughly 4.7x that effective_atr reading. A mult
+    # around 0.15-0.25 would end up comparable in scale to that specific
+    # incident at low trend_risk; that's a plausibility check against
+    # one data point, not a validated setting. 0.0 (this default) is a
+    # genuine off switch — keep it there until there's a few days of
+    # real numbers (across different vol regimes, not just this one
+    # calm morning) to size it against.
+    "zero_candidate_adverse_move_atr_mult": 0.0,
+
     # Claim-collision dwell (2026-08-08, gen00042_green): a CLEAN-FIT leg
     # (its open price genuinely sits inside the live range) whose ideal
     # closing cell is already claimed by another clean-fit leg this
@@ -7790,6 +7841,26 @@ class GridBot:
         # decision lands last (see the GRACE_TRAIL_DROP_2026_08_08
         # reason-gate above for that half).
         self._leg_zero_candidate_since_lock = threading.Lock()
+        # ADVERSE_MOVE_GRACE_2026_08_09: reference price recorded at the
+        # same moment a leg first enters _leg_zero_candidate_since — lets
+        # _check_zero_candidate_grace tell "waited and price came back
+        # toward us" apart from "waited and it kept getting worse" instead
+        # of only ever knowing how much TIME has elapsed. Confirmed via
+        # leg #1010 (gen00046_green, 2026-08-09): flagged zero-candidate
+        # at mid=64963.65, patiently held for its full 8100s grace+dwell
+        # budget, but price never came back — it drifted FURTHER away, to
+        # 64823.95 by the time the time-based cap finally liquidated it,
+        # so the wait made the eventual loss bigger (-$3.00) than an
+        # immediate chase back at the start would have cost (-$1.52). Same
+        # lifecycle as _leg_zero_candidate_since in every other respect —
+        # same lock, set once per zero-candidate episode, cleared whenever
+        # that leg_id is (see the cleanup loop, _finalize_leg_close's
+        # immediate-clear block, and both persist/restore pairs below) —
+        # kept as a separate dict rather than folded into the existing one
+        # so a leg_zero_candidate_since-shaped restore from an older DB
+        # row (no start-price data yet) degrades to "no adverse-move check
+        # for this leg's carried-over episode" instead of a KeyError.
+        self._leg_zero_candidate_start_price: Dict[int, float] = {}
         # Cooldown bookkeeping for the dwell-cap watchdog in _run() (2026-08-09,
         # GEN00046_GREEN incident — see that check's own comment for the
         # full writeup). Separate from GridEngine._last_orphan_rebuild_request
@@ -7861,6 +7932,9 @@ class GridBot:
         self._last_trend_log:    float = 0.0   # ts of last trend log line
         self._last_trend_slope_pct: float = 0.0  # cached for compute_trend_risk(),
                                                   # refreshed every _evaluate_trend() call
+        self._last_effective_atr: float = 0.0  # cached for the adverse-move allowance
+                                                # (AUTO_ADVERSE_MOVE_2026_08_09), refreshed
+                                                # every _rebuild_grid() call
 
         # ── SQLite persistence ────────────────────────────────────────────────────
         # Opened once here and shared with every GridEngine instance so that
@@ -10190,6 +10264,7 @@ class GridBot:
         # GRACE_TRAIL_DROP_2026_08_08's lock in the first place).
         with self._leg_zero_candidate_since_lock:
             self._leg_zero_candidate_since.pop(leg.leg_id, None)
+            self._leg_zero_candidate_start_price.pop(leg.leg_id, None)
         with self._leg_claim_collision_since_lock:
             self._leg_claim_collision_since.pop(leg.leg_id, None)
         with self._leg_no_fit_since_lock:
@@ -10476,16 +10551,23 @@ class GridBot:
                 self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
             )
             trend_risk = 0.0
-            if reason in ("trail_up", "trail_down") and self._stop_scorer is not None:
-                _bid, _ask, mid = _price_cache.get_l1()
-                if mid is not None:
-                    trend_risk = self._stop_scorer.compute_trend_risk(
-                        mid, self._effective_trend_regime(), self._last_trend_slope_pct
-                    )
-            if (reason in ("trail_up", "trail_down")
+            # ADVERSE_MOVE_GRACE_2026_08_09: fetched unconditionally (not
+            # just when self._stop_scorer is set) — the grace-registration
+            # branch below only requires trend_risk < urgent_threshold,
+            # which trend_risk's own 0.0 default satisfies even when
+            # self._stop_scorer is None, so mid has to be available
+            # either way or that branch would reference an unset name.
+            _bid, _ask, mid = _price_cache.get_l1()
+            if (reason in ("trail_up", "trail_down") and self._stop_scorer is not None
+                    and mid is not None):
+                trend_risk = self._stop_scorer.compute_trend_risk(
+                    mid, self._effective_trend_regime(), self._last_trend_slope_pct
+                )
+            if (reason in ("trail_up", "trail_down") and mid is not None
                     and pre_chase_grace_s > 0.0 and trend_risk < urgent_threshold):
                 with self._leg_zero_candidate_since_lock:
                     self._leg_zero_candidate_since[leg.leg_id] = time.time()
+                    self._leg_zero_candidate_start_price[leg.leg_id] = mid
                 logger.info(
                     f"[GridBot][{reason}] Leg #{leg.leg_id} (open="
                     f"{leg.open_price:.2f}) dropped by trailing with no "
@@ -10776,7 +10858,7 @@ class GridBot:
         return False
 
     def _check_zero_candidate_grace(self, leg: "OpenLeg", trend_risk: float,
-                                     now_ts: float) -> None:
+                                     now_ts: float, mid: float) -> None:
         """
         Decide whether a zero-candidate leg's pre-chase grace has ended:
         if not, hold it (excluded from the orphan detector via
@@ -10794,9 +10876,47 @@ class GridBot:
         class of bug: a second call site that needed the same grace logic
         but was never updated when grace was added, because the logic
         only existed inline in one place.
+
+        AUTO_ADVERSE_MOVE_2026_08_09: grace was originally a pure time
+        budget — wait up to pre_chase_grace_s regardless of what price
+        does in the meantime. Leg #1010 (gen00046_green, 2026-08-09) rode
+        its full 8100s budget while price drifted steadily further away
+        the whole time (mid=64963.65 -> 64823.95), so the eventual forced
+        close cost -$3.00 instead of the -$1.52 an immediate chase would
+        have cost at the start. Time alone can't tell "waiting is working"
+        apart from "waiting is making it worse" — this is a second,
+        independent way grace can end early, if price has moved too far
+        further against the leg since it first went zero-candidate.
+
+        "Too far" is a fixed dollar figure's job in a naive version of
+        this, and that was the first cut (2026-08-09, superseded same
+        day) — turned out to be a bad fit for "hard to tune" reasons that
+        go beyond just picking the right number once: a dollar figure
+        that fits a $65k BTC / current-vol regime doesn't mean the same
+        thing after a price-level or volatility shift, so it would have
+        silently needed re-tuning on a schedule nobody would remember to
+        keep. effective_atr (self._last_effective_atr, refreshed every
+        _rebuild_grid() call — see that assignment's comment for why it's
+        cached rather than read fresh here) already IS the market's own
+        answer to "how big a move is normal right now", continuously, for
+        free — expressing the allowance as a small multiple of it
+        (zero_candidate_adverse_move_atr_mult) means the dollar threshold
+        this actually evaluates against auto-tracks price level and vol
+        regime on its own, and the only dial left to hand-pick is a
+        small, comparable-across-conditions multiplier instead of a raw
+        dollar figure. trend_risk still does exactly what was asked for
+        ("based on market sentiment") on top of that ATR-denominated
+        base — scaled down as trend_risk rises toward urgent_threshold,
+        same shape as pre_chase_grace_s's own dwell-cap scaling, so a
+        sentiment-confirmed adverse move gets less rope than the same
+        drift under flat/neutral sentiment. ATR sets the ruler; sentiment
+        decides how much of it a given leg is allowed to use. Off by
+        default (zero_candidate_adverse_move_atr_mult=0.0) keeps this a
+        pure no-op until a value is set.
         """
         with self._leg_zero_candidate_since_lock:
             first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
+            start_price = self._leg_zero_candidate_start_price.setdefault(leg.leg_id, mid)
         with self._engine._lock:
             already_chasing = leg.leg_id in self._engine._chasing_leg_ids
         if already_chasing:
@@ -10812,6 +10932,27 @@ class GridBot:
             and grace_elapsed < pre_chase_grace_s
             and trend_risk < urgent_threshold
         )
+        adverse_move_usd = 0.0
+        adverse_allowance_usd = 0.0
+        if within_grace:
+            # BUY-opened leg needs price to rise back to close it well —
+            # adverse means price falling further below start_price.
+            # SELL-opened leg is the mirror: adverse means price rising
+            # further above start_price. Only the adverse direction
+            # counts; a leg drifting favorably during its wait is doing
+            # exactly what grace is for and shouldn't get cut short.
+            if leg.open_side == "BUY":
+                adverse_move_usd = max(0.0, start_price - mid) * leg.qty
+            else:
+                adverse_move_usd = max(0.0, mid - start_price) * leg.qty
+            atr_mult = self._cfg.get("zero_candidate_adverse_move_atr_mult", 0.0)
+            adverse_allowance_price = self._last_effective_atr * atr_mult
+            adverse_allowance_usd = adverse_allowance_price * leg.qty * (
+                max(0.0, 1.0 - trend_risk / urgent_threshold)
+                if urgent_threshold > 0 else 0.0
+            )
+            if atr_mult > 0.0 and adverse_move_usd >= adverse_allowance_usd:
+                within_grace = False
         if within_grace:
             with self._engine._lock:
                 self._engine._grace_held_leg_ids.add(leg.leg_id)
@@ -10819,19 +10960,32 @@ class GridBot:
                 f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
                 f"{leg.open_price:.2f}) — within pre-chase grace "
                 f"({grace_elapsed:.0f}s/{pre_chase_grace_s:.0f}s, "
-                f"trend_risk={trend_risk:.2f}<{urgent_threshold:.2f}) — "
-                f"holding with no resting order, re-evaluated later."
+                f"trend_risk={trend_risk:.2f}<{urgent_threshold:.2f}, "
+                f"adverse move ${adverse_move_usd:.2f}<"
+                f"${adverse_allowance_usd:.2f}) — holding with no resting "
+                f"order, re-evaluated later."
             )
             return
         with self._engine._lock:
             self._engine._chasing_leg_ids.add(leg.leg_id)
             self._engine._grace_held_leg_ids.discard(leg.leg_id)
-        logger.info(
-            f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
-            f"{leg.open_price:.2f}) — handing off to stray-leg chase for "
-            f"a shot at a decent price before settling into the unmanaged "
-            f"wait."
-        )
+        if adverse_move_usd > 0.0 and adverse_move_usd >= adverse_allowance_usd > 0.0:
+            logger.info(
+                f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
+                f"{leg.open_price:.2f}) — adverse move ${adverse_move_usd:.2f} "
+                f">= ${adverse_allowance_usd:.2f} allowance (effective_atr="
+                f"{self._last_effective_atr:.2f}, trend_risk={trend_risk:.2f}) "
+                f"with {pre_chase_grace_s - grace_elapsed:.0f}s of grace "
+                f"still nominally left — ending grace early, handing off "
+                f"to stray-leg chase."
+            )
+        else:
+            logger.info(
+                f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
+                f"{leg.open_price:.2f}) — handing off to stray-leg chase for "
+                f"a shot at a decent price before settling into the unmanaged "
+                f"wait."
+            )
         self._chase_close_leg(leg, reason="rebuild_reprice_pending")
 
     def _check_stranded_leg_grace(self, mid: float) -> None:
@@ -10931,7 +11085,7 @@ class GridBot:
                 # notices — harmless either way, since a leg_id absent from
                 # self._engine._open_legs can never be liquidated twice.
                 continue
-            self._check_zero_candidate_grace(leg, trend_risk, now_ts)
+            self._check_zero_candidate_grace(leg, trend_risk, now_ts, mid)
 
     def _rebuild_grid(self):
         mid = _price_cache.get_mid()
@@ -10951,6 +11105,15 @@ class GridBot:
         if new_params is None:
             logger.error("[GridBot] Auto-tuner returned None — keeping existing params")
             new_params = self._params
+        if new_params is not None and new_params.effective_atr:
+            # AUTO_ADVERSE_MOVE_2026_08_09: cached so _check_zero_candidate_
+            # grace (and _check_stranded_leg_grace, which runs before this
+            # line even executes on a given call) always has a recent
+            # effective_atr to work with, not just on calls where a full
+            # reposition actually happens — see that config's comment
+            # block for why this is the "unit" the auto-tuned adverse-move
+            # allowance is expressed in.
+            self._last_effective_atr = new_params.effective_atr
         if new_params is None:
             logger.error("[GridBot] No grid params available — aborting rebuild")
             return
@@ -11635,7 +11798,7 @@ class GridBot:
         # urgent move skips the grace and chases immediately regardless.
         zero_candidate_ids = {leg.leg_id for leg in zero_candidate_legs}
         for leg in zero_candidate_legs:
-            self._check_zero_candidate_grace(leg, reconcile_trend_risk, now_ts)
+            self._check_zero_candidate_grace(leg, reconcile_trend_risk, now_ts, mid)
         with self._leg_zero_candidate_since_lock:
             zero_candidate_since_ids_snapshot = list(self._leg_zero_candidate_since.keys())
         for leg_id in zero_candidate_since_ids_snapshot:
@@ -11658,6 +11821,7 @@ class GridBot:
             # branch, or by the chase worker's own exhaustion fallback).
             with self._leg_zero_candidate_since_lock:
                 self._leg_zero_candidate_since.pop(leg_id, None)
+                self._leg_zero_candidate_start_price.pop(leg_id, None)
             with self._engine._lock:
                 self._engine._grace_held_leg_ids.discard(leg_id)
 
@@ -11973,9 +12137,14 @@ class GridBot:
 
     def _persist_leg_zero_candidate_since(self) -> None:
         """
-        Persist `_leg_zero_candidate_since` to SQLite so the zero-candidate
-        dwell clock survives a process restart instead of restarting from
-        "just discovered" for every currently-stranded leg.
+        Persist `_leg_zero_candidate_since` (and, alongside it,
+        `_leg_zero_candidate_start_price` — same lifecycle, same lock,
+        added 2026-08-09 for AUTO_ADVERSE_MOVE_2026_08_09, kept under its
+        own meta key rather than folded into the same JSON blob so a
+        restore against data persisted before this change still parses
+        cleanly) to SQLite so the zero-candidate dwell clock survives a
+        process restart instead of restarting from "just discovered" for
+        every currently-stranded leg.
 
         Previously this lived only in memory, populated fresh on every
         process start (see __init__). _rebuild_grid()'s zero-candidate
@@ -11990,26 +12159,44 @@ class GridBot:
         Called once per _rebuild_grid() call, right after that method's
         zero-candidate bookkeeping block finishes mutating the dict (both
         the additions and the deletions) — mirrors _persist_halt_state()'s
-        "persist right after the state changes" placement.
+        "persist right after the state changes" placement — and also from
+        _finalize_leg_close's immediate-clear block, for the same
+        crash/restart-window reasoning that block's own comment covers.
         """
         if self._store is None:
             return
         with self._leg_zero_candidate_since_lock:
             snapshot = dict(self._leg_zero_candidate_since)
+            price_snapshot = dict(self._leg_zero_candidate_start_price)
         self._store.set_meta(
             "leg_zero_candidate_since",
             json.dumps({str(k): v for k, v in snapshot.items()}),
         )
+        self._store.set_meta(
+            "leg_zero_candidate_start_price",
+            json.dumps({str(k): v for k, v in price_snapshot.items()}),
+        )
 
     def _restore_leg_zero_candidate_since(self) -> None:
         """
-        Restore `_leg_zero_candidate_since` persisted by
+        Restore `_leg_zero_candidate_since` (and
+        `_leg_zero_candidate_start_price`, see
+        _persist_leg_zero_candidate_since() for why that's a second meta
+        key rather than a format change to this one) persisted by
         _persist_leg_zero_candidate_since(). Called once from start(),
         before the first _rebuild_grid() call (same timing as
         _restore_halt_state(), and for the same reason — this dict has to
         be populated before _rebuild_grid()'s bookkeeping runs its
         "already dwelling from a prior rebuild" check, or the restore is
         a no-op).
+
+        A leg_id with a since-timestamp but no matching start-price entry
+        (e.g. restored from data persisted before AUTO_ADVERSE_MOVE_
+        2026_08_09 existed) is handled by _check_zero_candidate_grace's
+        own .setdefault — it just treats the first post-restart mid it
+        sees as that leg's start_price, same as any other leg newly
+        registered into the map. Not a crash risk, just a slightly later
+        reference point for that one carried-over episode.
 
         A leg_id persisted here that no longer exists in the DB ledger
         (e.g. it was force-liquidated by a previous session, or
@@ -12023,6 +12210,7 @@ class GridBot:
         if self._store is None:
             return
         raw = self._store.get_meta("leg_zero_candidate_since")
+        raw_price = self._store.get_meta("leg_zero_candidate_start_price")
         if not raw:
             return
         try:
@@ -12033,8 +12221,22 @@ class GridBot:
                 f"— starting with an empty dwell map: {e}"
             )
             return
+        restored_price = {}
+        if raw_price:
+            try:
+                restored_price = json.loads(raw_price)
+            except Exception as e:
+                logger.error(
+                    f"[GridBot] Failed to parse persisted "
+                    f"leg_zero_candidate_start_price — adverse-move "
+                    f"tracking for any restored leg starts fresh from the "
+                    f"first post-restart price instead: {e}"
+                )
         with self._leg_zero_candidate_since_lock:
             self._leg_zero_candidate_since = {int(k): float(v) for k, v in restored.items()}
+            self._leg_zero_candidate_start_price = {
+                int(k): float(v) for k, v in restored_price.items()
+            }
         if self._leg_zero_candidate_since:
             logger.info(
                 f"[GridBot] Restored zero-candidate dwell state for "
