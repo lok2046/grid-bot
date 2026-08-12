@@ -11173,13 +11173,22 @@ class GridBot:
         if within_grace:
             with self._engine._lock:
                 self._engine._grace_held_leg_ids.add(leg.leg_id)
+            # atr_mult==0.0 means the adverse-move check above never ran
+            # the comparison, so adverse_allowance_usd is a meaningless
+            # 0.0 — printing "$X<$0.00" then would read as false whenever
+            # a leg has any nonzero adverse drift. Only show the clause
+            # once there's an actual allowance it's being compared against.
+            adverse_move_note = (
+                f", adverse move ${adverse_move_usd:.2f}<"
+                f"${adverse_allowance_usd:.2f}"
+                if atr_mult > 0.0 else ""
+            )
             logger.info(
                 f"[GridBot] Leg #{leg.leg_id} zero-candidate (open="
                 f"{leg.open_price:.2f}) — within pre-chase grace "
                 f"({grace_elapsed:.0f}s/{pre_chase_grace_s:.0f}s, "
-                f"trend_risk={trend_risk:.2f}<{urgent_threshold:.2f}, "
-                f"adverse move ${adverse_move_usd:.2f}<"
-                f"${adverse_allowance_usd:.2f}) — holding with no resting "
+                f"trend_risk={trend_risk:.2f}<{urgent_threshold:.2f}"
+                f"{adverse_move_note}) — holding with no resting "
                 f"order, re-evaluated later."
             )
             return
@@ -11310,27 +11319,36 @@ class GridBot:
             logger.warning("[GridBot] No mid price — cannot build grid")
             return
 
-        # Runs on EVERY call to this method, regardless of what the
-        # dead-band check below decides — see _check_stranded_leg_grace's
-        # docstring for why this can't just live in the post-reconcile
-        # bookkeeping further down like everything else here.
-        self._check_stranded_leg_grace(mid)
-
-        logger.info("[GridBot] (Re)building grid...")
-
         new_params = self._auto_tuner.compute(trend_regime=self._effective_trend_regime())
         if new_params is None:
             logger.error("[GridBot] Auto-tuner returned None — keeping existing params")
             new_params = self._params
         if new_params is not None and new_params.effective_atr:
-            # AUTO_ADVERSE_MOVE_2026_08_09: cached so _check_zero_candidate_
-            # grace (and _check_stranded_leg_grace, which runs before this
-            # line even executes on a given call) always has a recent
-            # effective_atr to work with, not just on calls where a full
-            # reposition actually happens — see that config's comment
-            # block for why this is the "unit" the auto-tuned adverse-move
-            # allowance is expressed in.
+            # AUTO_ADVERSE_MOVE_2026_08_09: cached here, before
+            # _check_stranded_leg_grace() runs below, so that call's own
+            # _check_zero_candidate_grace evaluations — including the very
+            # first check of a leg that just went zero-candidate in this
+            # exact _rebuild_grid() call — see a fresh reading instead of
+            # whatever was cached as of the PREVIOUS call. The commit that
+            # introduced this caching (2026-08-09) said it moved the
+            # caching ahead of _check_stranded_leg_grace for this reason,
+            # but didn't actually reorder anything — the call below still
+            # ran first and this line still ran after it. This is the
+            # actual move. See that config's comment block for why this is
+            # the "unit" the auto-tuned adverse-move allowance is
+            # expressed in.
             self._last_effective_atr = new_params.effective_atr
+
+        # Runs on EVERY call to this method, regardless of what the
+        # dead-band check below decides — see _check_stranded_leg_grace's
+        # docstring for why this can't just live in the post-reconcile
+        # bookkeeping further down like everything else here. Placed
+        # after the effective_atr caching above (not before), so it
+        # always evaluates against this call's fresh ATR reading.
+        self._check_stranded_leg_grace(mid)
+
+        logger.info("[GridBot] (Re)building grid...")
+
         if new_params is None:
             logger.error("[GridBot] No grid params available — aborting rebuild")
             return
