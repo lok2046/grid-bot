@@ -704,6 +704,32 @@ GRID_CONFIG: dict = {
     "min_atr_floor_pts":       30.0,  # hard floor for effective ATR (price points)
     "recent_range_atr_factor": 0.5,   # effective ATR >= recent_5min_range × this
 
+    #   3. long_range_window_minutes / long_range_atr_factor
+    #      (2026-08-10, LONG_RANGE_ATR_GUARD) — same shape as guard 2, over a
+    #      longer window, for a different failure mode: a slow multi-hour
+    #      grind that never spikes within any single 5-min slice but still
+    #      leaves the grid's range behind (see AutoTuner.compute()'s guard-3
+    #      comment for the leg #1010/#1015/#1016 evidence).
+    #      long_range_atr_factor itself is no longer a fixed number you set
+    #      once — see GridBot._maybe_recompute_long_range_atr_factor() for
+    #      the calibration loop that suggests (and optionally applies) it
+    #      from real outcomes. Everything below this line configures that
+    #      loop; long_range_atr_factor still starts at 0.0 (off) until it
+    #      has enough real data to suggest something else.
+    "long_range_window_minutes": 60,
+    "long_range_atr_factor":     0.0,  # 0.0 = off. effective ATR >= recent_Nmin_range × this
+    "long_range_atr_min_samples":   8,     # need >= this many incidents before suggesting anything
+    "long_range_atr_recompute_interval_s": 86400.0,  # re-suggest at most this often (default: daily)
+    "long_range_atr_factor_floor":   0.05, # suggestion is clamped to [floor, ceiling]
+    "long_range_atr_factor_ceiling": 1.00,
+    "long_range_atr_max_step":       0.05, # max change per recompute (damping)
+    "long_range_atr_factor_auto_apply": False,  # False = suggest only (log it, don't touch
+                                                 # the live value). True = write the damped/
+                                                 # clamped suggestion into long_range_atr_factor
+                                                 # automatically each recompute. See
+                                                 # _maybe_recompute_long_range_atr_factor()'s
+                                                 # docstring for why this defaults to False.
+
     # Minimum headroom between current mid and the newly-computed stop price,
     # expressed as a multiple of ATR.  If mid < stop + N×ATR at the moment the
     # grid is (re)built, the build is aborted: price is already too close to the
@@ -3295,6 +3321,42 @@ class GridAutoTuner:
                     f"{effective_atr:.2f} — raising effective ATR to {range_atr_min:.2f}"
                 )
                 effective_atr = range_atr_min
+
+        # Guard 3 — longer-window range scaling (2026-08-10,
+        # LONG_RANGE_ATR_GUARD): Guards 1-2 above only ever look at a
+        # single ATR reading and a 5-min window — neither catches a slow,
+        # steady grind that never spikes hard enough within any one 5-min
+        # slice to trip Guard 2, but still adds up to real distance over a
+        # couple of hours. Legs #1010/#1015/#1016 (GEN00046_GREEN/
+        # GEN00049_GREEN, 2026-08-09/10) all went zero-candidate with
+        # effective_atr pinned at the 30pt floor (a fixed ~180pt range)
+        # while price actually moved 347.9pts over the surrounding several
+        # hours — more than the range covered, without any single 5-min
+        # window ever showing enough to raise it. Same merge pattern as
+        # Guard 2 (can only WIDEN effective_atr, never narrow it), just a
+        # longer look-back and — deliberately — a smaller factor by
+        # default, since a longer window's raw hi-lo is naturally bigger
+        # than a 5-min one even in ordinary chop; the two factors aren't
+        # meant to be compared 1:1.
+        #
+        # long_range_atr_factor is calibrated, not hand-picked — see
+        # GridBot._maybe_recompute_long_range_atr_factor() for the loop
+        # that suggests it from actual zero-candidate outcomes. It starts
+        # at 0.0 (this guard is a no-op) until that loop has enough real
+        # incidents to suggest something else.
+        long_window = self._cfg.get("long_range_window_minutes", 60)
+        long_factor = self._cfg.get("long_range_atr_factor", 0.0)
+        if long_factor > 0.0:
+            long_stab = self._cache.compute_stability(long_window)
+            if long_stab["ok"]:
+                long_range_min = long_stab["hi_lo"] * long_factor
+                if long_range_min > effective_atr:
+                    logger.info(
+                        f"[AutoTuner] {long_window}-min range {long_stab['hi_lo']:.2f} "
+                        f"× {long_factor} = {long_range_min:.2f} > effective ATR "
+                        f"{effective_atr:.2f} — raising effective ATR to {long_range_min:.2f}"
+                    )
+                    effective_atr = long_range_min
         if effective_atr != atr:
             logger.info(
                 f"[AutoTuner] effective_atr={effective_atr:.2f} "
@@ -7861,6 +7923,21 @@ class GridBot:
         # row (no start-price data yet) degrades to "no adverse-move check
         # for this leg's carried-over episode" instead of a KeyError.
         self._leg_zero_candidate_start_price: Dict[int, float] = {}
+        # LONG_RANGE_ATR_GUARD calibration (2026-08-11): rolling history of
+        # (timestamp, needed_factor) samples, one per zero-candidate
+        # incident where the range genuinely wasn't wide enough — see
+        # _record_long_range_incident()'s docstring for what "needed_factor"
+        # means and why only genuine range-too-narrow incidents qualify.
+        # Bounded deque, not an unbounded log: old incidents from a stale
+        # vol regime shouldn't keep pulling the suggestion around forever.
+        self._long_range_incidents: collections.deque = collections.deque(maxlen=200)
+        self._long_range_incidents_lock = threading.Lock()
+        # Recompute cadence + damping state for
+        # _maybe_recompute_long_range_atr_factor() — see that method's
+        # docstring for the full reasoning.
+        self._last_long_range_atr_recompute_ts: float = 0.0
+        self._last_long_range_atr_suggestion: Optional[float] = None
+
         # Cooldown bookkeeping for the dwell-cap watchdog in _run() (2026-08-09,
         # GEN00046_GREEN incident — see that check's own comment for the
         # full writeup). Separate from GridEngine._last_orphan_rebuild_request
@@ -10857,6 +10934,141 @@ class GridBot:
         self._pending_raise_candidate = max(self._pending_raise_candidate, candidate_stop)
         return False
 
+    def _record_long_range_incident(self, leg: "OpenLeg", mid: float, now_ts: float) -> None:
+        """
+        LONG_RANGE_ATR_GUARD calibration (2026-08-11). Called once, from
+        _check_zero_candidate_grace below, the moment a leg is FIRST seen
+        zero-candidate — never on later re-checks of the same episode.
+
+        Outcome-based, not just "watch the raw hi-lo distribution": the
+        thing worth tuning long_range_atr_factor against is "did it cover
+        the moves that actually stranded a leg", not price movement in
+        general, most of which never causes a problem either way.
+
+        For this leg's stranding to even be a long-range-guard question,
+        the range has to have genuinely been too narrow at that moment —
+        needed_atr (what effective_atr would have had to be, right now,
+        for the range to reach this leg's open_price) has to exceed
+        self._last_effective_atr (what Guards 1+2, plus whatever
+        long_range_atr_factor is already live, actually produced last
+        rebuild). If it doesn't, this leg's stranding wasn't a range-width
+        problem at all — could be a fast move guards 1/2 already can't
+        help with either, a claim-collision, the handoff bug, etc. — and
+        folding it into this calibration would just be noise.
+
+        needed_factor is then "how big would long_range_atr_factor have
+        had to be, applied to THIS window's hi-lo, to have reached
+        needed_atr" — one data point banked into _long_range_incidents.
+        _maybe_recompute_long_range_atr_factor() turns the rolling history
+        of these into a suggested (and, if long_range_atr_factor_auto_apply
+        is set, live) factor.
+        """
+        atr_mult = self._cfg.get("atr_multiplier", 3.0)
+        if atr_mult <= 0:
+            return
+        needed_atr = abs(leg.open_price - mid) / atr_mult
+        if needed_atr <= self._last_effective_atr:
+            return
+        long_window = self._cfg.get("long_range_window_minutes", 60)
+        long_stab = self._auto_tuner._cache.compute_stability(long_window)
+        if not long_stab["ok"] or long_stab["hi_lo"] <= 0:
+            return
+        needed_factor = needed_atr / long_stab["hi_lo"]
+        with self._long_range_incidents_lock:
+            self._long_range_incidents.append((now_ts, needed_factor))
+            n = len(self._long_range_incidents)
+        logger.info(
+            f"[GridBot] long_range_atr_factor calibration: leg #{leg.leg_id} "
+            f"needed effective_atr>={needed_atr:.2f} (had {self._last_effective_atr:.2f}), "
+            f"{long_window}-min hi-lo={long_stab['hi_lo']:.2f} -> needed_factor="
+            f"{needed_factor:.3f} ({n} sample(s) banked)"
+        )
+        self._maybe_recompute_long_range_atr_factor(now_ts)
+
+    def _maybe_recompute_long_range_atr_factor(self, now_ts: float) -> None:
+        """
+        Periodic (not every-incident) recompute of long_range_atr_factor
+        from the rolling _long_range_incidents history banked by
+        _record_long_range_incident() above. Runs at most once every
+        long_range_atr_recompute_interval_s (default 86400 = daily) —
+        deliberately infrequent, meant to read like a daily review a
+        human would do, not react to any single incident.
+
+        Safety rails, all config-driven:
+          - long_range_atr_min_samples (default 8): won't suggest a
+            nonzero factor at all below this many banked incidents — a
+            single unlucky day is not enough evidence to set a live risk
+            parameter from.
+          - Suggests the 80th percentile of needed_factor across the
+            banked history, not the max and not the median — a margin
+            above "would have just barely worked" for the typical
+            incident, without one extreme outlier setting the whole
+            value on its own.
+          - long_range_atr_max_step (default 0.05): the suggestion can
+            only move this far from whatever it last suggested, per
+            recompute — damping, so one noisy batch nudges the value
+            instead of swinging it.
+          - long_range_atr_factor_floor / _ceiling (default [0.05, 1.0]):
+            hard clamp regardless of what the data says.
+
+        long_range_atr_factor_auto_apply (default False): when False —
+        the default — this only ever LOGS the suggestion; the live
+        long_range_atr_factor Guard 3 actually reads is untouched. When
+        True, the damped/clamped suggestion is written to
+        self._cfg["long_range_atr_factor"] directly, live for the very
+        next AutoTuner.compute() call.
+
+        Deliberately defaults to suggest-only. This parameter feeds
+        directly into range width, stop placement, and level/spacing
+        sizing on every rebuild (see AutoTuner.compute()) — letting a
+        background loop start rewriting it unattended, with no floor on
+        data quality beyond the sample-count check above, is a different
+        risk category than the guard itself (which can only ever widen,
+        never narrow, and is off until this loop or a human sets it).
+        Flip long_range_atr_factor_auto_apply once the suggested values
+        look sane across a few different days/regimes, not before.
+        """
+        interval = self._cfg.get("long_range_atr_recompute_interval_s", 86400.0)
+        if now_ts - self._last_long_range_atr_recompute_ts < interval:
+            return
+        self._last_long_range_atr_recompute_ts = now_ts
+        min_samples = self._cfg.get("long_range_atr_min_samples", 8)
+        with self._long_range_incidents_lock:
+            samples = [f for (_, f) in self._long_range_incidents]
+        if len(samples) < min_samples:
+            logger.info(
+                f"[GridBot] long_range_atr_factor: only {len(samples)}/"
+                f"{min_samples} calibration sample(s) banked — not enough "
+                f"to suggest a value yet"
+            )
+            return
+        samples.sort()
+        pct_idx = min(len(samples) - 1, int(round(0.80 * (len(samples) - 1))))
+        raw_suggestion = samples[pct_idx]
+        floor = self._cfg.get("long_range_atr_factor_floor", 0.05)
+        ceiling = self._cfg.get("long_range_atr_factor_ceiling", 1.00)
+        clamped = max(floor, min(ceiling, raw_suggestion))
+        max_step = self._cfg.get("long_range_atr_max_step", 0.05)
+        prev = self._last_long_range_atr_suggestion
+        damped = clamped if prev is None else prev + max(-max_step, min(max_step, clamped - prev))
+        self._last_long_range_atr_suggestion = damped
+        auto_apply = self._cfg.get("long_range_atr_factor_auto_apply", False)
+        current_live = self._cfg.get("long_range_atr_factor", 0.0)
+        logger.info(
+            f"[GridBot] long_range_atr_factor suggestion: {damped:.3f} "
+            f"(P80 of {len(samples)} sample(s)={raw_suggestion:.3f}, "
+            f"clamped={clamped:.3f}, previous suggestion="
+            f"{f'{prev:.3f}' if prev is not None else 'n/a'}, current live "
+            f"value={current_live:.3f}, auto_apply={auto_apply})"
+        )
+        if auto_apply and abs(damped - current_live) > 1e-9:
+            self._cfg["long_range_atr_factor"] = damped
+            logger.warning(
+                f"[GridBot] long_range_atr_factor auto-applied: "
+                f"{current_live:.3f} -> {damped:.3f} (live for the next "
+                f"AutoTuner.compute() call — long_range_atr_factor_auto_apply=true)"
+            )
+
     def _check_zero_candidate_grace(self, leg: "OpenLeg", trend_risk: float,
                                      now_ts: float, mid: float) -> None:
         """
@@ -10917,6 +11129,11 @@ class GridBot:
         with self._leg_zero_candidate_since_lock:
             first_seen = self._leg_zero_candidate_since.setdefault(leg.leg_id, now_ts)
             start_price = self._leg_zero_candidate_start_price.setdefault(leg.leg_id, mid)
+        if first_seen == now_ts:
+            # Genuinely new this call (setdefault didn't find an existing
+            # entry) — bank one calibration sample. Not re-checked on
+            # every later re-evaluation of the same still-pending episode.
+            self._record_long_range_incident(leg, mid, now_ts)
         with self._engine._lock:
             already_chasing = leg.leg_id in self._engine._chasing_leg_ids
         if already_chasing:
@@ -11875,14 +12092,47 @@ class GridBot:
                 f"the rebuilt grid"
             )
 
+        # CHASE_FIRST_REBUILD_REPRICE (2026-08-10): legs_to_liquidate is a
+        # mix of two categories reconcile_open_legs() itself distinguishes
+        # internally but doesn't expose separately in its return value —
+        # urgent-trend_risk legs (bypass every dwell/grace check on
+        # purpose, evict immediately) and non-urgent legs whose dwell cap
+        # simply expired (zero-candidate, claim-collision, or confirmed-
+        # misfit past confirm_s). reconcile_trend_risk is one scalar for
+        # the WHOLE reconcile_open_legs() call above, so if it's below
+        # this same urgent_threshold, none of reconcile_open_legs' urgent
+        # branches could have fired this rebuild — every leg here got
+        # here purely via a dwell cap expiring, the exact same situation
+        # rebuild_reprice_pending (_check_zero_candidate_grace) already
+        # gives a chase attempt before falling back to market. Previously
+        # this loop always market-liquidated unconditionally regardless
+        # of which case applied — leg #1010 (GEN00046_GREEN, 2026-08-09
+        # 09:28:40, -$3.28) is a confirmed instance: trend_risk=0.00,
+        # zero-candidate dwell cap organically expired, zero chase
+        # attempts ever made. Urgent legs are untouched by this change —
+        # still liquidated immediately, no chase, exactly as before.
+        urgent_threshold = self._cfg.get(
+            "reconcile_urgent_trend_risk",
+            self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
+        )
+        chase_first = reconcile_trend_risk < urgent_threshold
         if legs_to_liquidate:
             logger.info(
                 f"[GridBot] rebuild_reprice: reconcile_open_legs flagged "
-                f"{len(legs_to_liquidate)} leg(s) for market liquidation this "
-                f"rebuild: {[(leg.leg_id, leg.open_side, round(leg.open_price, 2)) for leg in legs_to_liquidate]}"
+                f"{len(legs_to_liquidate)} leg(s) for "
+                f"{'chase-first' if chase_first else 'immediate market'} "
+                f"liquidation this rebuild (trend_risk={reconcile_trend_risk:.2f} "
+                f"{'<' if chase_first else '>='} urgent {urgent_threshold:.2f}): "
+                f"{[(leg.leg_id, leg.open_side, round(leg.open_price, 2)) for leg in legs_to_liquidate]}"
             )
         for leg in legs_to_liquidate:
-            self._liquidate_leg_at_market(leg, reason="rebuild_reprice")
+            if chase_first:
+                with self._engine._lock:
+                    self._engine._chasing_leg_ids.add(leg.leg_id)
+                    self._engine._grace_held_leg_ids.discard(leg.leg_id)
+                self._chase_close_leg(leg, reason="rebuild_reprice")
+            else:
+                self._liquidate_leg_at_market(leg, reason="rebuild_reprice")
 
         logger.info(
             f"[GridBot] Grid live: [{new_params.lower:.2f},{new_params.upper:.2f}] "
