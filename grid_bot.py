@@ -406,6 +406,13 @@ GRID_CONFIG: dict = {
     # reconcile_urgent_trend_risk bypass as every other dwell cap here.
     "reconcile_claim_collision_dwell_s": 300.0,
 
+    # ── Rebuild-safe legacy leg handling ───────────────────────────────────────
+    # A grid rebuild changes future entry opportunities; it does not by itself
+    # invalidate an already-open position. Non-urgent legs that no longer fit
+    # the new cell geometry receive an independent profitable closer.
+    "legacy_reprice_closer_enabled": True,
+    "legacy_reprice_min_profit_spacing_mult": 1.0,
+
     # Cooldown between GridEngine's "orphaned leg — requesting fast rebuild"
     # triggers (see check_price_fills()). Without this, an orphaned/zero-
     # candidate leg that the dead-band check keeps bouncing (range hasn't
@@ -4019,6 +4026,18 @@ class GridLevel:
     suppressed_side: Optional[str] = None
 
 
+@dataclass
+class LegacyCloser:
+    """Independent closing order for an open leg no longer hosted by a grid cell."""
+    leg_id: int
+    side: str
+    price: float
+    qty: float
+    client_oid: str = ""
+    state: str = "IDLE"
+    placed_at: float = 0.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Grid engine
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4054,6 +4073,7 @@ class GridEngine:
                  sell_gate_fn: Optional[Callable[[], bool]] = None,
                  trend_confirm_fn: Optional[Callable[[], int]] = None,
                  stray_leg_fn: Optional[Callable[[Optional["OpenLeg"], str, Optional[str], Optional[str]], None]] = None,
+                 legacy_close_fill_fn: Optional[Callable[["OpenLeg", "FillEvent"], None]] = None,
                  uptrend_confirmed_fn: Optional[Callable[[], bool]] = None,
                  downtrend_confirmed_fn: Optional[Callable[[], bool]] = None,
                  down_shift_record_fn: Optional[Callable[[], None]] = None):
@@ -4137,6 +4157,8 @@ class GridEngine:
         # simply left resting — see the trail methods' cancellation
         # comments for why that's live-mode-risky).
         self._stray_leg_fn: Optional[Callable[[Optional["OpenLeg"], str, Optional[str], Optional[str]], None]] = stray_leg_fn
+        self._legacy_close_fill_fn: Optional[Callable[["OpenLeg", "FillEvent"], None]] = legacy_close_fill_fn
+        self._legacy_closers: Dict[int, LegacyCloser] = {}
         # Leg ids currently being actively managed by stray_leg_fn (a chase
         # in progress). check_price_fills()'s orphan-leg detector excludes
         # these — they're accounted for, just not by a cell — so it doesn't
@@ -4493,6 +4515,141 @@ class GridEngine:
         tag = f" closes_leg={closes_leg_id}" if closes_leg_id is not None else ""
         logger.debug(f"[GridEngine] SELL [{lv.index}] @ {lv.upper:.2f} qty={qty:.4f}{tag}")
 
+    # ── Rebuild-safe legacy closers ───────────────────────────────────────────
+    def export_legacy_closers(self) -> Dict[int, dict]:
+        with self._lock:
+            return {
+                leg_id: {
+                    "price": c.price, "qty": c.qty, "client_oid": c.client_oid,
+                    "state": c.state, "placed_at": c.placed_at,
+                }
+                for leg_id, c in self._legacy_closers.items()
+            }
+
+    def ensure_legacy_closer(self, leg: "OpenLeg", target_price: Optional[float] = None) -> None:
+        if not self._cfg.get("legacy_reprice_closer_enabled", True):
+            return
+        with self._lock:
+            closer = self._legacy_closers.get(leg.leg_id)
+            if closer is None:
+                target = target_price if target_price and target_price > 0 else self._legacy_target_price(leg)
+                closer = LegacyCloser(
+                    leg_id=leg.leg_id,
+                    side="SELL" if leg.open_side == "BUY" else "BUY",
+                    price=target, qty=leg.qty,
+                )
+                self._legacy_closers[leg.leg_id] = closer
+            elif target_price and target_price > 0 and closer.state == "IDLE":
+                closer.price = target_price
+            closer.qty = leg.qty
+            if closer.state == "OPEN":
+                return
+        self._replace_legacy_closer(closer, leg)
+
+    def _legacy_target_price(self, leg: "OpenLeg") -> float:
+        spacing = max(0.0, float(self._params.spacing))
+        mult = max(0.1, float(self._cfg.get("legacy_reprice_min_profit_spacing_mult", 1.0)))
+        move = max(spacing * mult, leg.open_price * self._cfg.get("min_grid_pct", 0.0008))
+        if leg.open_side == "BUY":
+            return round(leg.open_price + move, 2)
+        return round(leg.open_price - move, 2)
+
+    def _replace_legacy_closer(self, closer: LegacyCloser, leg: Optional["OpenLeg"] = None) -> None:
+        if leg is None:
+            with self._lock:
+                leg = self._open_legs.get(closer.leg_id)
+        if leg is None or leg.qty <= 0:
+            with self._lock:
+                self._legacy_closers.pop(closer.leg_id, None)
+            return
+        with self._lock:
+            closer.qty = leg.qty
+            closer.side = "SELL" if leg.open_side == "BUY" else "BUY"
+            if closer.price <= 0:
+                closer.price = self._legacy_target_price(leg)
+
+            # If the old target has already been crossed favorably, join the
+            # current touch rather than posting a stale marketable POST_ONLY
+            # order. The touch is still required to remain profitable.
+            bid, ask, _ = _price_cache.get_l1()
+            if closer.side == "SELL" and ask is not None and ask >= closer.price and ask > leg.open_price:
+                closer.price = round(ask, 2)
+            elif closer.side == "BUY" and bid is not None and bid <= closer.price and bid < leg.open_price:
+                closer.price = round(bid, 2)
+
+            req = OrderRequest.limit_maker(
+                side=closer.side, qty=closer.qty, price=closer.price,
+                instrument=self._instrument, purpose="legacy_leg_close"
+            )
+            closer.client_oid = req.client_oid
+            closer.state = "OPEN"
+            closer.placed_at = time.time()
+        if self._oms.live_trading:
+            self._oms.submit(req)
+        logger.info(
+            f"[GridEngine] LEGACY closer leg #{leg.leg_id}: POST_ONLY "
+            f"{closer.side} {closer.qty:.4f} @ {closer.price:.2f}"
+        )
+
+    def _replace_idle_legacy_closers(self) -> None:
+        with self._lock:
+            idle = [c for c in self._legacy_closers.values() if c.state == "IDLE"]
+        for closer in idle:
+            self._replace_legacy_closer(closer)
+
+    def _simulate_paper_legacy_fills(self, mid: float) -> None:
+        with self._lock:
+            closers = list(self._legacy_closers.values())
+        min_resting_s = self._cfg.get("paper_fill_min_resting_s", 1.5)
+        now = time.time()
+        for closer in closers:
+            if closer.state != "OPEN":
+                continue
+            crossed = ((closer.side == "SELL" and mid >= closer.price) or
+                       (closer.side == "BUY" and mid <= closer.price))
+            if not crossed or (min_resting_s > 0 and now - closer.placed_at < min_resting_s):
+                continue
+            fee = closer.price * closer.qty * self._cfg.get("maker_fee_rate", 0.0001)
+            fill = FillEvent(
+                client_oid=closer.client_oid, order_id=f"paper-{closer.client_oid[:8]}",
+                status=OrderStatus.FILLED, filled_qty=closer.qty,
+                avg_price=closer.price, fee=fee, purpose="legacy_leg_close"
+            )
+            with self._lock:
+                current = self._legacy_closers.get(closer.leg_id)
+                if current is None or current.client_oid != closer.client_oid:
+                    continue
+                self._legacy_closers.pop(closer.leg_id, None)
+                self._fill_queue.append((("legacy", closer.leg_id), fill))
+                self._fill_event.set()
+
+    def _poll_live_legacy_fills(self) -> None:
+        with self._lock:
+            closers = list(self._legacy_closers.values())
+        for closer in closers:
+            if closer.state != "OPEN" or not closer.client_oid:
+                continue
+            fill = self._oms.wait_fill(closer.client_oid, timeout=0.0)
+            if fill is None:
+                continue
+            with self._lock:
+                current = self._legacy_closers.get(closer.leg_id)
+                if current is None or current.client_oid != closer.client_oid:
+                    continue
+                if fill.is_filled:
+                    current.state = "IDLE"
+                    current.client_oid = ""
+                    self._legacy_closers.pop(closer.leg_id, None)
+                    self._fill_queue.append((("legacy", closer.leg_id), fill))
+                elif fill.is_cancelled and fill.filled_qty > 0:
+                    # Hold in PARTIAL_PENDING until the fill thread applies the
+                    # qty reduction. This prevents check_price_fills() from
+                    # re-posting the old full quantity before the callback runs.
+                    current.state = "PARTIAL_PENDING"
+                    current.client_oid = ""
+                    self._fill_queue.append((("legacy_partial", closer.leg_id), fill))
+                self._fill_event.set()
+
     # ── Fill detection ────────────────────────────────────────────────────────
 
     def check_price_fills(self, mid: float):
@@ -4504,8 +4661,12 @@ class GridEngine:
         """
         if self._oms.live_trading:
             self._poll_live_fills()
+            self._poll_live_legacy_fills()
         else:
             self._simulate_paper_fills(mid)
+            self._simulate_paper_legacy_fills(mid)
+
+        self._replace_idle_legacy_closers()
 
         # Catch any level left IDLE with no resting order — e.g. a
         # cancel-timeout re-place, or (see _place_initial_orders) a level
@@ -4547,7 +4708,8 @@ class GridEngine:
             tagged_leg_ids = {lv.closes_leg_id for lv in self._levels
                                if lv.closes_leg_id is not None}
             orphaned_legs = (set(self._open_legs.keys()) - tagged_leg_ids
-                              - self._chasing_leg_ids - self._grace_held_leg_ids)
+                              - self._chasing_leg_ids - self._grace_held_leg_ids
+                              - set(self._legacy_closers.keys()))
         buys_are_intentionally_paused = (open_buys == 0 and suppressed > 0)
         # Cooldown-gated (2026-08-06 GEN00037_GREEN incident — see
         # orphan_leg_rebuild_cooldown_s in GRID_CONFIG for the full writeup):
@@ -5136,10 +5298,44 @@ class GridEngine:
             self._fill_event.clear()
             while self._fill_queue:
                 try:
-                    idx, fill = self._fill_queue.popleft()
+                    key, fill = self._fill_queue.popleft()
                 except IndexError:
                     break
-                self._on_fill(idx, fill)
+                if isinstance(key, tuple):
+                    kind, leg_id = key
+                    if kind == "legacy":
+                        self._on_legacy_close_fill(leg_id, fill, partial=False)
+                    elif kind == "legacy_partial":
+                        self._on_legacy_close_fill(leg_id, fill, partial=True)
+                else:
+                    self._on_fill(key, fill)
+
+    def _on_legacy_close_fill(self, leg_id: int, fill: FillEvent, partial: bool = False) -> None:
+        with self._lock:
+            leg = self._open_legs.get(leg_id)
+        if leg is None:
+            logger.error(f"[GridEngine] LEGACY closer fill for unknown leg #{leg_id}")
+            return
+        if self._legacy_close_fill_fn is None:
+            logger.critical(
+                f"[GridEngine] LEGACY closer filled for leg #{leg_id} but "
+                f"no legacy_close_fill_fn is configured; position remains tracked"
+            )
+            return
+        self._legacy_close_fill_fn(leg, fill)
+        if partial:
+            with self._lock:
+                if leg.leg_id in self._open_legs:
+                    closer = self._legacy_closers.get(leg.leg_id)
+                    if closer is None:
+                        closer = LegacyCloser(
+                            leg_id=leg.leg_id,
+                            side="SELL" if leg.open_side == "BUY" else "BUY",
+                            price=self._legacy_target_price(leg), qty=leg.qty,
+                        )
+                        self._legacy_closers[leg.leg_id] = closer
+                    closer.state = "IDLE"
+                    closer.qty = leg.qty
 
     def _retry_db_write(self, fn, attempts: int = 3, base_delay: float = 0.05) -> Tuple[bool, object]:
         """
@@ -5681,133 +5877,24 @@ class GridEngine:
         pending_since: Optional[Dict[int, float]] = None,
         zero_candidate_since: Optional[Dict[int, float]] = None,
         claim_collision_since: Optional[Dict[int, float]] = None,
-    ) -> Tuple[Dict[int, int], List["OpenLeg"], set, List["OpenLeg"], List["OpenLeg"]]:
+    ) -> Tuple[Dict[int, int], List["OpenLeg"], set, List["OpenLeg"], List["OpenLeg"], List["OpenLeg"]]:
         """
-        Decide, for every currently-open leg, whether it still fits the
-        just-rebuilt grid.
+        Reconcile positions with the new grid without making grid geometry own
+        the lifetime of an already-open leg.
 
-        - Cleanly within [new lower, new upper]: pick the best-fit level to
-          host its designated closer (nearest to one new-spacing away in the
-          closing direction, among levels not already claimed by another
-          leg or excluded by the caller) and reserve it — returned as
-          {level_index: leg_id} for the caller to pass into
-          start(skip_indices=...), then apply via apply_leg_reassignments()
-          once start() has finished placing everything else.
-        - Cleanly within range, but every direction-correct level is
-          already claimed by another clean-fit leg (grid capacity
-          contention, not a genuine range mismatch — a narrow grid with
-          more legs on one side than it has cells): unlike a real range
-          mismatch this is usually transient and self-resolving (the
-          leg currently holding that cell closes naturally, freeing it up
-          on the very next rebuild), so it gets the same dwell-then-
-          liquidate treatment as the zero-candidate case, via the fifth
-          return value (claim_collision_pending), rather than the
-          instant, unconditional liquidation this branch used before
-          2026-08-08 (gen00042_green: 3 of 6 same-session
-          rebuild_reprice closes traced directly to this branch firing
-          on a session that was independently rebuilding every ~15s —
-          more rebuilds simply means more chances for two legs' ideal
-          cells to collide on the same pass; see claim_collision_since).
-        - Outside [lower,upper] but within a trend_risk-scaled tolerance
-          buffer (see reconcile_buffer_atr_mult), AND a direction-correct
-          closing level still exists: same tentative re-anchor as above, but
-          its leg_id is also added to the third return value (still_pending)
-          so the caller keeps a confirm-dwell timer running rather than
-          treating it as a clean fit.
-        - Outside the buffer too, but STILL flagged pending less than
-          reconcile_confirm_s ago (per the caller-supplied pending_since
-          map): same tentative re-anchor + still_pending, giving it more
-          time to either recover or genuinely confirm before paying for a
-          market close.
-        - No direction-correct closing level exists at all (leg's open
-          price is beyond every level in the required direction): this
-          leg has no cell to rest a closer on at all, so it can't be
-          assigned or held pending the way the cases above are. Unless
-          trend_risk is already urgent (immediate to_liquidate, same as a
-          confirmed-misfit clean/buffered leg), it's returned in the
-          fourth list (zero_candidate_pending) — this method still does
-          NOT act on it (no chase, no liquidation): GridBot._rebuild_grid
-          owns kicking off the stray-leg chase the first time a leg
-          appears here, and owns force-liquidating it once
-          zero_candidate_since shows it's been stranded for
-          >= reconcile_zero_candidate_max_dwell_s (that cap itself
-          shrinking toward 0 as trend_risk climbs toward
-          reconcile_urgent_trend_risk). See the "2026-08-03 16:35
-          incident" GRID_CONFIG comment block.
+        Clean-fit legs with a free profitable cell may be re-anchored to the new
+        grid. Any non-clean leg, or a clean leg whose profitable target cell is
+        already claimed, becomes an independent LEGACY closer unless trend-risk
+        is already urgent. Urgent legs remain the explicit hard-risk exception
+        and are returned for immediate market liquidation.
 
-          NOTE (2026-08-08/09, gen00043_green/GEN00046_GREEN): this
-          method's own grace -> chase transition only runs when it's
-          actually CALLED, which GridBot._rebuild_grid only does when the
-          dead-band check passes (a genuine reposition) or is bypassed
-          (mid outside range) — every branch of a dead-band-SKIPPED
-          rebuild returns before ever reaching this method. Confirmed
-          against legs #1000/#1001 (flagged zero-candidate at 06:00:37,
-          next and ONLY re-evaluation at 08:19:23 — 8326s later, straight
-          to liquidation with zero chase attempts) and again against leg
-          #1012 in a calmer market with no coincidental trigger keeping
-          rebuilds frequent. This method's own dwell-cap logic was
-          working exactly as designed in both cases; the gap was
-          upstream, in when it gets called at all — fixed via
-          GridBot._run()'s dwell-cap watchdog blocks, which directly
-          request a rebuild the instant any tracked leg's own cap is
-          reached (using this exact same dwell-cap formula), combined
-          with GridBot._check_stranded_leg_grace()/_check_zero_candidate_grace(),
-          which perform the actual grace -> chase transition once that
-          forced rebuild happens — independent of whether the rest of
-          _rebuild_grid's dead-band check then passes or skips. See those
-          methods' docstrings.
-        - Flagged pending (any of the three kinds above) for too long and
-          still not resolved: returned in the second list (to_liquidate).
-          This method does NOT liquidate them itself — it only decides;
-          GridBot._rebuild_grid executes the actual market close (real
-          fill, real fee, real fill event in grid_fills) and only then
-          removes the leg from the ledger. A leg that can't be reconciled
-          stays fully tracked and safe until that happens.
-
-        See the "reconcile_open_legs: trend-risk buffer + confirm-dwell"
-        GRID_CONFIG comment block for the 2026-08-02 incident this
-        replaces: an unconditional in_range check was force-liquidating
-        legs at market/taker fees purely because a low-volatility retune
-        had narrowed the range, with no relation to actual directional risk.
-
-        exclude_indices: level indices already spoken for by something else
-        (currently: a blue-green handoff's restore_plan) — never a candidate
-        here. already_handled_leg_ids: legs already re-attached by that same
-        mechanism — skipped entirely rather than double-assigned.
-        trend_risk: [0,1] score from StopScoreCalculator.compute_trend_risk()
-        — same score already used to gate the stop-raise system. 0 ("looks
-        like noise") gives the full tolerance buffer; 1 ("genuine
-        strengthening decline") collapses it to 0, matching pre-fix
-        behaviour exactly.
-        effective_atr: the volatility read the CURRENT rebuild's range was
-        built from (GridParams.effective_atr) — buffer is sized in these
-        units so it scales with the same regime the range itself reacted to.
-        pending_since: {leg_id: first-flagged-ts}, owned and persisted by
-        the caller (GridBot._leg_no_fit_since) across rebuilds, since a new
-        GridEngine/leg set is reseeded from DB on every rebuild and can't
-        hold dwell state itself.
-        zero_candidate_since: {leg_id: first-flagged-ts} for the zero-candidate
-        case specifically — owned and persisted by the caller
-        (GridBot._leg_zero_candidate_since), same reasoning as pending_since.
-        Kept as a separate map (not merged into pending_since) since the two
-        cases mean different things operationally: pending_since always has
-        a resting order in place while it waits; this one never does.
-        claim_collision_since: {leg_id: first-flagged-ts} for the clean-fit-
-        but-claimed case — owned and persisted by the caller
-        (GridBot._leg_claim_collision_since). Kept separate from
-        zero_candidate_since too, deliberately: sharing one clock risks a
-        leg that transitions FROM zero-candidate INTO a claim-collision (the
-        range widened enough to give it a direction, just not a free cell
-        yet) inheriting a stale multi-hour "first seen" timestamp from a
-        completely different, much longer-budgeted wait, and instantly
-        blowing through the much shorter collision dwell the moment it
-        switches categories.
+        The three dwell-map inputs and effective_atr remain in the signature for
+        compatibility with persisted state and callers, but ordinary rebuilds
+        no longer turn those clocks into market-close decisions.
         """
         exclude_indices = exclude_indices or set()
         already_handled_leg_ids = already_handled_leg_ids or set()
-        pending_since = pending_since or {}
-        zero_candidate_since = zero_candidate_since or {}
-        claim_collision_since = claim_collision_since or {}
+
         with self._lock:
             legs = [leg for leg in self._open_legs.values()
                     if leg.leg_id not in already_handled_leg_ids]
@@ -5815,349 +5902,71 @@ class GridEngine:
             levels = [lv for lv in all_levels if lv.index not in exclude_indices]
 
         if not legs:
-            return {}, [], set(), [], []
-        if not levels:
-            # No cells left to host ANYONE's closer this rebuild (e.g. a
-            # handoff restore_plan claimed every level in a small grid —
-            # exactly what happened to leg #893, GEN00041_GREEN,
-            # 2026-08-07 13:10:55: a levels=3 grid, restore_plan claimed
-            # all 3, so `levels` came back empty here). Structurally this
-            # means every leg in `legs` is zero-candidate — there's no
-            # cell for ANY of them, same as the "no direction-correct
-            # level exists" case in the main loop below — NOT "confirmed
-            # misfit, liquidate now" regardless of remaining grace/dwell
-            # budget. FIX_2026_08_07: this branch previously returned
-            # `list(legs)` straight as to_liquidate unconditionally,
-            # bypassing zero_candidate_since entirely and skipping the
-            # "[GridEngine] reconcile_open_legs: ..." summary log below
-            # (this returns before reaching it) — leg #893 had ~6700s of
-            # its ~8057s grace+dwell budget left and got market-
-            # liquidated anyway, with zero chase attempts, purely because
-            # of this early-return. Apply the same urgent/dwell-cap
-            # decision the main zero-candidate branch uses instead of
-            # skipping it — see that branch (below) for the identical
-            # logic and the "2026-08-03 16:35 incident" GRID_CONFIG
-            # comment block this and that branch both defer to.
-            urgent_threshold = self._cfg.get(
-                "reconcile_urgent_trend_risk",
-                self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
-            )
-            pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
-            zc_max_dwell = self._cfg.get("reconcile_zero_candidate_max_dwell_s", 900.0)
-            zc_dwell_cap = pre_chase_grace_s + (
-                zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
-                if urgent_threshold > 0 else 0.0
-            )
-            to_liquidate_nc: List["OpenLeg"] = []
-            zero_candidate_pending_nc: List["OpenLeg"] = []
-            now_nc = time.time()
-            for leg in sorted(legs, key=lambda l: l.opened_ts):
-                if trend_risk >= urgent_threshold:
-                    logger.info(
-                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate "
-                        f"(no cells available at all this rebuild) + "
-                        f"urgent trend_risk={trend_risk:.2f} >= "
-                        f"{urgent_threshold:.2f} — liquidating now"
-                    )
-                    to_liquidate_nc.append(leg)
-                    continue
-                first_zc = zero_candidate_since.get(leg.leg_id)
-                if first_zc is not None and (now_nc - first_zc) >= zc_dwell_cap:
-                    logger.info(
-                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate "
-                        f"for {now_nc - first_zc:.0f}s >= dwell cap "
-                        f"{zc_dwell_cap:.0f}s (trend_risk={trend_risk:.2f}, "
-                        f"no cells available at all this rebuild) — "
-                        f"liquidating"
-                    )
-                    to_liquidate_nc.append(leg)
-                    continue
-                logger.info(
-                    f"[GridEngine] Leg #{leg.leg_id} zero-candidate (open="
-                    f"{leg.open_price:.2f}) — no cells available at all "
-                    f"this rebuild (all {len(all_levels)} claimed "
-                    f"elsewhere), trend_risk={trend_risk:.2f}, dwell cap "
-                    f"{zc_dwell_cap:.0f}s ({'starting now' if first_zc is None else f'{now_nc - first_zc:.0f}s elapsed'})"
-                )
-                zero_candidate_pending_nc.append(leg)
-            if to_liquidate_nc or zero_candidate_pending_nc:
-                logger.info(
-                    f"[GridEngine] reconcile_open_legs: 0 leg(s) "
-                    f"re-anchored to the rebuilt grid (0 cells available "
-                    f"at all this rebuild), {len(to_liquidate_nc)} "
-                    f"liquidating, {len(zero_candidate_pending_nc)} "
-                    f"zero-candidate pending"
-                )
-            return {}, to_liquidate_nc, set(), zero_candidate_pending_nc, []
+            return {}, [], set(), [], [], []
 
-        # lower/upper/spacing describe the REBUILT GRID'S true range, from
-        # every level regardless of exclusion — not just the subset left
-        # over after removing exclude_indices. Those two ranges diverge
-        # whenever a handoff restore_plan happens to claim a boundary index
-        # (e.g. the very lowest or highest level): using the filtered list
-        # here would narrow the effective range and could mark a leg that's
-        # genuinely still inside the grid as "no longer fits", sending it to
-        # a needless market liquidation. `levels` (filtered) is still what
-        # candidate-selection below draws from, since those ARE the only
-        # slots actually available to host a new closer.
-        # Structural boundaries: fixed lower/upper of the edge cells, not
-        # their transient .price. len(all_levels) is now the CELL count
-        # directly (one spacing per cell, not per-point), so no -1.
-        lower   = all_levels[0].lower
-        upper   = all_levels[-1].upper
-        spacing = (upper - lower) / len(all_levels) if all_levels else 0.0
-
-        max_buffer_mult = self._cfg.get("reconcile_buffer_atr_mult", 1.5)
-        confirm_s       = self._cfg.get("reconcile_confirm_s", 1800.0)
-        # Buffer shrinks to 0 as trend_risk -> 1, so a confirmed genuine
-        # decline evicts exactly as fast as before this change.
-        buffer = (max_buffer_mult * effective_atr * max(0.0, 1.0 - trend_risk)
-                  if effective_atr > 0 else 0.0)
-
-        # Urgent bypass — mirrors the stop-raise system's own urgent gate:
-        # trend_risk at/above this is strong, real evidence of a genuine
-        # move, so skip any dwell/wait and evict immediately. Computed once
-        # up front since both the buffered-fit case below and the
-        # zero-candidate case use the exact same threshold.
         urgent_threshold = self._cfg.get(
             "reconcile_urgent_trend_risk",
             self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
         )
-        # Zero-candidate dwell cap: full reconcile_zero_candidate_max_dwell_s
-        # at trend_risk=0, linearly down to 0 at urgent_threshold — a leg
-        # stranded during a strong, confirmed move gets barely any
-        # unmanaged wait; one stranded during flat/noisy conditions gets
-        # close to the full cap. See the "2026-08-03 16:35 incident"
-        # GRID_CONFIG comment block.
-        #
-        # GRACE_DWELL_COORDINATION_2026_08_06: zero_candidate_since is the
-        # SAME anchor zero_candidate_pre_chase_grace_s counts from (see
-        # _rebuild_grid's pre-chase grace loop). Before this fix, this cap
-        # was compared against that same anchor on its own — so with grace
-        # set to 7200s and this cap at its 900s default, EVERY zero-
-        # candidate leg hit this liquidation check ~900s in, while still
-        # sitting inside its own 7200s grace window, and got a market
-        # order with zero chase attempts ever dispatched. That's strictly
-        # worse than both the pre-grace baseline (immediate chase, a real
-        # shot at a maker fill) and the intended grace behavior (patient
-        # wait, THEN chase) — confirmed against leg #816
-        # (GEN00037_GREEN, 2026-08-06 19:03:12-19:19:59): 0 chase attempts,
-        # liquidated at 1007s solely by this check. Adding the grace
-        # period on top makes the total budget grace-time (no resting
-        # order, not yet chasing) + dwell-time (no resting order, chase
-        # already tried and exhausted) instead of the two silently
-        # overlapping on the same clock.
-        pre_chase_grace_s = self._cfg.get("zero_candidate_pre_chase_grace_s", 0.0)
-        zc_max_dwell = self._cfg.get("reconcile_zero_candidate_max_dwell_s", 900.0)
-        zc_dwell_cap = pre_chase_grace_s + (
-            zc_max_dwell * max(0.0, 1.0 - trend_risk / urgent_threshold)
-            if urgent_threshold > 0 else 0.0
-        )
 
-        # Claim-collision dwell cap (2026-08-08, gen00042_green): much
-        # shorter than the zero-candidate cap on purpose — this isn't "no
-        # cell will ever work", it's "a cell WOULD work and is currently
-        # taken". The leg currently holding it will very likely close
-        # naturally (an ordinary grid cycle, typically minutes, not hours)
-        # well before this expires; if it hasn't by then, fall back to the
-        # same liquidation this branch always did rather than let a leg
-        # dwell unmanaged indefinitely over what's ultimately just cell
-        # contention. Same urgent-trend_risk bypass as every other dwell
-        # cap here — a genuinely urgent move shouldn't wait on a cell
-        # freeing up either.
-        claim_collision_dwell_s = self._cfg.get("reconcile_claim_collision_dwell_s", 300.0)
+        if not levels:
+            urgent = [leg for leg in legs if trend_risk >= urgent_threshold]
+            legacy = [leg for leg in legs if trend_risk < urgent_threshold]
+            return {}, urgent, set(), [], [], legacy
 
-        assignments:   Dict[int, int] = {}
-        claimed:       set            = set()
-        to_liquidate:  List[OpenLeg]  = []
-        still_pending: set            = set()
-        zero_candidate_pending: List[OpenLeg] = []
-        claim_collision_pending: List[OpenLeg] = []
-        now = time.time()
+        lower = all_levels[0].lower
+        upper = all_levels[-1].upper
+        spacing = (upper - lower) / len(all_levels) if all_levels else self._params.spacing
+        assignments: Dict[int, int] = {}
+        claimed: set = set()
+        legacy_legs: List[OpenLeg] = []
+        to_liquidate: List[OpenLeg] = []
 
-        def _closer_price(lv: "GridLevel", leg: "OpenLeg") -> float:
-            # The price THIS cell would actually place the leg's closer at
-            # — its upper boundary for a BUY-opened leg (closes via SELL),
-            # its lower boundary for a SELL-opened leg (closes via BUY).
+        def closer_price(lv: GridLevel, leg: OpenLeg) -> float:
             return lv.upper if leg.open_side == "BUY" else lv.lower
 
-        def _candidates(leg: "OpenLeg") -> Tuple[float, List["GridLevel"]]:
+        def candidates(leg: OpenLeg) -> List[GridLevel]:
             if leg.open_side == "BUY":
-                # Long leg closes with a SELL above what it paid — never at
-                # or below, that would be locking in a loss the grid itself
-                # didn't ask for.
-                tgt = leg.open_price + spacing if spacing > 0 else leg.open_price
-                cands = [lv for lv in levels
-                         if lv.index not in claimed and lv.upper > leg.open_price]
-            else:
-                tgt = leg.open_price - spacing if spacing > 0 else leg.open_price
-                cands = [lv for lv in levels
-                         if lv.index not in claimed and lv.lower < leg.open_price]
-            return tgt, cands
+                return [lv for lv in levels
+                        if lv.index not in claimed and lv.upper > leg.open_price]
+            return [lv for lv in levels
+                    if lv.index not in claimed and lv.lower < leg.open_price]
 
-        # Oldest-opened first within each pass: whichever position has been
-        # waiting longest gets first pick if two legs' ideal target levels
-        # collide. Clean fits are a SEPARATE, earlier pass — a buffered or
-        # still-pending leg must never claim a level ahead of one that
-        # genuinely belongs in the range, or an old out-of-range leg could
-        # starve a newer clean-fit leg of its rightful level (caught by
-        # simulating this exact function against the 2026-08-02 incident
-        # numbers before shipping this change).
-        ordered = sorted(legs, key=lambda l: l.opened_ts)
-        clean_legs = [l for l in ordered if lower <= l.open_price <= upper]
-        other_legs = [l for l in ordered if not (lower <= l.open_price <= upper)]
+        clean_legs = sorted(
+            [leg for leg in legs if lower <= leg.open_price <= upper],
+            key=lambda l: l.opened_ts,
+        )
+        nonclean_legs = [leg for leg in legs if not (lower <= leg.open_price <= upper)]
 
+        # Keep the normal fast path for clean-fit positions when a free cell
+        # exists. This preserves the ordinary cell-cycle behavior.
         for leg in clean_legs:
-            target, candidates = _candidates(leg)
-            if not candidates:
-                # Every candidate level on the closing side is already
-                # claimed by another clean-fit leg. Grid capacity
-                # contention, not a genuine range mismatch — see
-                # claim_collision_since in the docstring for why this gets
-                # the same dwell-then-liquidate treatment as a
-                # zero-candidate leg now, instead of the instant,
-                # unconditional liquidation this branch used before
-                # 2026-08-08 (previously silent too until the 2026-08-07
-                # logging-only fix — leg #893's restart-triggered
-                # liquidation left no trace anywhere in this method's own
-                # logging, making the actual branch that fired
-                # unrecoverable after the fact).
-                if trend_risk >= urgent_threshold:
-                    logger.info(
-                        f"[GridEngine] Leg #{leg.leg_id} clean-fit + urgent "
-                        f"trend_risk={trend_risk:.2f} >= {urgent_threshold:.2f} "
-                        f"— every closing-side level already claimed, "
-                        f"bypassing collision dwell, liquidating now"
-                    )
-                    to_liquidate.append(leg)
-                    continue
-
-                first_cc = claim_collision_since.get(leg.leg_id)
-                if first_cc is not None and (now - first_cc) >= claim_collision_dwell_s:
-                    logger.info(
-                        f"[GridEngine] Leg #{leg.leg_id} clean-fit (open="
-                        f"{leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}]) "
-                        f"— every closing-side level still claimed after "
-                        f"{now - first_cc:.0f}s >= collision dwell "
-                        f"{claim_collision_dwell_s:.0f}s — liquidating"
-                    )
-                    to_liquidate.append(leg)
-                    continue
-
-                logger.info(
-                    f"[GridEngine] Leg #{leg.leg_id} clean-fit (open="
-                    f"{leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}]) "
-                    f"but every closing-side level already claimed by "
-                    f"another clean-fit leg — holding with no resting "
-                    f"order, collision dwell {claim_collision_dwell_s:.0f}s "
-                    f"({'starting now' if first_cc is None else f'{now - first_cc:.0f}s elapsed'}), "
-                    f"re-evaluated at the next rebuild"
-                )
-                claim_collision_pending.append(leg)
-                continue
-            best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
-            claimed.add(best.index)
-            assignments[best.index] = leg.leg_id
-
-        for leg in other_legs:
-            target, candidates = _candidates(leg)
-            if not candidates:
-                # No level in the required direction exists at any price —
-                # structurally stranded (e.g. a long opened well above a
-                # grid that has since dropped entirely below it), or every
-                # remaining level was already claimed by a clean fit above.
-                # There's no cell to hold a resting closer on regardless of
-                # trend_risk, so this can never be a clean/buffered
-                # assignment — but unless trend_risk is already urgent, it
-                # no longer means an instant market close either. See the
-                # "2026-08-03 16:35 incident" GRID_CONFIG comment block.
-                if trend_risk >= urgent_threshold:
-                    logger.info(
-                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate + "
-                        f"urgent trend_risk={trend_risk:.2f} >= "
-                        f"{urgent_threshold:.2f} — liquidating now"
-                    )
-                    to_liquidate.append(leg)
-                    continue
-
-                first_zc = zero_candidate_since.get(leg.leg_id)
-                if first_zc is not None and (now - first_zc) >= zc_dwell_cap:
-                    logger.info(
-                        f"[GridEngine] Leg #{leg.leg_id} zero-candidate for "
-                        f"{now - first_zc:.0f}s >= dwell cap {zc_dwell_cap:.0f}s "
-                        f"(trend_risk={trend_risk:.2f}) — liquidating"
-                    )
-                    to_liquidate.append(leg)
-                    continue
-
-                logger.info(
-                    f"[GridEngine] Leg #{leg.leg_id} zero-candidate "
-                    f"(open={leg.open_price:.2f}, range=[{lower:.2f},"
-                    f"{upper:.2f}]) — no cell to hold a closer on, "
-                    f"trend_risk={trend_risk:.2f}, dwell cap {zc_dwell_cap:.0f}s "
-                    f"({'starting now' if first_zc is None else f'{now - first_zc:.0f}s elapsed'})"
-                )
-                zero_candidate_pending.append(leg)
-                continue
-
-            buffered_fit = buffer > 0 and (lower - buffer) <= leg.open_price <= (upper + buffer)
-            if buffered_fit:
-                logger.info(
-                    f"[GridEngine] Leg #{leg.leg_id} outside [{lower:.2f},"
-                    f"{upper:.2f}] (open={leg.open_price:.2f}) but within "
-                    f"trend_risk-scaled buffer ({buffer:.2f}, trend_risk="
-                    f"{trend_risk:.2f}) — tolerated, no dwell started"
-                )
-                best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
+            cands = candidates(leg)
+            if cands:
+                target = leg.open_price + spacing if leg.open_side == "BUY" else leg.open_price - spacing
+                best = min(cands, key=lambda lv: abs(closer_price(lv, leg) - target))
                 claimed.add(best.index)
                 assignments[best.index] = leg.leg_id
-                continue
+            elif trend_risk >= urgent_threshold:
+                to_liquidate.append(leg)
+            else:
+                legacy_legs.append(leg)
 
+        # Range mismatch is now a position-preservation event, not a forced
+        # close. The new grid gets to evolve independently while this leg keeps
+        # a profitable closer.
+        for leg in nonclean_legs:
             if trend_risk >= urgent_threshold:
-                logger.info(
-                    f"[GridEngine] Leg #{leg.leg_id} misfit + urgent "
-                    f"trend_risk={trend_risk:.2f} >= {urgent_threshold:.2f} "
-                    f"— bypassing confirm-dwell, liquidating now"
-                )
                 to_liquidate.append(leg)
-                continue
+            else:
+                legacy_legs.append(leg)
 
-            # Outside the buffer too. Give it reconcile_confirm_s (tracked
-            # by the caller across rebuilds) before forcing a market close.
-            first_seen = pending_since.get(leg.leg_id)
-            if first_seen is not None and (now - first_seen) >= confirm_s:
-                logger.info(
-                    f"[GridEngine] Leg #{leg.leg_id} confirmed misfit after "
-                    f"{now - first_seen:.0f}s (open={leg.open_price:.2f}, "
-                    f"range=[{lower:.2f},{upper:.2f}], buffer={buffer:.2f}) "
-                    f"— liquidating"
-                )
-                to_liquidate.append(leg)
-                continue
-
-            logger.info(
-                f"[GridEngine] Leg #{leg.leg_id} misfit "
-                f"(open={leg.open_price:.2f}, range=[{lower:.2f},{upper:.2f}], "
-                f"buffer={buffer:.2f}) — tentatively re-anchored, holding "
-                f"{confirm_s:.0f}s before liquidating "
-                f"({'new candidate' if first_seen is None else f'{now - first_seen:.0f}s elapsed'})"
-            )
-            best = min(candidates, key=lambda lv: abs(_closer_price(lv, leg) - target))
-            claimed.add(best.index)
-            assignments[best.index] = leg.leg_id
-            still_pending.add(leg.leg_id)
-
-        if assignments or to_liquidate or zero_candidate_pending or claim_collision_pending:
-            logger.info(
-                f"[GridEngine] reconcile_open_legs: {len(assignments)} leg(s) "
-                f"re-anchored to the rebuilt grid ({len(still_pending)} still "
-                f"pending confirm), {len(to_liquidate)} liquidating, "
-                f"{len(zero_candidate_pending)} zero-candidate pending, "
-                f"{len(claim_collision_pending)} claim-collision pending "
-                f"(new range=[{lower:.2f},{upper:.2f}])"
-            )
-        return (assignments, to_liquidate, still_pending, zero_candidate_pending,
-                claim_collision_pending)
+        logger.info(
+            f"[GridEngine] reconcile_open_legs: {len(assignments)} cell-assigned, "
+            f"{len(legacy_legs)} legacy-preserved, {len(to_liquidate)} urgent-liquidated "
+            f"(trend_risk={trend_risk:.2f}, range=[{lower:.2f},{upper:.2f}], spacing={spacing:.2f})"
+        )
+        return assignments, to_liquidate, set(), [], [], legacy_legs
 
     def apply_leg_reassignments(self, assignments: Dict[int, int]) -> None:
         """
@@ -6201,6 +6010,7 @@ class GridEngine:
             "open_buys":    open_buys,
             "open_sells":   open_sells,
             "suppressed":   suppressed,
+            "legacy_closers": len(self._legacy_closers),
             "long_qty":     round(self._long_qty, 4),
             "realized_pnl": round(self._realized_pnl, 4),
             "total_fees":   round(self._total_fees, 6),
@@ -7312,7 +7122,7 @@ class GridStateStore:
     # below (REPRICE_UNDERCOUNT_2026_08_05) and any future caller checking
     # "is this row a reprice/trail loss" stay in sync with each other.
     REPRICE_CLOSE_REASONS = (
-        "rebuild_reprice", "rebuild_reprice_pending", "trail_up", "trail_down",
+        "rebuild_reprice", "rebuild_reprice_pending", "legacy_reprice", "trail_up", "trail_down",
     )
 
     def _reprice_totals_from_fills(self, hkt_date: Optional[str] = None) -> Tuple[float, int]:
@@ -10467,6 +10277,17 @@ class GridBot:
             f"realized {gross_pnl:+.4f} USD | {leg.qty:.4f} BTC remaining"
         )
 
+    def _on_legacy_close_fill(self, leg: "OpenLeg", fill: FillEvent) -> None:
+        close_side = "SELL" if leg.open_side == "BUY" else "BUY"
+        if fill.filled_qty + 1e-12 >= leg.qty:
+            self._finalize_leg_close(
+                leg, fill, close_side, "legacy_reprice",
+                log_verb="legacy-close-filled",
+                alert_label="Leg closed via legacy reprice closer",
+            )
+        elif fill.filled_qty > 0:
+            self._record_partial_leg_close(leg, fill, close_side, "legacy_reprice")
+
     def _chase_close_leg(self, leg: Optional["OpenLeg"], reason: str,
                           dropped_client_oid: Optional[str] = None,
                           dropped_order_side: Optional[str] = None) -> None:
@@ -11216,9 +11037,11 @@ class GridBot:
 
     def _check_stranded_leg_grace(self, mid: float) -> None:
         """
-        Re-evaluate the pre-chase-grace -> chase transition for every
-        currently zero-candidate leg, independent of whether a full grid
-        reposition happens on this particular _rebuild_grid() call.
+        Reconcile any persisted zero-candidate episode before a rebuild.
+
+        With rebuild-safe legacy closers enabled, the preferred action is to
+        arm an independent closer immediately; the old chase/grace path remains
+        only as a compatibility fallback when the feature is explicitly disabled.
 
         Why this needs to exist as its own step, separate from the
         post-reconcile bookkeeping below: reconcile_open_legs() — and
@@ -11304,14 +11127,27 @@ class GridBot:
         for leg_id in tracked_leg_ids:
             with self._engine._lock:
                 leg = self._engine._open_legs.get(leg_id)
+                already_chasing = leg_id in self._engine._chasing_leg_ids
+                old_target = None
+                for lv in self._engine._levels:
+                    if lv.closes_leg_id == leg_id and lv.price > 0:
+                        old_target = lv.price
+                        break
             if leg is None:
-                # Resolved via some other path (closed, liquidated) between
-                # being flagged and this check running. Left in the dwell
-                # map until the next full reconcile pass' own cleanup loop
-                # notices — harmless either way, since a leg_id absent from
-                # self._engine._open_legs can never be liquidated twice.
                 continue
-            self._check_zero_candidate_grace(leg, trend_risk, now_ts, mid)
+            if self._cfg.get("legacy_reprice_closer_enabled", True) and not already_chasing:
+                self._engine.ensure_legacy_closer(leg, old_target)
+                with self._leg_zero_candidate_since_lock:
+                    self._leg_zero_candidate_since.pop(leg_id, None)
+                    self._leg_zero_candidate_start_price.pop(leg_id, None)
+                with self._engine._lock:
+                    self._engine._grace_held_leg_ids.discard(leg_id)
+                logger.info(
+                    f"[GridBot] Leg #{leg_id} zero-candidate → LEGACY closer armed; "
+                    f"rebuild geometry will no longer trigger a chase/market close"
+                )
+            else:
+                self._check_zero_candidate_grace(leg, trend_risk, now_ts, mid)
 
     def _rebuild_grid(self):
         mid = _price_cache.get_mid()
@@ -11883,6 +11719,15 @@ class GridBot:
         # self._engine currently is — safe on their own, since the
         # underlying ledger is the shared DB, not this specific instance;
         # it's only reconcile's fresh-assignment side that needed this fix).
+        carried_legacy_closers: Dict[int, dict] = {}
+        old_leg_closer_prices: Dict[int, float] = {}
+        if self._engine is not None:
+            with self._engine._lock:
+                for lv in self._engine._levels:
+                    if lv.closes_leg_id is not None and lv.price > 0:
+                        old_leg_closer_prices[lv.closes_leg_id] = lv.price
+                carried_legacy_closers = self._engine.export_legacy_closers()
+
         carried_chasing_leg_ids: set = set()
         # ORPHAN_COOLDOWN_CARRY_2026_08_07: _last_orphan_rebuild_request
         # (orphan_leg_rebuild_cooldown_s's cooldown clock) lives on the
@@ -11914,6 +11759,7 @@ class GridBot:
             sell_gate_fn=_sell_gate,
             trend_confirm_fn=self._trend_confirm,
             stray_leg_fn=self._chase_close_leg,
+            legacy_close_fill_fn=self._on_legacy_close_fill,
             uptrend_confirmed_fn=self._uptrend_confirmed_now,
             downtrend_confirmed_fn=self._downtrend_confirmed_now,
             down_shift_record_fn=self._record_down_shift)
@@ -11934,6 +11780,29 @@ class GridBot:
                 f"detector until their chase finishes."
             )
 
+        # Restore independent legacy closers across the engine-instance swap.
+        # If a live order is already resting, its client_oid is carried forward;
+        # if it was idle, the new engine simply re-posts the same profitable target.
+        if carried_legacy_closers:
+            for leg_id, spec in carried_legacy_closers.items():
+                leg = self._engine._open_legs.get(leg_id)
+                if leg is None:
+                    continue
+                with self._engine._lock:
+                    self._engine._legacy_closers[leg_id] = LegacyCloser(
+                        leg_id=leg_id,
+                        side="SELL" if leg.open_side == "BUY" else "BUY",
+                        price=float(spec.get("price", 0.0)),
+                        qty=leg.qty,
+                        client_oid=str(spec.get("client_oid", "")),
+                        state=str(spec.get("state", "IDLE")),
+                        placed_at=float(spec.get("placed_at", 0.0)),
+                    )
+            self._engine._replace_idle_legacy_closers()
+            logger.info(
+                f"[GridBot] Carried {len(carried_legacy_closers)} legacy closer(s) across rebuild"
+            )
+
         # ── Reconcile every still-open leg against the grid we just built ────
         # _open_legs was just seeded from DB inside GridEngine.__init__ above,
         # so this covers BOTH a same-process rebuild (the legs the OLD engine
@@ -11944,10 +11813,11 @@ class GridBot:
         # under an in-flight stray-leg chase are excluded too (see
         # carried_chasing_leg_ids above) — reconcile is not the right tool
         # for something _chase_close_leg_worker is already actively closing.
+        carried_legacy_leg_ids = set(carried_legacy_closers.keys())
         already_handled_leg_ids = {
             snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
             if snap_lv.get("closes_leg_id") is not None
-        } | carried_chasing_leg_ids
+        } | carried_chasing_leg_ids | carried_legacy_leg_ids
         if already_handled_leg_ids:
             from_restore_plan = {
                 snap_lv["closes_leg_id"] for snap_lv in restore_plan.values()
@@ -11983,7 +11853,7 @@ class GridBot:
                 f"{ {lid: round(now_dbg - ts, 0) for lid, ts in zero_candidate_since_snapshot.items()} } "
                 f"(values are seconds elapsed, not raw timestamps)"
             )
-        leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs, claim_collision_legs = (
+        leg_assignments, legs_to_liquidate, still_pending_leg_ids, zero_candidate_legs, claim_collision_legs, legacy_legs = (
             self._engine.reconcile_open_legs(
                 exclude_indices=set(restore_plan.keys()),
                 already_handled_leg_ids=already_handled_leg_ids,
@@ -11994,106 +11864,29 @@ class GridBot:
                 claim_collision_since=claim_collision_since_snapshot,
             )
         )
-        # Maintain the dwell dict across rebuilds: start the clock the
-        # first time a leg is flagged (never reset it while it stays
-        # pending — that's what confirm_s measures against), and drop any
-        # leg that's no longer pending (either it recovered to a clean fit,
-        # or reconcile_open_legs just confirmed-liquidated it).
-        now_ts = time.time()
-        with self._leg_no_fit_since_lock:
-            for leg_id in still_pending_leg_ids:
-                self._leg_no_fit_since.setdefault(leg_id, now_ts)
-            for leg_id in list(self._leg_no_fit_since.keys()):
-                if leg_id not in still_pending_leg_ids:
-                    del self._leg_no_fit_since[leg_id]
+        # REBUILD_SAFE_LEGS_2026_08_12:
+        # Any non-urgent position not given a clean cell assignment is moved to
+        # an independent closer. Its previous cell closer price is preferred so
+        # the rebuild does not silently change the trade's intended target.
+        for leg in legacy_legs:
+            self._engine.ensure_legacy_closer(
+                leg, old_leg_closer_prices.get(leg.leg_id)
+            )
 
-        # Same bookkeeping for the zero-candidate dwell map, plus: once a
-        # leg has been zero-candidate for at least
-        # zero_candidate_pre_chase_grace_s, kick off the stray-leg chase
-        # for it (a shot at a decent price before it settles into the
-        # unmanaged post-chase wait) — mirrors exactly how
-        # _trail_up/_trail_down hand a dropped leg to the same chase
-        # mechanism. Guarded on "not already chasing" so a leg that
-        # recovers, goes stranded again, and is still mid-chase from
-        # earlier doesn't get a second chase spawned on top of the first.
-        #
-        # zero_candidate_pre_chase_grace_s (2026-08-06, sized against the
-        # REPRICE_UNDERCOUNT_2026_08_05 recovery-time backtest — see
-        # GRID_CONFIG comment block): default 0.0 preserves the exact
-        # legacy behavior (chase immediately, first rebuild a leg is seen
-        # zero-candidate). Set > 0 to hold a newly-stranded leg with NO
-        # resting order for up to that many seconds first — same
-        # "unmanaged, re-checked at the next rebuild" mechanics the
-        # POST-chase-exhaustion dwell cap already uses below, just applied
-        # BEFORE the chase starts instead of only after it fails. If price
-        # re-enters a real cell before the grace period elapses, the leg
-        # is picked up by the ordinary (non-zero-candidate) reconcile path
-        # next rebuild and never needs the chase at all. Same urgent-
-        # trend_risk bypass as the post-chase dwell cap: a genuinely
-        # urgent move skips the grace and chases immediately regardless.
-        zero_candidate_ids = {leg.leg_id for leg in zero_candidate_legs}
-        for leg in zero_candidate_legs:
-            self._check_zero_candidate_grace(leg, reconcile_trend_risk, now_ts, mid)
+        # Legacy legs must not remain in the old zero-candidate/grace watchdog
+        # or it could re-arm the very chase this refactor removes.
         with self._leg_zero_candidate_since_lock:
-            zero_candidate_since_ids_snapshot = list(self._leg_zero_candidate_since.keys())
-        for leg_id in zero_candidate_since_ids_snapshot:
-            if leg_id in zero_candidate_ids:
-                continue  # still dwelling, reported again this rebuild
-            with self._engine._lock:
-                still_chasing = leg_id in self._engine._chasing_leg_ids
-            if still_chasing:
-                # Excluded from THIS reconcile call via already_handled_leg_ids
-                # (or carried_chasing_leg_ids on the next one) purely because
-                # its chase is in flight — not because it resolved. Keep the
-                # dwell-start time so the chase worker's own exhaustion check
-                # (and reconcile, once the chase ends) measure from when it
-                # first went stranded, not from whenever the chase happens
-                # to finish.
-                continue
-            # Neither zero-candidate this rebuild nor mid-chase: it
-            # genuinely resolved — recovered to a clean/buffered fit, or
-            # was already confirmed-liquidated (by reconcile's cap-expiry
-            # branch, or by the chase worker's own exhaustion fallback).
-            with self._leg_zero_candidate_since_lock:
-                self._leg_zero_candidate_since.pop(leg_id, None)
-                self._leg_zero_candidate_start_price.pop(leg_id, None)
-            with self._engine._lock:
-                self._engine._grace_held_leg_ids.discard(leg_id)
-
-        # Same bookkeeping for the claim-collision dwell map (2026-08-08,
-        # gen00042_green — see reconcile_open_legs' claim_collision_since
-        # docstring and GRID_CONFIG's reconcile_claim_collision_dwell_s
-        # entry). No chase to kick off here — unlike a zero-candidate leg,
-        # a claim-collision leg already has a perfectly good cell
-        # somewhere, it's just occupied right now — so this only needs to
-        # (a) track how long it's been colliding, for reconcile_open_legs'
-        # own dwell-cap check next rebuild, and (b) keep it out of the
-        # orphan-leg detector while it waits, exactly like a grace-held
-        # zero-candidate leg.
-        claim_collision_ids = {leg.leg_id for leg in claim_collision_legs}
-        resolved_cc_ids = []
+            for leg in legacy_legs:
+                self._leg_zero_candidate_since.pop(leg.leg_id, None)
+                self._leg_zero_candidate_start_price.pop(leg.leg_id, None)
+        with self._leg_no_fit_since_lock:
+            for leg in legacy_legs:
+                self._leg_no_fit_since.pop(leg.leg_id, None)
         with self._leg_claim_collision_since_lock:
-            for leg in claim_collision_legs:
-                self._leg_claim_collision_since.setdefault(leg.leg_id, now_ts)
-            for leg_id in list(self._leg_claim_collision_since.keys()):
-                if leg_id in claim_collision_ids:
-                    continue  # still colliding, reported again this rebuild
-                # Resolved: either it got a real assignment this rebuild (a
-                # cell freed up), or reconcile's own dwell-cap check already
-                # liquidated it.
-                del self._leg_claim_collision_since[leg_id]
-                resolved_cc_ids.append(leg_id)
-        with self._engine._lock:
-            for leg in claim_collision_legs:
-                self._engine._grace_held_leg_ids.add(leg.leg_id)
-            for leg_id in resolved_cc_ids:
-                self._engine._grace_held_leg_ids.discard(leg_id)
-        self._persist_leg_claim_collision_since()
-
-        # Persist right after this block finishes mutating the dict (both
-        # the additions above and the deletions just above) — see
-        # _persist_leg_zero_candidate_since() docstring.
+            for leg in legacy_legs:
+                self._leg_claim_collision_since.pop(leg.leg_id, None)
         self._persist_leg_zero_candidate_since()
+        self._persist_leg_claim_collision_since()
 
         self._engine.start(
             mid, skip_indices=set(restore_plan.keys()) | set(leg_assignments.keys())
@@ -12110,47 +11903,26 @@ class GridBot:
                 f"the rebuilt grid"
             )
 
-        # CHASE_FIRST_REBUILD_REPRICE (2026-08-10): legs_to_liquidate is a
-        # mix of two categories reconcile_open_legs() itself distinguishes
-        # internally but doesn't expose separately in its return value —
-        # urgent-trend_risk legs (bypass every dwell/grace check on
-        # purpose, evict immediately) and non-urgent legs whose dwell cap
-        # simply expired (zero-candidate, claim-collision, or confirmed-
-        # misfit past confirm_s). reconcile_trend_risk is one scalar for
-        # the WHOLE reconcile_open_legs() call above, so if it's below
-        # this same urgent_threshold, none of reconcile_open_legs' urgent
-        # branches could have fired this rebuild — every leg here got
-        # here purely via a dwell cap expiring, the exact same situation
-        # rebuild_reprice_pending (_check_zero_candidate_grace) already
-        # gives a chase attempt before falling back to market. Previously
-        # this loop always market-liquidated unconditionally regardless
-        # of which case applied — leg #1010 (GEN00046_GREEN, 2026-08-09
-        # 09:28:40, -$3.28) is a confirmed instance: trend_risk=0.00,
-        # zero-candidate dwell cap organically expired, zero chase
-        # attempts ever made. Urgent legs are untouched by this change —
-        # still liquidated immediately, no chase, exactly as before.
+        # Ordinary rebuild misfits are now legacy-preserved. The only market
+        # closes emitted directly by reconciliation are explicit urgent-risk
+        # exceptions, where the independent trend signal says the move is real.
         urgent_threshold = self._cfg.get(
             "reconcile_urgent_trend_risk",
             self._cfg.get("stop_raise_urgent_trend_risk", 0.80),
         )
-        chase_first = reconcile_trend_risk < urgent_threshold
-        if legs_to_liquidate:
+        if legacy_legs:
             logger.info(
-                f"[GridBot] rebuild_reprice: reconcile_open_legs flagged "
-                f"{len(legs_to_liquidate)} leg(s) for "
-                f"{'chase-first' if chase_first else 'immediate market'} "
-                f"liquidation this rebuild (trend_risk={reconcile_trend_risk:.2f} "
-                f"{'<' if chase_first else '>='} urgent {urgent_threshold:.2f}): "
-                f"{[(leg.leg_id, leg.open_side, round(leg.open_price, 2)) for leg in legs_to_liquidate]}"
+                f"[GridBot] rebuild_reprice: preserved {len(legacy_legs)} open leg(s) "
+                f"as independent LEGACY closers — no normal reprice liquidation"
+            )
+        if legs_to_liquidate:
+            logger.warning(
+                f"[GridBot] rebuild_reprice: {len(legs_to_liquidate)} leg(s) require "
+                f"urgent market protection (trend_risk={reconcile_trend_risk:.2f} "
+                f">= {urgent_threshold:.2f})"
             )
         for leg in legs_to_liquidate:
-            if chase_first:
-                with self._engine._lock:
-                    self._engine._chasing_leg_ids.add(leg.leg_id)
-                    self._engine._grace_held_leg_ids.discard(leg.leg_id)
-                self._chase_close_leg(leg, reason="rebuild_reprice")
-            else:
-                self._liquidate_leg_at_market(leg, reason="rebuild_reprice")
+            self._liquidate_leg_at_market(leg, reason="rebuild_reprice_urgent")
 
         logger.info(
             f"[GridBot] Grid live: [{new_params.lower:.2f},{new_params.upper:.2f}] "
