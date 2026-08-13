@@ -5523,6 +5523,11 @@ class GridEngine:
                 else:
                     self._on_fill(key, fill)
 
+    def _on_legacy_partial_close(self, leg: OpenLeg, fill: FillEvent) -> None:
+        """Apply a partial legacy-closer fill consumed by a retarget worker."""
+        close_side = "SELL" if leg.open_side == "BUY" else "BUY"
+        self._record_partial_leg_close(leg, fill, close_side, "legacy_target_retarget")
+
     def _on_legacy_close_fill(self, leg_id: int, fill: FillEvent, partial: bool = False) -> None:
         with self._lock:
             leg = self._open_legs.get(leg_id)
@@ -12455,9 +12460,28 @@ class GridBot:
         """
         if self._store is None:
             return
+        # The durable open_legs table is authoritative.  Never persist dwell
+        # state for a leg that no longer exists; otherwise a clean restart can
+        # resurrect historical zero-candidate IDs and the watchdog will keep
+        # requesting rebuilds forever (even though reconcile_open_legs() has
+        # nothing to act on).
+        active_leg_ids = {int(row["leg_id"]) for row in self._store.get_open_legs()}
         with self._leg_zero_candidate_since_lock:
-            snapshot = dict(self._leg_zero_candidate_since)
-            price_snapshot = dict(self._leg_zero_candidate_start_price)
+            snapshot = {
+                leg_id: ts for leg_id, ts in self._leg_zero_candidate_since.items()
+                if leg_id in active_leg_ids
+            }
+            price_snapshot = {
+                leg_id: px for leg_id, px in self._leg_zero_candidate_start_price.items()
+                if leg_id in active_leg_ids
+            }
+            # Prune stale in-memory entries as well, so the current process
+            # cannot re-trigger the watchdog on a dead leg before the next
+            # rebuild/persistence cycle.
+            for leg_id in list(self._leg_zero_candidate_since.keys()):
+                if leg_id not in active_leg_ids:
+                    self._leg_zero_candidate_since.pop(leg_id, None)
+                    self._leg_zero_candidate_start_price.pop(leg_id, None)
         self._store.set_meta(
             "leg_zero_candidate_since",
             json.dumps({str(k): v for k, v in snapshot.items()}),
@@ -12522,15 +12546,37 @@ class GridBot:
                     f"tracking for any restored leg starts fresh from the "
                     f"first post-restart price instead: {e}"
                 )
+        # Restore only for legs that are actually present in the durable
+        # open_legs ledger.  The ledger is authoritative; persisted dwell state
+        # can outlive a leg when a previous cleanup/forced close removed the
+        # position but failed to clear old metadata.  Filtering here prevents
+        # those historical IDs from waking the zero-candidate watchdog after a
+        # restart.
+        active_leg_ids = {int(row["leg_id"]) for row in self._store.get_open_legs()}
+        filtered_since = {
+            int(k): float(v) for k, v in restored.items()
+            if int(k) in active_leg_ids
+        }
+        filtered_price = {
+            int(k): float(v) for k, v in restored_price.items()
+            if int(k) in active_leg_ids
+        }
+        dropped_ids = sorted(set(int(k) for k in restored.keys()) - active_leg_ids)
         with self._leg_zero_candidate_since_lock:
-            self._leg_zero_candidate_since = {int(k): float(v) for k, v in restored.items()}
-            self._leg_zero_candidate_start_price = {
-                int(k): float(v) for k, v in restored_price.items()
-            }
+            self._leg_zero_candidate_since = filtered_since
+            self._leg_zero_candidate_start_price = filtered_price
+        if dropped_ids:
+            logger.info(
+                f"[GridBot] Dropped {len(dropped_ids)} stale zero-candidate "
+                f"leg ID(s) absent from open_legs on restore: {dropped_ids}"
+            )
+            # Persist the filtered maps immediately so the stale IDs are not
+            # carried into the next restart.
+            self._persist_leg_zero_candidate_since()
         if self._leg_zero_candidate_since:
             logger.info(
                 f"[GridBot] Restored zero-candidate dwell state for "
-                f"{len(self._leg_zero_candidate_since)} leg(s) from previous "
+                f"{len(self._leg_zero_candidate_since)} active leg(s) from previous "
                 f"session: {sorted(self._leg_zero_candidate_since.keys())}"
             )
 
@@ -12546,8 +12592,15 @@ class GridBot:
         """
         if self._store is None:
             return
+        active_leg_ids = {int(row["leg_id"]) for row in self._store.get_open_legs()}
         with self._leg_claim_collision_since_lock:
-            snapshot = dict(self._leg_claim_collision_since)
+            snapshot = {
+                leg_id: ts for leg_id, ts in self._leg_claim_collision_since.items()
+                if leg_id in active_leg_ids
+            }
+            for leg_id in list(self._leg_claim_collision_since.keys()):
+                if leg_id not in active_leg_ids:
+                    self._leg_claim_collision_since.pop(leg_id, None)
         self._store.set_meta(
             "leg_claim_collision_since",
             json.dumps({str(k): v for k, v in snapshot.items()}),
@@ -12573,12 +12626,24 @@ class GridBot:
                 f"— starting with an empty dwell map: {e}"
             )
             return
+        active_leg_ids = {int(row["leg_id"]) for row in self._store.get_open_legs()}
+        filtered = {
+            int(k): float(v) for k, v in restored.items()
+            if int(k) in active_leg_ids
+        }
+        dropped_ids = sorted(set(int(k) for k in restored.keys()) - active_leg_ids)
         with self._leg_claim_collision_since_lock:
-            self._leg_claim_collision_since = {int(k): float(v) for k, v in restored.items()}
+            self._leg_claim_collision_since = filtered
+        if dropped_ids:
+            logger.info(
+                f"[GridBot] Dropped {len(dropped_ids)} stale claim-collision "
+                f"leg ID(s) absent from open_legs on restore: {dropped_ids}"
+            )
+            self._persist_leg_claim_collision_since()
         if self._leg_claim_collision_since:
             logger.info(
                 f"[GridBot] Restored claim-collision dwell state for "
-                f"{len(self._leg_claim_collision_since)} leg(s) from previous "
+                f"{len(self._leg_claim_collision_since)} active leg(s) from previous "
                 f"session: {sorted(self._leg_claim_collision_since.keys())}"
             )
 
