@@ -413,6 +413,24 @@ GRID_CONFIG: dict = {
     "legacy_reprice_closer_enabled": True,
     "legacy_reprice_min_profit_spacing_mult": 1.0,
 
+    # ── Legacy closer target policy ───────────────────────────────────────────
+    # A rebuild no longer owns an open leg's lifetime.  The closer itself is
+    # therefore managed from market regime instead of being blindly re-anchored
+    # to each new grid geometry.
+    #   FAVORABLE + stable trend  -> ratchet target farther into profit
+    #   NEUTRAL / ranging         -> freeze target
+    #   ADVERSE + stable trend    -> ratchet target toward current market
+    # Target changes are deliberately rate-limited and ATR-scaled.
+    "legacy_target_policy_enabled": True,
+    "legacy_target_trend_stable_s": 180.0,
+    "legacy_target_min_slope_pct": 0.05,
+    "legacy_target_favorable_extension_atr": 0.50,
+    "legacy_target_max_favorable_extension_atr": 3.0,
+    "legacy_target_adverse_offset_atr": 0.05,
+    "legacy_target_allow_loss_on_adverse": True,
+    "legacy_target_min_change_atr": 0.10,
+    "legacy_target_min_adjust_interval_s": 30.0,
+
     # Cooldown between GridEngine's "orphaned leg — requesting fast rebuild"
     # triggers (see check_price_fills()). Without this, an orphaned/zero-
     # candidate leg that the dead-band check keeps bouncing (range hasn't
@@ -4036,6 +4054,8 @@ class LegacyCloser:
     client_oid: str = ""
     state: str = "IDLE"
     placed_at: float = 0.0
+    last_target_update_at: float = 0.0
+    retargeting: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4074,6 +4094,7 @@ class GridEngine:
                  trend_confirm_fn: Optional[Callable[[], int]] = None,
                  stray_leg_fn: Optional[Callable[[Optional["OpenLeg"], str, Optional[str], Optional[str]], None]] = None,
                  legacy_close_fill_fn: Optional[Callable[["OpenLeg", "FillEvent"], None]] = None,
+                 legacy_partial_close_fn: Optional[Callable[["OpenLeg", "FillEvent"], None]] = None,
                  uptrend_confirmed_fn: Optional[Callable[[], bool]] = None,
                  downtrend_confirmed_fn: Optional[Callable[[], bool]] = None,
                  down_shift_record_fn: Optional[Callable[[], None]] = None):
@@ -4158,6 +4179,7 @@ class GridEngine:
         # comments for why that's live-mode-risky).
         self._stray_leg_fn: Optional[Callable[[Optional["OpenLeg"], str, Optional[str], Optional[str]], None]] = stray_leg_fn
         self._legacy_close_fill_fn: Optional[Callable[["OpenLeg", "FillEvent"], None]] = legacy_close_fill_fn
+        self._legacy_partial_close_fn: Optional[Callable[["OpenLeg", "FillEvent"], None]] = legacy_partial_close_fn
         self._legacy_closers: Dict[int, LegacyCloser] = {}
         # Leg ids currently being actively managed by stray_leg_fn (a chase
         # in progress). check_price_fills()'s orphan-leg detector excludes
@@ -4522,6 +4544,8 @@ class GridEngine:
                 leg_id: {
                     "price": c.price, "qty": c.qty, "client_oid": c.client_oid,
                     "state": c.state, "placed_at": c.placed_at,
+                    "last_target_update_at": c.last_target_update_at,
+                    "retargeting": c.retargeting,
                 }
                 for leg_id, c in self._legacy_closers.items()
             }
@@ -4589,6 +4613,195 @@ class GridEngine:
         logger.info(
             f"[GridEngine] LEGACY closer leg #{leg.leg_id}: POST_ONLY "
             f"{closer.side} {closer.qty:.4f} @ {closer.price:.2f}"
+        )
+
+    def update_legacy_targets(
+            self, mid: float, trend_regime: str, trend_slope_pct: float,
+            trend_regime_age_s: float, effective_atr: float,
+            best_bid: Optional[float], best_ask: Optional[float]) -> None:
+        """
+        Adjust existing legacy closer targets from market regime, not grid
+        geometry.  This is intentionally separate from reconciliation so a
+        rebuild cannot silently move a legacy target.
+
+        Policy:
+          FAVORABLE + stable trend -> ratchet farther into profit.
+          NEUTRAL / ranging        -> freeze the existing target.
+          ADVERSE + stable trend   -> ratchet toward the market.
+
+        Target changes are monotonic within a leg's current lifecycle and
+        rate-limited.  Live orders are cancel-and-replaced asynchronously so
+        the main tick loop never blocks on exchange confirmation.
+        """
+        if not self._cfg.get("legacy_target_policy_enabled", True):
+            return
+        if effective_atr is None or effective_atr <= 0 or mid is None:
+            return
+        stable_s = max(0.0, float(self._cfg.get("legacy_target_trend_stable_s", 180.0)))
+        slope_min = abs(float(self._cfg.get("legacy_target_min_slope_pct", 0.05)))
+        stable = trend_regime in ("UP", "DOWN") and trend_regime_age_s >= stable_s
+        directional = stable and abs(float(trend_slope_pct)) >= slope_min
+        if not directional:
+            return
+
+        min_change = max(0.0, float(self._cfg.get("legacy_target_min_change_atr", 0.10))) * effective_atr
+        min_interval = max(0.0, float(self._cfg.get("legacy_target_min_adjust_interval_s", 30.0)))
+        favorable_ext = max(0.0, float(self._cfg.get("legacy_target_favorable_extension_atr", 0.50))) * effective_atr
+        max_fav_ext = max(favorable_ext, float(self._cfg.get("legacy_target_max_favorable_extension_atr", 3.0)) * effective_atr)
+        adverse_offset = max(0.0, float(self._cfg.get("legacy_target_adverse_offset_atr", 0.05))) * effective_atr
+        allow_loss = bool(self._cfg.get("legacy_target_allow_loss_on_adverse", True))
+        now = time.time()
+
+        with self._lock:
+            closers = list(self._legacy_closers.values())
+            legs = {lid: self._open_legs.get(lid) for lid in self._legacy_closers}
+
+        for closer in closers:
+            leg = legs.get(closer.leg_id)
+            if leg is None or leg.qty <= 0:
+                continue
+            if closer.state != "OPEN" or closer.retargeting:
+                continue
+            if now - closer.last_target_update_at < min_interval:
+                continue
+
+            is_long = leg.open_side == "BUY"
+            favorable = (is_long and trend_regime == "UP") or ((not is_long) and trend_regime == "DOWN")
+            adverse = (is_long and trend_regime == "DOWN") or ((not is_long) and trend_regime == "UP")
+            if not favorable and not adverse:
+                continue
+
+            old_target = closer.price
+            new_target = old_target
+
+            if favorable:
+                # Extend the target away from price, but never beyond a bounded
+                # distance from the real open price.  This is a profit ratchet.
+                ref = (best_ask if is_long else best_bid) or mid
+                open_px = leg.open_price
+                max_target = open_px + max_fav_ext if is_long else open_px - max_fav_ext
+                candidate = ref + favorable_ext if is_long else ref - favorable_ext
+                if is_long:
+                    candidate = min(candidate, max_target)
+                    if candidate - old_target >= min_change:
+                        new_target = candidate
+                else:
+                    candidate = max(candidate, max_target)
+                    if old_target - candidate >= min_change:
+                        new_target = candidate
+            elif adverse:
+                # Pull the target toward the current passive touch.  In a
+                # confirmed adverse regime this is allowed to cross open_price
+                # intentionally when loss-taking is enabled.
+                if is_long:
+                    ref = best_ask or mid
+                    candidate = ref + adverse_offset
+                    if not allow_loss:
+                        candidate = max(candidate, leg.open_price + min_change)
+                    if old_target - candidate >= min_change:
+                        new_target = candidate
+                else:
+                    ref = best_bid or mid
+                    candidate = ref - adverse_offset
+                    if not allow_loss:
+                        candidate = min(candidate, leg.open_price - min_change)
+                    if candidate - old_target >= min_change:
+                        new_target = candidate
+
+            if abs(new_target - old_target) < min_change:
+                continue
+
+            new_target = round(new_target, 2)
+            self._retarget_legacy_closer(closer.leg_id, new_target, trend_regime,
+                                         "favorable" if favorable else "adverse")
+
+    def _retarget_legacy_closer(self, leg_id: int, new_target: float,
+                                trend_regime: str, direction: str) -> None:
+        """Cancel/repost one live legacy closer without blocking the tick loop."""
+        with self._lock:
+            closer = self._legacy_closers.get(leg_id)
+            leg = self._open_legs.get(leg_id)
+            if closer is None or leg is None or closer.state != "OPEN" or closer.retargeting:
+                return
+            old_target = closer.price
+            if abs(new_target - old_target) < 1e-9:
+                return
+            old_oid = closer.client_oid
+            old_side = closer.side
+            closer.retargeting = True
+            closer.last_target_update_at = time.time()
+
+        if not self._oms.live_trading:
+            with self._lock:
+                current = self._legacy_closers.get(leg_id)
+                if current is None or current.client_oid != old_oid or current.state != "OPEN":
+                    return
+                current.price = round(new_target, 2)
+                current.client_oid = ""
+                current.state = "IDLE"
+                current.retargeting = False
+            self._replace_legacy_closer(current, leg)
+            logger.info(
+                f"[GridEngine] LEGACY target {direction} retarget leg #{leg_id}: "
+                f"{old_target:.2f} -> {new_target:.2f} "
+                f"(trend={trend_regime}, paper)"
+            )
+            return
+
+        threading.Thread(
+            target=self._retarget_legacy_closer_worker,
+            args=(leg_id, old_oid, old_side, new_target, trend_regime, direction),
+            name=f"LegacyRetarget-{leg_id}", daemon=True).start()
+
+    def _retarget_legacy_closer_worker(
+            self, leg_id: int, old_oid: str, old_side: str, new_target: float,
+            trend_regime: str, direction: str) -> None:
+        fill = self._oms.request_cancel_and_await(old_oid, timeout=15.0)
+        if fill is None:
+            with self._lock:
+                current = self._legacy_closers.get(leg_id)
+                if current is not None and current.client_oid == old_oid:
+                    current.retargeting = False
+            logger.critical(
+                f"[GridEngine] LEGACY retarget leg #{leg_id}: cancel resolution "
+                f"unknown for [{old_oid[:8]}] — retaining old target; retarget "
+                f"plan to {new_target:.2f} was NOT applied"
+            )
+            return
+
+        # request_cancel_and_await consumes the resolving FillEvent itself.
+        # Feed a real full/partial fill back into the authoritative accounting
+        # path, otherwise a cancel-race fill could disappear from PnL.
+        with self._lock:
+            leg = self._open_legs.get(leg_id)
+
+        if fill.is_filled:
+            if leg is not None and self._legacy_close_fill_fn is not None:
+                self._legacy_close_fill_fn(leg, fill)
+            return
+
+        if fill.is_cancelled and fill.filled_qty > 0:
+            if leg is not None and self._legacy_partial_close_fn is not None:
+                self._legacy_partial_close_fn(leg, fill)
+
+        with self._lock:
+            current = self._legacy_closers.get(leg_id)
+            leg = self._open_legs.get(leg_id)
+            if current is None or leg is None:
+                return
+            if current.client_oid != old_oid:
+                current.retargeting = False
+                return
+            current.price = round(new_target, 2)
+            current.client_oid = ""
+            current.state = "IDLE"
+            current.retargeting = False
+
+        self._replace_legacy_closer(current, leg)
+        logger.info(
+            f"[GridEngine] LEGACY target {direction} retarget leg #{leg_id}: "
+            f"replaced {old_side} {old_oid[:8]} -> {current.price:.2f} "
+            f"(trend={trend_regime}, live)"
         )
 
     def _replace_idle_legacy_closers(self) -> None:
@@ -7819,6 +8032,7 @@ class GridBot:
         self._last_trend_log:    float = 0.0   # ts of last trend log line
         self._last_trend_slope_pct: float = 0.0  # cached for compute_trend_risk(),
                                                   # refreshed every _evaluate_trend() call
+        self._trend_regime_since: float = time.time()
         self._last_effective_atr: float = 0.0  # cached for the adverse-move allowance
                                                 # (AUTO_ADVERSE_MOVE_2026_08_09), refreshed
                                                 # every _rebuild_grid() call
@@ -9575,6 +9789,26 @@ class GridBot:
                             "(sell-gate cleared)"
                         )
 
+            # Legacy closer target policy. This intentionally runs BEFORE
+            # fill detection so a paper-mode target adjustment cannot race the
+            # same tick's simulated fill. Grid geometry itself does not move
+            # legacy targets; only confirmed market regime is allowed to do so.
+            if self._engine is not None and self._cfg.get("legacy_target_policy_enabled", True):
+                legacy_bid, legacy_ask, _ = _price_cache.get_l1()
+                legacy_trend = self._effective_trend_regime()
+                legacy_age = max(0.0, time.time() - self._trend_regime_since)
+                legacy_atr = _price_cache.compute_atr(
+                    self._cfg.get("atr_lookback_minutes", 1440))
+                if legacy_atr and legacy_atr > 0:
+                    self._engine.update_legacy_targets(
+                        mid=mid,
+                        trend_regime=legacy_trend,
+                        trend_slope_pct=self._last_trend_slope_pct,
+                        trend_regime_age_s=legacy_age,
+                        effective_atr=legacy_atr,
+                        best_bid=legacy_bid,
+                        best_ask=legacy_ask)
+
             # Fill detection
             if self._engine:
                 self._engine.check_price_fills(mid)
@@ -10275,6 +10509,19 @@ class GridBot:
             f"{close_side} {fill.filled_qty:.4f} BTC @ {fill.avg_price:.2f} "
             f"(opened {leg.open_side} @ {leg.open_price:.2f}) | "
             f"realized {gross_pnl:+.4f} USD | {leg.qty:.4f} BTC remaining"
+        )
+
+    def _on_legacy_partial_close(self, leg: "OpenLeg", fill: "FillEvent") -> None:
+        """Record a partial fill consumed while retargeting a legacy closer.
+
+        GridEngine owns the cancel/replace mechanics, while GridBot owns
+        position accounting and the durable open_legs ledger.  This bridge
+        ensures a partial fill racing with a cancel is recorded exactly once
+        and the remaining leg quantity is persisted.
+        """
+        close_side = "SELL" if leg.open_side == "BUY" else "BUY"
+        self._record_partial_leg_close(
+            leg, fill, close_side, "legacy_target_retarget"
         )
 
     def _on_legacy_close_fill(self, leg: "OpenLeg", fill: FillEvent) -> None:
@@ -11760,6 +12007,7 @@ class GridBot:
             trend_confirm_fn=self._trend_confirm,
             stray_leg_fn=self._chase_close_leg,
             legacy_close_fill_fn=self._on_legacy_close_fill,
+            legacy_partial_close_fn=self._on_legacy_partial_close,
             uptrend_confirmed_fn=self._uptrend_confirmed_now,
             downtrend_confirmed_fn=self._downtrend_confirmed_now,
             down_shift_record_fn=self._record_down_shift)
@@ -11797,6 +12045,8 @@ class GridBot:
                         client_oid=str(spec.get("client_oid", "")),
                         state=str(spec.get("state", "IDLE")),
                         placed_at=float(spec.get("placed_at", 0.0)),
+                        last_target_update_at=float(spec.get("last_target_update_at", 0.0)),
+                        retargeting=False,
                     )
             self._engine._replace_idle_legacy_closers()
             logger.info(
@@ -13090,6 +13340,8 @@ class GridBot:
                 f"(Telegram alert sent)"
             )
 
+        if regime != self._last_trend_regime:
+            self._trend_regime_since = time.time()
         self._last_trend_regime = regime
         if regime != TrendSignal.REGIME_NODATA:
             self._last_confirmed_trend_regime = regime
